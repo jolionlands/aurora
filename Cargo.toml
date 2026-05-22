@@ -1,0 +1,64 @@
+[package]
+name = "aurora"
+version = "0.1.0"
+edition = "2021"
+description = "Efficient desktop background swapper for Windows with IPC and multi-monitor support"
+license = "MIT"
+authors = ["jolionlands"]
+
+[[bin]]
+name = "aurora"
+path = "src/main.rs"
+
+[[bin]]
+name = "aurora-ctl"
+path = "src/bin/ctl.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+notify = "6.1"
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp", "tiff", "bmp", "ico", "avif"] }
+chrono = "0.4"
+rand = "0.8"
+blake3 = "1.5"
+kamadak-exif = "0.5"
+tempfile = "3.10"
+
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

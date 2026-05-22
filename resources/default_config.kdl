@@ -1,0 +1,72 @@
+// aurora default configuration
+// Written to %APPDATA%\aurora\config.kdl on first run.
+// Edit freely — aurora watches this file for changes.
+
+log-level "info"
+
+// ---------------------------------------------------------------------------
+// Source folders — add as many as you like.
+// ---------------------------------------------------------------------------
+source {
+    path "C:/Users/Public/Pictures"
+    recursive true
+    extensions "jpg,jpeg,png,webp,avif,tiff,bmp"
+    min-width 1280
+    min-height 720
+}
+
+// ---------------------------------------------------------------------------
+// Schedule
+// ---------------------------------------------------------------------------
+schedule {
+    mode "interval"          // "interval" | "at" | "random"
+    interval-secs 1800       // 30 minutes
+    // at "09:00"            // uncomment to use mode=at with fixed times
+    // at "17:00"
+    on-workspace-change false
+    pause-when-fullscreen true
+    pause-when-idle-secs 0   // 0 = never pause for idle
+    min-repeat-window 20     // avoid repeating a photo within last N shown
+}
+
+// ---------------------------------------------------------------------------
+// Transitions
+// ---------------------------------------------------------------------------
+transitions {
+    enabled true
+    duration-ms 800
+    style "crossfade"        // crossfade | slide-left | slide-right | wipe-left
+                             // wipe-right | dissolve | zoom-in | zoom-out | none
+    renderer "auto"          // "gpu" | "cpu" | "auto"
+}
+
+// ---------------------------------------------------------------------------
+// Per-monitor overrides  (optional — defaults apply when omitted)
+// ---------------------------------------------------------------------------
+// monitor "\\.\DISPLAY1\Monitor0" {
+//     fit "fill"            // fill | contain | tile | center | stretch
+//     tint "none"
+// }
+
+// ---------------------------------------------------------------------------
+// Triggers
+// ---------------------------------------------------------------------------
+// triggers {
+//     on-startup "C:/path/to/script.bat"
+// }
+
+// ---------------------------------------------------------------------------
+// Metrics  (Prometheus endpoint)
+// ---------------------------------------------------------------------------
+metrics {
+    enabled false
+    port 9876
+}
+
+// ---------------------------------------------------------------------------
+// Decode cache
+// ---------------------------------------------------------------------------
+cache {
+    decoded-mb 256
+    prefetch-count 3
+}
