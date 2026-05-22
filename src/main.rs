@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
         paused: false,
         current_path: std::collections::HashMap::new(),
         history_len: 0,
+        history: std::collections::VecDeque::new(),
     }));
 
     // Build RuntimeHandle (for IPC).
@@ -201,6 +202,7 @@ async fn main() -> Result<()> {
         Arc::clone(&snap_state),
         runtime.index_arc(),
         Arc::clone(&metrics),
+        config_path.clone(),
     );
 
     // Extract the shared pause Arc so Runtime::run can check IPC pause state.

@@ -222,8 +222,17 @@ impl IpcServer {
 
             IpcMessage::Reload => {
                 info!("IPC: Reload config requested");
-                self.broadcast_event(IpcEvent::ConfigReloaded);
-                serde_json::json!({ "success": true })
+                if let Some(handle) = self.runtime.lock().clone() {
+                    match handle.reload_from_disk() {
+                        Ok(()) => {
+                            self.broadcast_event(IpcEvent::ConfigReloaded);
+                            serde_json::json!({ "success": true })
+                        }
+                        Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                    }
+                } else {
+                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
+                }
             }
 
             IpcMessage::Quit => {
@@ -244,15 +253,11 @@ impl IpcServer {
             }
 
             IpcMessage::Prev => {
-                // Prev requires popping history; the history lives inside Runtime.
-                // For now, skip_next is the closest we can do without a dedicated
-                // prev-path channel. A future round should add a PrevRequest variant.
                 let h = runtime!();
-                let _ = h; // acknowledged
-                serde_json::json!({
-                    "success": false,
-                    "error": "prev requires history channel — not yet fully implemented"
-                })
+                match h.prev() {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
             }
 
             IpcMessage::Pause { duration_secs } => {
@@ -277,13 +282,14 @@ impl IpcServer {
             }
 
             IpcMessage::SetFolder { path } => {
-                // SetFolder narrows the active source for this session.
-                // Requires index rebuild — not yet plumbed.
-                let _ = path;
-                serde_json::json!({
-                    "success": false,
-                    "error": "set_folder requires live index rebuild — not yet implemented"
-                })
+                if let Some(handle) = self.runtime.lock().clone() {
+                    match handle.set_folder(std::path::PathBuf::from(path)) {
+                        Ok(()) => serde_json::json!({ "success": true }),
+                        Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                    }
+                } else {
+                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
+                }
             }
 
             IpcMessage::Rate { stars } => {

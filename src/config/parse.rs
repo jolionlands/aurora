@@ -137,6 +137,10 @@ fn lex_line(raw: &str) -> Option<Line<'_>> {
 // ---------------------------------------------------------------------------
 
 pub fn parse_kdl_config(input: &str) -> Result<Config> {
+    // Strip leading UTF-8 BOM if present (PowerShell 5.1's Out-File -Encoding utf8
+    // writes one and silently breaks our hand-rolled parser).
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+
     let mut config = Config::default();
 
     // Section stack: Vec of section names as we nest
@@ -391,5 +395,18 @@ mod tests {
         assert!(!cfg.sources.is_empty(), "should have at least one source");
         assert_eq!(cfg.schedule.mode, "interval");
         assert!(cfg.transitions.enabled);
+    }
+
+    #[test]
+    fn test_parse_strips_bom() {
+        // PowerShell 5.1 Out-File -Encoding utf8 prepends a UTF-8 BOM (U+FEFF).
+        // Verify the parser silently strips it and returns Ok.
+        let bom_src = "\u{FEFF}source \"X\" {\n}\n";
+        let result = parse_kdl_config(bom_src);
+        assert!(result.is_ok(), "BOM-prefixed config should parse without error: {:?}", result.err());
+        let cfg = result.unwrap();
+        // The source path should have been captured as "X".
+        assert_eq!(cfg.sources.len(), 1, "expected 1 source, got {}: {:?}", cfg.sources.len(), cfg.sources);
+        assert_eq!(cfg.sources[0].path.to_str().unwrap(), "X");
     }
 }

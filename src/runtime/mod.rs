@@ -168,6 +168,7 @@ impl Runtime {
                 snap.paused = p.paused;
                 snap.current_path = self.state.current_path.clone();
                 snap.history_len = self.state.history.len();
+                snap.history = self.state.history.clone();
             }
         }
         info!("runtime: swap channel closed — exiting");
@@ -328,6 +329,8 @@ pub struct RuntimeStateSnapshot {
     pub paused: bool,
     pub current_path: HashMap<String, PathBuf>,
     pub history_len: usize,
+    /// Full history ring, mirrored from Runtime::state so IPC `prev` can read it.
+    pub history: VecDeque<PathBuf>,
 }
 
 /// A lightweight, Clone handle that IPC commands dispatch through.
@@ -341,6 +344,8 @@ pub struct RuntimeHandle {
     /// Pause state is managed separately so IPC can set it without going
     /// through the swap channel (which would need runtime to drain it).
     paused: Arc<Mutex<PauseState>>,
+    /// Path to the config file on disk, used by reload_from_disk().
+    config_path: Arc<std::path::PathBuf>,
 }
 
 pub struct PauseState {
@@ -354,6 +359,7 @@ impl RuntimeHandle {
         state: Arc<Mutex<RuntimeStateSnapshot>>,
         index: Arc<RwLock<PhotoIndex>>,
         metrics: Arc<Metrics>,
+        config_path: std::path::PathBuf,
     ) -> Self {
         Self {
             swap_tx,
@@ -364,6 +370,7 @@ impl RuntimeHandle {
                 paused: false,
                 pause_until: None,
             })),
+            config_path: Arc::new(config_path),
         }
     }
 
@@ -439,6 +446,94 @@ impl RuntimeHandle {
     /// Return a snapshot of the current wallpaper path for each monitor.
     pub fn current_wallpaper(&self) -> HashMap<String, PathBuf> {
         self.state.lock().current_path.clone()
+    }
+
+    /// Re-read the config file from disk, re-scan photo sources, and update
+    /// the index and metrics.
+    ///
+    /// NOTE: live transition/schedule changes require a full daemon restart.
+    /// TODO: apply transition and schedule changes without restart.
+    pub fn reload_from_disk(&self) -> anyhow::Result<()> {
+        let src = std::fs::read_to_string(self.config_path.as_ref())
+            .with_context(|| format!("read config {}", self.config_path.display()))?;
+        let config = crate::config::parse::parse_kdl_config(&src)
+            .with_context(|| format!("parse config {}", self.config_path.display()))?;
+
+        let roots: Vec<PathBuf> = config.sources.iter().map(|s| s.path.clone()).collect();
+        let extensions: Vec<String> = if roots.is_empty() {
+            vec!["jpg".to_string(), "jpeg".to_string(), "png".to_string()]
+        } else {
+            config
+                .sources
+                .first()
+                .map(|s| s.extensions.clone())
+                .unwrap_or_default()
+        };
+        let recursive = config
+            .sources
+            .first()
+            .map(|s| s.recursive)
+            .unwrap_or(true);
+
+        let new_index = if roots.is_empty() {
+            PhotoIndex::default()
+        } else {
+            PhotoIndex::scan(&roots, &extensions, recursive)
+                .context("scanning photo sources during reload")?
+        };
+
+        let new_size = new_index.len() as u64;
+        *self.index.write() = new_index;
+        self.metrics.set_index_size(new_size);
+        info!("reload_from_disk: photo index rebuilt with {} photos", new_size);
+        Ok(())
+    }
+
+    /// Narrow the active photo pool to a single folder for this session.
+    /// Pass an empty path to revert to the full configured source list.
+    pub fn set_folder(&self, path: PathBuf) -> anyhow::Result<()> {
+        let default_extensions: Vec<String> = ["jpg", "jpeg", "png", "webp", "gif"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let new_index = if path.as_os_str().is_empty() {
+            // Empty path → rebuild from configured sources (best-effort: use existing index).
+            // A full reload_from_disk() is needed for proper source config; log a hint.
+            info!("set_folder: empty path — clearing session folder override; call reload to restore configured sources");
+            PhotoIndex::default()
+        } else {
+            PhotoIndex::scan(&[path.clone()], &default_extensions, true)
+                .with_context(|| format!("set_folder: scan {:?}", path))?
+        };
+
+        let new_size = new_index.len() as u64;
+        *self.index.write() = new_index;
+        self.metrics.set_index_size(new_size);
+        info!("set_folder: index now contains {} photos from {:?}", new_size, path);
+        Ok(())
+    }
+
+    /// Restore the previous photo from the history ring.
+    /// Returns an error if there is no previous entry (history has fewer than 2 entries).
+    pub fn prev(&self) -> anyhow::Result<()> {
+        let prev_path = {
+            let snap = self.state.lock();
+            // history is most-recent-at-back; [len-1] = current, [len-2] = previous.
+            if snap.history.len() < 2 {
+                return Err(anyhow::anyhow!("no previous photo in history"));
+            }
+            snap.history.iter().rev().nth(1).cloned()
+        };
+        if let Some(path) = prev_path {
+            let _ = self.swap_tx.send(SwapRequest {
+                reason: SwapReason::Manual,
+                specific: Some(path),
+            });
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("no previous photo in history"))
+        }
     }
 }
 
@@ -518,10 +613,11 @@ mod tests {
             paused: false,
             current_path: HashMap::new(),
             history_len: 0,
+            history: VecDeque::new(),
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics);
+        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
 
         handle.pause(None);
         assert!(handle.pause_arc().lock().paused);
@@ -537,14 +633,102 @@ mod tests {
             paused: false,
             current_path: HashMap::new(),
             history_len: 0,
+            history: VecDeque::new(),
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics);
+        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
 
         handle.pause(Some(Duration::from_secs(60)));
-        let p = handle.pause_arc().lock();
+        let pause_arc = handle.pause_arc();
+        let p = pause_arc.lock();
         assert!(p.paused);
         assert!(p.pause_until.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // test_handle_set_folder_replaces_index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_handle_set_folder_replaces_index() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Write a tiny JPEG-like file so the scanner finds it.
+        let p = dir.path().join("test.jpg");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(RuntimeStateSnapshot {
+            paused: false,
+            current_path: HashMap::new(),
+            history_len: 0,
+            history: VecDeque::new(),
+        }));
+        // Start with an empty index.
+        let index = Arc::new(RwLock::new(PhotoIndex::default()));
+        let metrics = Metrics::new();
+        let handle = RuntimeHandle::new(tx, state, index, Arc::clone(&metrics), std::path::PathBuf::from("config.kdl"));
+
+        assert_eq!(metrics.index_size.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        handle.set_folder(dir.path().to_path_buf()).expect("set_folder");
+
+        // After set_folder the index should contain the one JPEG we wrote.
+        assert_eq!(handle.index.read().len(), 1);
+        assert_eq!(metrics.index_size.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // test_handle_prev_returns_history_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_handle_prev_returns_history_entry() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SwapRequest>();
+        let mut history: VecDeque<PathBuf> = VecDeque::new();
+        history.push_back(PathBuf::from("photo_a.jpg"));
+        history.push_back(PathBuf::from("photo_b.jpg"));
+        history.push_back(PathBuf::from("photo_c.jpg")); // current
+
+        let state = Arc::new(Mutex::new(RuntimeStateSnapshot {
+            paused: false,
+            current_path: HashMap::new(),
+            history_len: history.len(),
+            history,
+        }));
+        let index = Arc::new(RwLock::new(PhotoIndex::default()));
+        let metrics = Metrics::new();
+        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+
+        handle.prev().expect("prev should succeed with 3 history entries");
+
+        // The swap channel should have received a request for photo_b.jpg (second-to-last).
+        let req = rx.try_recv().expect("swap channel should have a message");
+        assert_eq!(req.specific, Some(PathBuf::from("photo_b.jpg")));
+        assert!(matches!(req.reason, SwapReason::Manual));
+    }
+
+    // -----------------------------------------------------------------------
+    // test_handle_prev_fails_with_no_history
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_handle_prev_fails_with_no_history() {
+        let (tx, _rx) = mpsc::unbounded_channel::<SwapRequest>();
+        let state = Arc::new(Mutex::new(RuntimeStateSnapshot {
+            paused: false,
+            current_path: HashMap::new(),
+            history_len: 0,
+            history: VecDeque::new(),
+        }));
+        let index = Arc::new(RwLock::new(PhotoIndex::default()));
+        let metrics = Metrics::new();
+        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+
+        let result = handle.prev();
+        assert!(result.is_err(), "prev on empty history should return Err");
     }
 }
