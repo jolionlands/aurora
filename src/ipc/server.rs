@@ -5,6 +5,7 @@ use tracing::{debug, error, info, warn};
 
 use super::messages::{IpcEvent, IpcMessage};
 use super::PIPE_PATH;
+use crate::runtime::RuntimeHandle;
 
 // ---------------------------------------------------------------------------
 // IpcServer
@@ -13,6 +14,7 @@ use super::PIPE_PATH;
 pub struct IpcServer {
     event_tx: broadcast::Sender<IpcEvent>,
     shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    runtime: parking_lot::Mutex<Option<RuntimeHandle>>,
 }
 
 impl IpcServer {
@@ -21,7 +23,13 @@ impl IpcServer {
         Self {
             event_tx,
             shutdown_tx: parking_lot::Mutex::new(None),
+            runtime: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Wire a RuntimeHandle so IPC commands can drive the runtime.
+    pub fn set_runtime(&self, handle: RuntimeHandle) {
+        *self.runtime.lock() = Some(handle);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<IpcEvent> {
@@ -175,18 +183,44 @@ impl IpcServer {
     }
 
     fn process_message(&self, message: IpcMessage) -> serde_json::Value {
+        // Helper: get a clone of the runtime handle, or return not-ready error.
+        macro_rules! runtime {
+            () => {
+                match self.runtime.lock().clone() {
+                    Some(h) => h,
+                    None => {
+                        return serde_json::json!({
+                            "success": false,
+                            "error": "runtime not yet initialised"
+                        })
+                    }
+                }
+            };
+        }
+
         match message {
             IpcMessage::Status => {
-                serde_json::json!({
-                    "success": true,
-                    "result": { "running": true }
-                })
+                let result = match self.runtime.lock().clone() {
+                    Some(h) => h.status(),
+                    None => serde_json::json!({ "running": true }),
+                };
+                serde_json::json!({ "success": true, "result": result })
             }
+
+            IpcMessage::Stats => {
+                let result = match self.runtime.lock().clone() {
+                    Some(h) => h.status(),
+                    None => serde_json::json!({ "running": true }),
+                };
+                serde_json::json!({ "success": true, "result": result })
+            }
+
             IpcMessage::Reload => {
                 info!("IPC: Reload config requested");
                 self.broadcast_event(IpcEvent::ConfigReloaded);
-                serde_json::json!({"success": true})
+                serde_json::json!({ "success": true })
             }
+
             IpcMessage::Quit => {
                 info!("IPC: Quit requested");
                 if let Some(tx) = self.shutdown_tx.lock().take() {
@@ -195,39 +229,71 @@ impl IpcServer {
                     warn!("IPC Quit: no shutdown channel — calling process::exit");
                     std::process::exit(0);
                 }
-                serde_json::json!({"success": true})
+                serde_json::json!({ "success": true })
             }
-            // Stub responses for round-2 implementations
+
             IpcMessage::Next => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+                let h = runtime!();
+                h.skip_next();
+                serde_json::json!({ "success": true })
             }
+
             IpcMessage::Prev => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+                // Prev requires popping history; the history lives inside Runtime.
+                // For now, skip_next is the closest we can do without a dedicated
+                // prev-path channel. A future round should add a PrevRequest variant.
+                let h = runtime!();
+                let _ = h; // acknowledged
+                serde_json::json!({
+                    "success": false,
+                    "error": "prev requires history channel — not yet fully implemented"
+                })
             }
-            IpcMessage::Pause { .. } => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+
+            IpcMessage::Pause { duration_secs } => {
+                let h = runtime!();
+                let dur = duration_secs.map(std::time::Duration::from_secs);
+                h.pause(dur);
+                self.broadcast_event(IpcEvent::Paused);
+                serde_json::json!({ "success": true })
             }
+
             IpcMessage::Resume => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+                let h = runtime!();
+                h.resume();
+                self.broadcast_event(IpcEvent::Resumed);
+                serde_json::json!({ "success": true })
             }
-            IpcMessage::Set { .. } => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+
+            IpcMessage::Set { path } => {
+                let h = runtime!();
+                h.set_specific(std::path::PathBuf::from(path));
+                serde_json::json!({ "success": true })
             }
-            IpcMessage::SetFolder { .. } => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+
+            IpcMessage::SetFolder { path } => {
+                // SetFolder narrows the active source for this session.
+                // Requires index rebuild — not yet plumbed.
+                let _ = path;
+                serde_json::json!({
+                    "success": false,
+                    "error": "set_folder requires live index rebuild — not yet implemented"
+                })
             }
-            IpcMessage::Rate { .. } => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+
+            IpcMessage::Rate { stars } => {
+                let h = runtime!();
+                h.rate(stars)
             }
-            IpcMessage::Ban { .. } => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
+
+            IpcMessage::Ban { hash } => {
+                let h = runtime!();
+                h.ban(&hash)
             }
-            IpcMessage::Stats => {
-                serde_json::json!({"success": false, "error": "not yet implemented"})
-            }
+
             IpcMessage::SubscribeEvents { .. } => {
-                // Handled above in handle_client before reaching process_message
-                serde_json::json!({"success": true, "subscription_id": 1})
+                // Handled above in handle_client before reaching process_message.
+                serde_json::json!({ "success": true, "subscription_id": 1 })
             }
         }
     }
@@ -238,6 +304,10 @@ impl Default for IpcServer {
         Self::new()
     }
 }
+
+// RuntimeHandle is also imported at the top of this file. Callers outside the
+// module can reach it via `aurora::runtime::RuntimeHandle` since the runtime
+// module is `pub` from lib.rs.
 
 // ---------------------------------------------------------------------------
 // Pipe creation with ACL (Admins + Owner only)

@@ -3,8 +3,13 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use aurora::apply::WallpaperApplier;
 use aurora::config::parse::{default_config_path, parse_kdl_config};
+use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
+use aurora::metrics::{serve_metrics, Metrics};
+use aurora::runtime::{Runtime, RuntimeHandle, RuntimeStateSnapshot};
+use aurora::scheduler::Scheduler;
 
 /// Bundled default configuration — written to disk on first run.
 const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl");
@@ -62,15 +67,87 @@ async fn main() -> Result<()> {
 
     let config_src = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read config {}", config_path.display()))?;
-    let _config = parse_kdl_config(&config_src)
+    let config = parse_kdl_config(&config_src)
         .with_context(|| format!("parse config {}", config_path.display()))?;
 
     info!("Config loaded from {}", config_path.display());
 
     // ---------------------------------------------------------------------------
-    // 5. Start IPC server
+    // 5. Build metrics, applier, runtime
+    // ---------------------------------------------------------------------------
+    let metrics = Metrics::new();
+
+    let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
+
+    let runtime = Runtime::new(&config, applier, Arc::clone(&metrics))
+        .context("initialise Runtime")?;
+
+    // ---------------------------------------------------------------------------
+    // 6. Scheduler — owns the swap channel sender
+    // ---------------------------------------------------------------------------
+    let (scheduler, swap_rx) = Scheduler::new(config.schedule.clone());
+    let scheduler = Arc::new(scheduler);
+
+    // Clone the sender so both wiri integration and the runtime share it.
+    // We derive a sender clone from a new unbounded channel that feeds into
+    // the same receiver as the scheduler's channel — instead, we expose
+    // the scheduler's channel sender via a thin wrapper.
+    //
+    // Actually: the scheduler owns swap_tx internally; wiri sends directly
+    // into it via on_workspace_change(), and we need the raw tx for RuntimeHandle.
+    // Re-create a separate channel so Runtime and wiri can also inject requests.
+    let (extra_tx, extra_rx) = tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
+
+    // Merge: forward scheduler rx + extra rx into a single merged rx.
+    // Use a simple select loop in a spawned task.
+    let (merged_tx, merged_rx) = tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
+
+    {
+        let mtx = merged_tx.clone();
+        tokio::spawn(async move {
+            let mut swap_rx = swap_rx;
+            while let Some(req) = swap_rx.recv().await {
+                if mtx.send(req).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let mtx = merged_tx.clone();
+        tokio::spawn(async move {
+            let mut extra_rx = extra_rx;
+            while let Some(req) = extra_rx.recv().await {
+                if mtx.send(req).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Build shared snapshot state for IPC queries.
+    let snap_state = Arc::new(parking_lot::Mutex::new(RuntimeStateSnapshot {
+        paused: false,
+        current_path: std::collections::HashMap::new(),
+        history_len: 0,
+    }));
+
+    // Build RuntimeHandle (for IPC).
+    let runtime_handle = RuntimeHandle::new(
+        extra_tx.clone(),
+        Arc::clone(&snap_state),
+        runtime.index_arc(),
+        Arc::clone(&metrics),
+    );
+
+    // Extract the shared pause Arc so Runtime::run can check IPC pause state.
+    let pause_arc = runtime_handle.pause_arc();
+
+    // ---------------------------------------------------------------------------
+    // 7. Start IPC server
     // ---------------------------------------------------------------------------
     let ipc = Arc::new(IpcServer::new());
+    ipc.set_runtime(runtime_handle.clone());
 
     // Wire up a shutdown channel so `aurora-ctl quit` can signal us cleanly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -86,8 +163,45 @@ async fn main() -> Result<()> {
     info!("aurora ready. IPC pipe: {}", aurora::ipc::PIPE_PATH);
 
     // ---------------------------------------------------------------------------
-    // 6. Main loop — wait for shutdown signal
-    //    (Real scheduler / watcher arrives in round 2)
+    // 8. Start scheduler
+    // ---------------------------------------------------------------------------
+    tokio::spawn({
+        let s = Arc::clone(&scheduler);
+        async move { s.run().await; }
+    });
+
+    // ---------------------------------------------------------------------------
+    // 9. Wiri integration (optional)
+    // ---------------------------------------------------------------------------
+    if config.schedule.on_workspace_change {
+        let tx = extra_tx.clone();
+        tokio::spawn(async move {
+            let _ = subscribe_wiri_events(tx).await;
+        });
+    }
+
+    // ---------------------------------------------------------------------------
+    // 10. Metrics HTTP server (optional)
+    // ---------------------------------------------------------------------------
+    if config.metrics.enabled {
+        let port = config.metrics.port;
+        let m = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            if let Err(e) = serve_metrics(port, m).await {
+                tracing::warn!("metrics server: {}", e);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------------------
+    // 11. Runtime drain loop
+    // ---------------------------------------------------------------------------
+    tokio::spawn(async move {
+        runtime.run(merged_rx, snap_state, pause_arc).await;
+    });
+
+    // ---------------------------------------------------------------------------
+    // 12. Main loop — wait for shutdown signal
     // ---------------------------------------------------------------------------
     let _ = shutdown_rx.await;
     info!("Shutdown signal received — exiting");

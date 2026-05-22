@@ -281,7 +281,7 @@ fn is_fullscreen_active() -> bool {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
-            if GetMonitorInfoW(hmon, &mut mi).is_err() {
+            if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
                 return false;
             }
 
@@ -310,7 +310,7 @@ fn get_idle_secs() -> u64 {
                 cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
                 dwTime: 0,
             };
-            if GetLastInputInfo(&mut lii).is_err() {
+            if !GetLastInputInfo(&mut lii).as_bool() {
                 return 0;
             }
             let now_ms = GetTickCount() as u64;
