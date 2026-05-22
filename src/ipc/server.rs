@@ -44,6 +44,11 @@ impl IpcServer {
         *self.shutdown_tx.lock() = Some(tx);
     }
 
+    /// Clone the broadcast sender so Runtime can emit events into it.
+    pub fn event_tx_clone(&self) -> broadcast::Sender<IpcEvent> {
+        self.event_tx.clone()
+    }
+
     /// Start the accept loop.  Returns only on fatal pipe error.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("IPC server starting on {} (ACL: Admins+Owner only)", PIPE_PATH);
@@ -294,6 +299,19 @@ impl IpcServer {
             IpcMessage::SubscribeEvents { .. } => {
                 // Handled above in handle_client before reaching process_message.
                 serde_json::json!({ "success": true, "subscription_id": 1 })
+            }
+
+            IpcMessage::GetCurrentWallpaper => {
+                if let Some(handle) = self.runtime.lock().clone() {
+                    let map = handle.current_wallpaper();
+                    let entries: serde_json::Map<String, serde_json::Value> = map
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v.display().to_string())))
+                        .collect();
+                    serde_json::json!({ "success": true, "result": entries })
+                } else {
+                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
+                }
             }
         }
     }

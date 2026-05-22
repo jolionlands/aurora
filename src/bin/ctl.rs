@@ -80,6 +80,9 @@ enum Command {
     /// Reload configuration from disk.
     Reload,
 
+    /// Show which photo is currently displayed on each monitor.
+    CurrentWallpaper,
+
     /// Gracefully stop the aurora daemon.
     Quit,
 }
@@ -187,6 +190,34 @@ async fn main() -> Result<()> {
         Command::Reload => {
             let resp = send_message(&IpcMessage::Reload).await?;
             print_response(&resp, cli.json)?;
+        }
+
+        Command::CurrentWallpaper => {
+            let resp = send_message(&IpcMessage::GetCurrentWallpaper).await?;
+            if cli.json {
+                print_response(&resp, true)?;
+            } else {
+                // Human-readable: one line per monitor
+                let v: serde_json::Value = serde_json::from_slice(&resp)
+                    .unwrap_or_else(|_| serde_json::json!({"success": false, "error": "bad response"}));
+                let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                if success {
+                    if let Some(result) = v.get("result").and_then(|r| r.as_object()) {
+                        let mut monitors: Vec<(&String, &serde_json::Value)> = result.iter().collect();
+                        monitors.sort_by_key(|(k, _)| k.as_str());
+                        for (monitor, path) in monitors {
+                            let path_str = path.as_str().unwrap_or("");
+                            println!("{:<30}  {}", monitor, path_str);
+                        }
+                    } else {
+                        println!("(no wallpaper data)");
+                    }
+                } else {
+                    let error = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+                    eprintln!("error: {}", error);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Command::Quit => {

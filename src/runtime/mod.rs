@@ -17,6 +17,7 @@ use crate::apply::{WallpaperApplier, WallpaperFit};
 use crate::config::types::Config;
 use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
+use crate::ipc::messages::IpcEvent;
 use crate::metrics::Metrics;
 use crate::scheduler::{SwapRequest, SwapReason};
 use crate::transition::{Backend, DecodedImage as TransitionImage, Rect, TransitionRenderer, TransitionStyle};
@@ -71,6 +72,7 @@ pub struct Runtime {
     metrics: Arc<Metrics>,
     state: RuntimeState,
     config: Config,
+    event_tx: Option<tokio::sync::broadcast::Sender<IpcEvent>>,
 }
 
 const HISTORY_CAP: usize = 50;
@@ -114,7 +116,13 @@ impl Runtime {
             metrics,
             state: RuntimeState::new(),
             config: config.clone(),
+            event_tx: None,
         })
+    }
+
+    /// Wire the IPC broadcast sender so Runtime can emit WallpaperChanged events.
+    pub fn set_event_sender(&mut self, tx: tokio::sync::broadcast::Sender<IpcEvent>) {
+        self.event_tx = Some(tx);
     }
 
     /// Expose the photo index Arc so main can hand it to RuntimeHandle.
@@ -252,6 +260,14 @@ impl Runtime {
             self.applier
                 .set_for_monitor(&monitor.id, &new_path)
                 .with_context(|| format!("set_for_monitor {}", &monitor.id))?;
+
+            // Broadcast WallpaperChanged event to IPC subscribers.
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(IpcEvent::WallpaperChanged {
+                    monitor_id: monitor.id.clone(),
+                    path: new_path.display().to_string(),
+                });
+            }
 
             // Update metrics.
             self.metrics
@@ -418,6 +434,11 @@ impl RuntimeHandle {
         let mut index = self.index.write();
         index.ban(hash);
         serde_json::json!({"success": true})
+    }
+
+    /// Return a snapshot of the current wallpaper path for each monitor.
+    pub fn current_wallpaper(&self) -> HashMap<String, PathBuf> {
+        self.state.lock().current_path.clone()
     }
 }
 

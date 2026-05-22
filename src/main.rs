@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aurora::apply::WallpaperApplier;
 use aurora::config::parse::{default_config_path, parse_kdl_config};
+use aurora::hooks::StartupManager;
 use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
 use aurora::metrics::{serve_metrics, Metrics};
@@ -13,6 +15,22 @@ use aurora::scheduler::Scheduler;
 
 /// Bundled default configuration — written to disk on first run.
 const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl");
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(name = "aurora", about = "Wallpaper cycling daemon for Windows", version)]
+struct Args {
+    /// Register aurora in the Windows Run key so it starts with Windows.
+    #[arg(long)]
+    register_autostart: bool,
+
+    /// Remove aurora from the Windows Run key.
+    #[arg(long)]
+    unregister_autostart: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,6 +43,41 @@ async fn main() -> Result<()> {
         .init();
 
     info!("aurora 0.1.0 starting");
+
+    // ---------------------------------------------------------------------------
+    // 1a. Autostart flags — handle BEFORE single-instance check or IPC startup
+    // ---------------------------------------------------------------------------
+    let args = Args::parse();
+
+    if args.register_autostart {
+        let mgr = StartupManager::new();
+        match mgr.register() {
+            Ok(()) => {
+                info!("autostart: registered aurora in Windows Run key ({})", mgr.get_registered_path().unwrap_or_default());
+                println!("aurora registered for autostart.");
+            }
+            Err(e) => {
+                eprintln!("aurora: failed to register autostart: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if args.unregister_autostart {
+        let mgr = StartupManager::new();
+        match mgr.unregister() {
+            Ok(()) => {
+                info!("autostart: removed aurora from Windows Run key");
+                println!("aurora removed from autostart.");
+            }
+            Err(e) => {
+                eprintln!("aurora: failed to unregister autostart: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     // ---------------------------------------------------------------------------
     // 2. COM initialisation (required for WIC + IDesktopWallpaper)
@@ -72,6 +125,16 @@ async fn main() -> Result<()> {
 
     info!("Config loaded from {}", config_path.display());
 
+    // Log autostart status.
+    {
+        let mgr = StartupManager::new();
+        if mgr.is_registered() {
+            info!("autostart: registered (path: {})", mgr.get_registered_path().unwrap_or_default());
+        } else {
+            info!("autostart: not registered (run with --register-autostart to enable)");
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // 5. Build metrics, applier, runtime
     // ---------------------------------------------------------------------------
@@ -79,7 +142,7 @@ async fn main() -> Result<()> {
 
     let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
 
-    let runtime = Runtime::new(&config, applier, Arc::clone(&metrics))
+    let mut runtime = Runtime::new(&config, applier, Arc::clone(&metrics))
         .context("initialise Runtime")?;
 
     // ---------------------------------------------------------------------------
@@ -148,6 +211,9 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     let ipc = Arc::new(IpcServer::new());
     ipc.set_runtime(runtime_handle.clone());
+
+    // Wire IPC broadcast sender into Runtime so it can emit WallpaperChanged events.
+    runtime.set_event_sender(ipc.event_tx_clone());
 
     // Wire up a shutdown channel so `aurora-ctl quit` can signal us cleanly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

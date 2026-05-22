@@ -103,6 +103,10 @@ pub enum IpcMessage {
         #[serde(default)]
         types: Vec<String>,
     },
+
+    /// Query the currently displayed wallpaper path for each monitor.
+    #[serde(rename = "get_current_wallpaper")]
+    GetCurrentWallpaper,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +135,13 @@ pub enum IpcEvent {
     /// Configuration was reloaded from disk.
     #[serde(rename = "config_reloaded")]
     ConfigReloaded,
+
+    /// Emitted each time a wallpaper is successfully applied to a monitor.
+    #[serde(rename = "wallpaper_changed")]
+    WallpaperChanged {
+        monitor_id: String,
+        path: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
