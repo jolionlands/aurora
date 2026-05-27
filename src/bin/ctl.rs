@@ -98,19 +98,29 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
     }
     // Check suffix
     if let Some(val) = s.strip_suffix('h') {
-        let h: u64 = val.trim().parse().map_err(|_| anyhow::anyhow!("invalid hours: {}", val))?;
+        let h: u64 = val
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid hours: {}", val))?;
         return Ok(h * 3600);
     }
     if let Some(val) = s.strip_suffix('m') {
-        let m: u64 = val.trim().parse().map_err(|_| anyhow::anyhow!("invalid minutes: {}", val))?;
+        let m: u64 = val
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid minutes: {}", val))?;
         return Ok(m * 60);
     }
     if let Some(val) = s.strip_suffix('s') {
-        let sec: u64 = val.trim().parse().map_err(|_| anyhow::anyhow!("invalid seconds: {}", val))?;
+        let sec: u64 = val
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid seconds: {}", val))?;
         return Ok(sec);
     }
     // Plain number = seconds
-    s.parse::<u64>().map_err(|_| anyhow::anyhow!("cannot parse duration {:?}", s))
+    s.parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("cannot parse duration {:?}", s))
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +175,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Rate { stars } => {
-            if stars < 1 || stars > 5 {
+            if !(1..=5).contains(&stars) {
                 bail!("star rating must be between 1 and 5, got {}", stars);
             }
             let resp = send_message(&IpcMessage::Rate { stars }).await?;
@@ -198,12 +208,14 @@ async fn main() -> Result<()> {
                 print_response(&resp, true)?;
             } else {
                 // Human-readable: one line per monitor
-                let v: serde_json::Value = serde_json::from_slice(&resp)
-                    .unwrap_or_else(|_| serde_json::json!({"success": false, "error": "bad response"}));
+                let v: serde_json::Value = serde_json::from_slice(&resp).unwrap_or_else(
+                    |_| serde_json::json!({"success": false, "error": "bad response"}),
+                );
                 let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
                 if success {
                     if let Some(result) = v.get("result").and_then(|r| r.as_object()) {
-                        let mut monitors: Vec<(&String, &serde_json::Value)> = result.iter().collect();
+                        let mut monitors: Vec<(&String, &serde_json::Value)> =
+                            result.iter().collect();
                         monitors.sort_by_key(|(k, _)| k.as_str());
                         for (monitor, path) in monitors {
                             let path_str = path.as_str().unwrap_or("");
@@ -213,7 +225,10 @@ async fn main() -> Result<()> {
                         println!("(no wallpaper data)");
                     }
                 } else {
-                    let error = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+                    let error = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown error");
                     eprintln!("error: {}", error);
                     std::process::exit(1);
                 }
@@ -280,9 +295,9 @@ fn print_response(bytes: &[u8], as_json: bool) -> Result<()> {
 
 /// Keep the pipe open and print each event as a JSON line.
 async fn stream_events(types: Vec<String>) -> Result<()> {
+    use aurora::ipc::{IpcMessage, PIPE_PATH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::windows::named_pipe::ClientOptions;
-    use aurora::ipc::{IpcMessage, PIPE_PATH};
 
     let mut client = ClientOptions::new()
         .open(PIPE_PATH)

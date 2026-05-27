@@ -1,7 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::path::PathBuf;
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -117,9 +117,7 @@ impl Metrics {
 
         // cache_hit_ratio
         let ratio = self.cache_hit_ratio();
-        out.push_str(
-            "# HELP aurora_cache_hit_ratio Decode cache hit ratio (0..1)\n",
-        );
+        out.push_str("# HELP aurora_cache_hit_ratio Decode cache hit ratio (0..1)\n");
         out.push_str("# TYPE aurora_cache_hit_ratio gauge\n");
         out.push_str(&format!("aurora_cache_hit_ratio {ratio:.4}\n"));
 
@@ -132,9 +130,7 @@ impl Metrics {
         // decode_ms histogram
         let count = self.decode_ms_count.load(Ordering::Relaxed);
         let sum = self.decode_ms_sum.load(Ordering::Relaxed);
-        out.push_str(
-            "# HELP aurora_decode_ms_bucket Decode latency histogram in milliseconds\n",
-        );
+        out.push_str("# HELP aurora_decode_ms_bucket Decode latency histogram in milliseconds\n");
         out.push_str("# TYPE aurora_decode_ms_bucket histogram\n");
         let bounds = [10u64, 50, 100, 200, 500, 1000];
         let mut cumulative = 0u64;
@@ -206,10 +202,7 @@ pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>) -> Result<()> {
     }
 }
 
-async fn handle_request(
-    stream: &mut tokio::net::TcpStream,
-    metrics: &Arc<Metrics>,
-) -> Result<()> {
+async fn handle_request(stream: &mut tokio::net::TcpStream, metrics: &Arc<Metrics>) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut buf_reader = BufReader::new(reader);
 

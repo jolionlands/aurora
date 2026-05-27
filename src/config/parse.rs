@@ -1,6 +1,6 @@
-use anyhow::{bail, Result};
-use std::path::PathBuf;
 use super::types::*;
+use anyhow::Result;
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Tiny hand-rolled KDL parser
@@ -51,7 +51,10 @@ fn parse_quoted(s: &str, start: usize) -> Option<(String, usize)> {
                 b'\\' => out.push('\\'),
                 b'"' => out.push('"'),
                 b'\'' => out.push('\''),
-                c => { out.push('\\'); out.push(c as char); }
+                c => {
+                    out.push('\\');
+                    out.push(c as char);
+                }
             }
         } else if bytes[i] == quote {
             return Some((out, i + 1));
@@ -61,6 +64,34 @@ fn parse_quoted(s: &str, start: usize) -> Option<(String, usize)> {
         i += 1;
     }
     None // unterminated string — treat as None; caller handles gracefully
+}
+
+fn parse_value_tokens(mut s: &str) -> Vec<String> {
+    let mut values = Vec::new();
+
+    loop {
+        s = s.trim_start();
+        if s.is_empty() {
+            break;
+        }
+
+        if s.starts_with('"') || s.starts_with('\'') {
+            if let Some((value, end)) = parse_quoted(s, 0) {
+                values.push(value);
+                s = &s[end..];
+                continue;
+            }
+        }
+
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        let value = s[..end].trim_matches(|c: char| c == '"' || c == '\'');
+        if !value.is_empty() {
+            values.push(value.to_string());
+        }
+        s = &s[end..];
+    }
+
+    values
 }
 
 /// Parse a single non-blank, non-comment line into a `Line` token.
@@ -77,13 +108,16 @@ fn lex_line(raw: &str) -> Option<Line<'_>> {
 
     // Check for section open: ends with `{` (possibly after a quoted arg).
     // Pattern: `name {` or `name "arg" {`
-    if s.ends_with('{') {
-        let body = s[..s.len() - 1].trim();
+    if let Some(body) = s.strip_suffix('{') {
+        let body = body.trim();
         // Does it have a quoted arg?
-        if let Some(q_start) = body.find(|c| c == '"' || c == '\'') {
+        if let Some(q_start) = body.find(['"', '\'']) {
             let name = body[..q_start].trim();
             if let Some((arg, _)) = parse_quoted(body, q_start) {
-                return Some(Line::SectionOpen { name, arg: Some(arg) });
+                return Some(Line::SectionOpen {
+                    name,
+                    arg: Some(arg),
+                });
             }
         }
         // No quoted arg
@@ -115,6 +149,16 @@ fn lex_line(raw: &str) -> Option<Line<'_>> {
         let after_key = after_key.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
         after_key
     };
+
+    if key == "extensions" {
+        let values = parse_value_tokens(value_start);
+        if !values.is_empty() {
+            return Some(Line::KeyValue {
+                key,
+                value: values.join(","),
+            });
+        }
+    }
 
     if value_start.starts_with('"') || value_start.starts_with('\'') {
         if let Some((v, _)) = parse_quoted(value_start, 0) {
@@ -200,8 +244,15 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             }
 
             Line::KeyValue { key, value } => {
-                apply_kv(&mut config, &mut cur_source, &mut cur_monitor, &section, &key, &value)
-                    .map_err(|e| anyhow::anyhow!("line {}: {}", lineno + 1, e))?;
+                apply_kv(
+                    &mut config,
+                    &mut cur_source,
+                    &mut cur_monitor,
+                    &section,
+                    &key,
+                    &value,
+                )
+                .map_err(|e| anyhow::anyhow!("line {}: {}", lineno + 1, e))?;
             }
 
             Line::Bare { token } => {
@@ -225,19 +276,23 @@ fn parse_bool(v: &str) -> bool {
 }
 
 fn parse_u32(v: &str) -> Result<u32> {
-    v.parse::<u32>().map_err(|_| anyhow::anyhow!("expected u32, got {:?}", v))
+    v.parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("expected u32, got {:?}", v))
 }
 
 fn parse_u64(v: &str) -> Result<u64> {
-    v.parse::<u64>().map_err(|_| anyhow::anyhow!("expected u64, got {:?}", v))
+    v.parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("expected u64, got {:?}", v))
 }
 
 fn parse_u16(v: &str) -> Result<u16> {
-    v.parse::<u16>().map_err(|_| anyhow::anyhow!("expected u16, got {:?}", v))
+    v.parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("expected u16, got {:?}", v))
 }
 
 fn parse_usize(v: &str) -> Result<usize> {
-    v.parse::<usize>().map_err(|_| anyhow::anyhow!("expected usize, got {:?}", v))
+    v.parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("expected usize, got {:?}", v))
 }
 
 fn apply_kv(
@@ -266,7 +321,7 @@ fn apply_kv(
                     "extensions" => {
                         // Comma-separated or space-separated list on one line
                         s.extensions = value
-                            .split(|c: char| c == ',' || c == ' ')
+                            .split([',', ' '])
                             .map(|t| t.trim().to_lowercase())
                             .filter(|t| !t.is_empty())
                             .collect();
@@ -335,7 +390,10 @@ fn apply_kv(
         "triggers.wiri-workspace" | "triggers.wiri_workspace" => {
             // key is the workspace id (as string), value is the command/folder
             if let Ok(id) = key.parse::<i32>() {
-                config.triggers.on_wiri_workspace.push((id, value.to_string()));
+                config
+                    .triggers
+                    .on_wiri_workspace
+                    .push((id, value.to_string()));
             }
         }
 
@@ -403,10 +461,35 @@ mod tests {
         // Verify the parser silently strips it and returns Ok.
         let bom_src = "\u{FEFF}source \"X\" {\n}\n";
         let result = parse_kdl_config(bom_src);
-        assert!(result.is_ok(), "BOM-prefixed config should parse without error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BOM-prefixed config should parse without error: {:?}",
+            result.err()
+        );
         let cfg = result.unwrap();
         // The source path should have been captured as "X".
-        assert_eq!(cfg.sources.len(), 1, "expected 1 source, got {}: {:?}", cfg.sources.len(), cfg.sources);
+        assert_eq!(
+            cfg.sources.len(),
+            1,
+            "expected 1 source, got {}: {:?}",
+            cfg.sources.len(),
+            cfg.sources
+        );
         assert_eq!(cfg.sources[0].path.to_str().unwrap(), "X");
+    }
+
+    #[test]
+    fn test_source_extensions_accept_multiple_quoted_values() {
+        let src = r#"
+source "C:\Users\kalli\Documents\custom_wallpapers" {
+    recursive true
+    extensions "jpg" "jpeg" "png" "heic" "webp"
+}
+"#;
+        let cfg = parse_kdl_config(src).expect("config should parse");
+        assert_eq!(
+            cfg.sources[0].extensions,
+            vec!["jpg", "jpeg", "png", "heic", "webp"]
+        );
     }
 }

@@ -21,7 +21,11 @@ const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl")
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "aurora", about = "Wallpaper cycling daemon for Windows", version)]
+#[command(
+    name = "aurora",
+    about = "Wallpaper cycling daemon for Windows",
+    version
+)]
 struct Args {
     /// Register aurora in the Windows Run key so it starts with Windows.
     #[arg(long)]
@@ -53,7 +57,10 @@ async fn main() -> Result<()> {
         let mgr = StartupManager::new();
         match mgr.register() {
             Ok(()) => {
-                info!("autostart: registered aurora in Windows Run key ({})", mgr.get_registered_path().unwrap_or_default());
+                info!(
+                    "autostart: registered aurora in Windows Run key ({})",
+                    mgr.get_registered_path().unwrap_or_default()
+                );
                 println!("aurora registered for autostart.");
             }
             Err(e) => {
@@ -99,7 +106,10 @@ async fn main() -> Result<()> {
     {
         use tokio::net::windows::named_pipe::ClientOptions;
         if ClientOptions::new().open(aurora::ipc::PIPE_PATH).is_ok() {
-            eprintln!("aurora: another instance is already running (pipe open at {})", aurora::ipc::PIPE_PATH);
+            eprintln!(
+                "aurora: another instance is already running (pipe open at {})",
+                aurora::ipc::PIPE_PATH
+            );
             std::process::exit(1);
         }
     }
@@ -129,7 +139,10 @@ async fn main() -> Result<()> {
     {
         let mgr = StartupManager::new();
         if mgr.is_registered() {
-            info!("autostart: registered (path: {})", mgr.get_registered_path().unwrap_or_default());
+            info!(
+                "autostart: registered (path: {})",
+                mgr.get_registered_path().unwrap_or_default()
+            );
         } else {
             info!("autostart: not registered (run with --register-autostart to enable)");
         }
@@ -142,8 +155,8 @@ async fn main() -> Result<()> {
 
     let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
 
-    let mut runtime = Runtime::new(&config, applier, Arc::clone(&metrics))
-        .context("initialise Runtime")?;
+    let mut runtime =
+        Runtime::new(&config, applier, Arc::clone(&metrics)).context("initialise Runtime")?;
 
     // ---------------------------------------------------------------------------
     // 6. Scheduler — owns the swap channel sender
@@ -159,11 +172,13 @@ async fn main() -> Result<()> {
     // Actually: the scheduler owns swap_tx internally; wiri sends directly
     // into it via on_workspace_change(), and we need the raw tx for RuntimeHandle.
     // Re-create a separate channel so Runtime and wiri can also inject requests.
-    let (extra_tx, extra_rx) = tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
+    let (extra_tx, extra_rx) =
+        tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
 
     // Merge: forward scheduler rx + extra rx into a single merged rx.
     // Use a simple select loop in a spawned task.
-    let (merged_tx, merged_rx) = tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
+    let (merged_tx, merged_rx) =
+        tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
 
     {
         let mtx = merged_tx.clone();
@@ -235,7 +250,9 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     tokio::spawn({
         let s = Arc::clone(&scheduler);
-        async move { s.run().await; }
+        async move {
+            s.run().await;
+        }
     });
 
     // ---------------------------------------------------------------------------

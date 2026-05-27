@@ -19,8 +19,10 @@ use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
 use crate::ipc::messages::IpcEvent;
 use crate::metrics::Metrics;
-use crate::scheduler::{SwapRequest, SwapReason};
-use crate::transition::{Backend, DecodedImage as TransitionImage, Rect, TransitionRenderer, TransitionStyle};
+use crate::scheduler::{SwapReason, SwapRequest};
+use crate::transition::{
+    Backend, DecodedImage as TransitionImage, Rect, TransitionRenderer, TransitionStyle,
+};
 
 // ---------------------------------------------------------------------------
 // RuntimeState
@@ -49,6 +51,7 @@ impl RuntimeState {
     }
 
     /// Returns true if the runtime is currently paused (auto-resumes timed pauses).
+    #[cfg(test)]
     fn is_effectively_paused(&mut self) -> bool {
         if let Some(until) = self.pause_until {
             if Instant::now() >= until {
@@ -94,16 +97,20 @@ impl Runtime {
         let index = if roots.is_empty() {
             PhotoIndex::default()
         } else {
-            PhotoIndex::scan(&roots, &extensions, config.sources.first().map(|s| s.recursive).unwrap_or(true))
-                .context("scanning photo sources")?
+            PhotoIndex::scan(
+                &roots,
+                &extensions,
+                config.sources.first().map(|s| s.recursive).unwrap_or(true),
+            )
+            .context("scanning photo sources")?
         };
 
         let index_size = index.len() as u64;
         metrics.set_index_size(index_size);
         info!("photo index built: {} photos", index_size);
 
-        let style = TransitionStyle::from_str(&config.transitions.style);
-        let backend = Backend::from_str(&config.transitions.renderer);
+        let style = TransitionStyle::parse(&config.transitions.style);
+        let backend = Backend::parse(&config.transitions.renderer);
         let transitions = TransitionRenderer::new(style, config.transitions.duration_ms, backend);
 
         let cache = SharedDecodeCache::new(16);
@@ -130,7 +137,6 @@ impl Runtime {
         Arc::clone(&self.index)
     }
 
-
     /// Consume the runtime, processing SwapRequests until the channel closes.
     ///
     /// `handle_state` is written after each swap so IPC can read status.
@@ -154,7 +160,10 @@ impl Runtime {
                     }
                 }
                 if p.paused {
-                    debug!("runtime paused (IPC) — dropping swap request {:?}", req.reason);
+                    debug!(
+                        "runtime paused (IPC) — dropping swap request {:?}",
+                        req.reason
+                    );
                     continue;
                 }
             }
@@ -175,10 +184,7 @@ impl Runtime {
     }
 
     async fn handle_swap(&mut self, req: SwapRequest) -> Result<()> {
-        let monitors = self
-            .applier
-            .list_monitors()
-            .context("listing monitors")?;
+        let monitors = self.applier.list_monitors().context("listing monitors")?;
 
         if monitors.is_empty() {
             warn!("no monitors found via IDesktopWallpaper — skip swap");
@@ -207,7 +213,7 @@ impl Runtime {
                 .find(|m| m.name == monitor.id)
                 .map(|m| m.fit.as_str())
                 .unwrap_or("fill");
-            let fit = WallpaperFit::from_str(fit_str);
+            let fit = WallpaperFit::parse(fit_str);
             self.applier.set_fit(fit)?;
 
             // Target decode resolution: use monitor bounds if known, else generous default.
@@ -469,11 +475,7 @@ impl RuntimeHandle {
                 .map(|s| s.extensions.clone())
                 .unwrap_or_default()
         };
-        let recursive = config
-            .sources
-            .first()
-            .map(|s| s.recursive)
-            .unwrap_or(true);
+        let recursive = config.sources.first().map(|s| s.recursive).unwrap_or(true);
 
         let new_index = if roots.is_empty() {
             PhotoIndex::default()
@@ -485,7 +487,10 @@ impl RuntimeHandle {
         let new_size = new_index.len() as u64;
         *self.index.write() = new_index;
         self.metrics.set_index_size(new_size);
-        info!("reload_from_disk: photo index rebuilt with {} photos", new_size);
+        info!(
+            "reload_from_disk: photo index rebuilt with {} photos",
+            new_size
+        );
         Ok(())
     }
 
@@ -503,14 +508,17 @@ impl RuntimeHandle {
             info!("set_folder: empty path — clearing session folder override; call reload to restore configured sources");
             PhotoIndex::default()
         } else {
-            PhotoIndex::scan(&[path.clone()], &default_extensions, true)
+            PhotoIndex::scan(std::slice::from_ref(&path), &default_extensions, true)
                 .with_context(|| format!("set_folder: scan {:?}", path))?
         };
 
         let new_size = new_index.len() as u64;
         *self.index.write() = new_index;
         self.metrics.set_index_size(new_size);
-        info!("set_folder: index now contains {} photos from {:?}", new_size, path);
+        info!(
+            "set_folder: index now contains {} photos from {:?}",
+            new_size, path
+        );
         Ok(())
     }
 
@@ -582,7 +590,10 @@ mod tests {
 
         // Timed pause that has already expired should auto-resume.
         state.pause_until = Some(Instant::now() - Duration::from_secs(1));
-        assert!(!state.is_effectively_paused(), "expired timed pause should auto-resume");
+        assert!(
+            !state.is_effectively_paused(),
+            "expired timed pause should auto-resume"
+        );
         assert!(!state.paused);
     }
 
@@ -617,7 +628,13 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+        let handle = RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            metrics,
+            std::path::PathBuf::from("config.kdl"),
+        );
 
         handle.pause(None);
         assert!(handle.pause_arc().lock().paused);
@@ -637,7 +654,13 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+        let handle = RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            metrics,
+            std::path::PathBuf::from("config.kdl"),
+        );
 
         handle.pause(Some(Duration::from_secs(60)));
         let pause_arc = handle.pause_arc();
@@ -670,15 +693,33 @@ mod tests {
         // Start with an empty index.
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, Arc::clone(&metrics), std::path::PathBuf::from("config.kdl"));
+        let handle = RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            Arc::clone(&metrics),
+            std::path::PathBuf::from("config.kdl"),
+        );
 
-        assert_eq!(metrics.index_size.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .index_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
-        handle.set_folder(dir.path().to_path_buf()).expect("set_folder");
+        handle
+            .set_folder(dir.path().to_path_buf())
+            .expect("set_folder");
 
         // After set_folder the index should contain the one JPEG we wrote.
         assert_eq!(handle.index.read().len(), 1);
-        assert_eq!(metrics.index_size.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .index_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -701,9 +742,17 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+        let handle = RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            metrics,
+            std::path::PathBuf::from("config.kdl"),
+        );
 
-        handle.prev().expect("prev should succeed with 3 history entries");
+        handle
+            .prev()
+            .expect("prev should succeed with 3 history entries");
 
         // The swap channel should have received a request for photo_b.jpg (second-to-last).
         let req = rx.try_recv().expect("swap channel should have a message");
@@ -726,7 +775,13 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(tx, state, index, metrics, std::path::PathBuf::from("config.kdl"));
+        let handle = RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            metrics,
+            std::path::PathBuf::from("config.kdl"),
+        );
 
         let result = handle.prev();
         assert!(result.is_err(), "prev on empty history should return Err");

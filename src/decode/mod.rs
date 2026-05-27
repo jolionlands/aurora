@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Decoded image
@@ -30,7 +30,11 @@ pub fn decode_image(path: &Path, target_w: u32, target_h: u32) -> Result<Decoded
     match decode_via_image_crate(path, target_w, target_h) {
         Ok(img) => return Ok(img),
         Err(e) => {
-            tracing::debug!("image crate failed for {:?}: {} — trying WIC fallback", path, e);
+            tracing::debug!(
+                "image crate failed for {:?}: {} — trying WIC fallback",
+                path,
+                e
+            );
         }
     }
 
@@ -59,7 +63,6 @@ fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) 
 
 fn decode_via_image_crate(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedImage> {
     use image::imageops::FilterType;
-    use image::DynamicImage;
 
     let img = image::open(path).with_context(|| format!("image::open({:?})", path))?;
 
@@ -83,17 +86,21 @@ fn decode_via_image_crate(path: &Path, target_w: u32, target_h: u32) -> Result<D
         bgra.push(pixel[3]); // A
     }
 
-    Ok(DecodedImage { width: w, height: h, bgra })
+    Ok(DecodedImage {
+        width: w,
+        height: h,
+        bgra,
+    })
 }
 
 fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedImage> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, IWICBitmapDecoder, IWICBitmapScaler, IWICFormatConverter,
-        IWICImagingFactory, GUID_WICPixelFormat32bppBGRA,
-        WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
-        WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnDemand,
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapDecoder, IWICBitmapScaler,
+        IWICFormatConverter, IWICImagingFactory, WICBitmapDitherTypeNone,
+        WICBitmapInterpolationModeFant, WICBitmapPaletteTypeMedianCut,
+        WICDecodeMetadataCacheOnDemand,
     };
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
@@ -105,12 +112,9 @@ fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedIm
         .collect();
 
     unsafe {
-        let factory: IWICImagingFactory = CoCreateInstance(
-            &CLSID_WICImagingFactory,
-            None,
-            CLSCTX_INPROC_SERVER,
-        )
-        .context("CoCreateInstance(WICImagingFactory)")?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                .context("CoCreateInstance(WICImagingFactory)")?;
 
         let decoder: IWICBitmapDecoder = factory
             .CreateDecoderFromFilename(
@@ -121,13 +125,13 @@ fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedIm
             )
             .context("WIC CreateDecoderFromFilename")?;
 
-        let frame = decoder
-            .GetFrame(0)
-            .context("WIC GetFrame(0)")?;
+        let frame = decoder.GetFrame(0).context("WIC GetFrame(0)")?;
 
         let mut src_w = 0u32;
         let mut src_h = 0u32;
-        frame.GetSize(&mut src_w, &mut src_h).context("WIC GetSize")?;
+        frame
+            .GetSize(&mut src_w, &mut src_h)
+            .context("WIC GetSize")?;
 
         let (new_w, new_h) = fit_dimensions(src_w, src_h, target_w, target_h);
 
@@ -166,7 +170,11 @@ fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedIm
             .CopyPixels(std::ptr::null(), stride, &mut bgra)
             .context("WIC CopyPixels")?;
 
-        Ok(DecodedImage { width: new_w, height: new_h, bgra })
+        Ok(DecodedImage {
+            width: new_w,
+            height: new_h,
+            bgra,
+        })
     }
 }
 
@@ -216,6 +224,10 @@ impl DecodeCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 // Thread-safe wrapper
@@ -226,7 +238,12 @@ impl SharedDecodeCache {
         Self(Mutex::new(DecodeCache::new(capacity)))
     }
 
-    pub fn get_or_decode(&self, path: &Path, target_w: u32, target_h: u32) -> Result<Arc<DecodedImage>> {
+    pub fn get_or_decode(
+        &self,
+        path: &Path,
+        target_w: u32,
+        target_h: u32,
+    ) -> Result<Arc<DecodedImage>> {
         let key = (path.to_path_buf(), target_w, target_h);
         {
             let mut cache = self.0.lock().unwrap();
@@ -281,7 +298,12 @@ mod tests {
         // BGRA: B at 0, G at 1, R at 2, A at 3
         let r = img.bgra[2]; // R channel of first pixel
         let b = img.bgra[0]; // B channel
-        assert!(r > 128, "red channel should be dominant, got R={} B={}", r, b);
+        assert!(
+            r > 128,
+            "red channel should be dominant, got R={} B={}",
+            r,
+            b
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -295,7 +317,13 @@ mod tests {
                 bgra: vec![v, v, v, 255],
             })
         };
-        let k = |n: u32| (std::path::PathBuf::from(format!("img{}.jpg", n)), 10u32, 10u32);
+        let k = |n: u32| {
+            (
+                std::path::PathBuf::from(format!("img{}.jpg", n)),
+                10u32,
+                10u32,
+            )
+        };
 
         cache.insert(k(1), dummy(1));
         cache.insert(k(2), dummy(2));

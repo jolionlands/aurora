@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
-use rand::seq::SliceRandom;
 use rand::Rng;
 
 // ---------------------------------------------------------------------------
@@ -66,8 +65,10 @@ impl PhotoIndex {
     pub fn watch_roots(
         &mut self,
         roots: &[PathBuf],
-    ) -> Result<(RecommendedWatcher, std::sync::mpsc::Receiver<notify::Result<notify::Event>>)>
-    {
+    ) -> Result<(
+        RecommendedWatcher,
+        std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    )> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())
             .context("failed to create filesystem watcher")?;
@@ -198,8 +199,8 @@ fn collect_files(
     recursive: bool,
     index: &mut PhotoIndex,
 ) -> Result<()> {
-    let read_dir = std::fs::read_dir(dir)
-        .with_context(|| format!("cannot read directory {:?}", dir))?;
+    let read_dir =
+        std::fs::read_dir(dir).with_context(|| format!("cannot read directory {:?}", dir))?;
 
     for entry in read_dir {
         let entry = entry.context("error reading directory entry")?;
@@ -260,8 +261,8 @@ fn build_entry(path: &Path, meta: &std::fs::Metadata) -> Result<PhotoEntry> {
 /// Blake3 hash of first 8 KB — returned as lowercase hex.
 fn hash_first_8k(path: &Path) -> Result<String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open {:?} for hashing", path))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {:?} for hashing", path))?;
     let mut buf = vec![0u8; 8192];
     let n = file.read(&mut buf).context("read error")?;
     let digest = blake3::hash(&buf[..n]);

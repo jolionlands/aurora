@@ -171,12 +171,22 @@ impl Scheduler {
 
             // at_times check
             let now_local = chrono::Local::now();
-            let current_hm = (now_local.format("%H").to_string().parse::<u32>().unwrap_or(0),
-                              now_local.format("%M").to_string().parse::<u32>().unwrap_or(0));
+            let current_hm = (
+                now_local
+                    .format("%H")
+                    .to_string()
+                    .parse::<u32>()
+                    .unwrap_or(0),
+                now_local
+                    .format("%M")
+                    .to_string()
+                    .parse::<u32>()
+                    .unwrap_or(0),
+            );
 
             let at_times = parse_at_times(&self.config.at_times);
-            let should_at_fire = at_times.iter().any(|&hm| hm == current_hm)
-                && last_at_fired != Some(current_hm);
+            let should_at_fire =
+                at_times.contains(&current_hm) && last_at_fired != Some(current_hm);
 
             if should_at_fire {
                 last_at_fired = Some(current_hm);
@@ -200,8 +210,9 @@ impl Scheduler {
             if self.config.mode == "interval" || self.config.mode.is_empty() {
                 let due = match st.last_swap {
                     None => true,
-                    Some(last) => Instant::now().duration_since(last).as_secs()
-                        >= self.config.interval_secs,
+                    Some(last) => {
+                        Instant::now().duration_since(last).as_secs() >= self.config.interval_secs
+                    }
                 };
                 if due {
                     let _ = self.swap_tx.send(SwapRequest {
@@ -227,10 +238,7 @@ impl Scheduler {
 
 /// Parse "HH:MM" strings → (hour, minute) tuples.
 pub fn parse_at_times(at_times: &[String]) -> Vec<(u32, u32)> {
-    at_times
-        .iter()
-        .filter_map(|s| parse_hhmm(s).ok())
-        .collect()
+    at_times.iter().filter_map(|s| parse_hhmm(s).ok()).collect()
 }
 
 pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
@@ -238,8 +246,12 @@ pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
     if parts.len() != 2 {
         bail!("invalid at_time format '{}': expected HH:MM", s);
     }
-    let h: u32 = parts[0].parse().map_err(|_| anyhow::anyhow!("invalid hour in '{}'", s))?;
-    let m: u32 = parts[1].parse().map_err(|_| anyhow::anyhow!("invalid minute in '{}'", s))?;
+    let h: u32 = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid hour in '{}'", s))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid minute in '{}'", s))?;
     if h > 23 {
         bail!("hour out of range in '{}'", s);
     }
@@ -258,12 +270,10 @@ fn is_fullscreen_active() -> bool {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowRect,
-        };
         use windows::Win32::Graphics::Gdi::{
-            MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         };
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
 
         unsafe {
             let hwnd = GetForegroundWindow();
@@ -302,8 +312,8 @@ fn is_fullscreen_active() -> bool {
 fn get_idle_secs() -> u64 {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
         use windows::Win32::System::SystemInformation::GetTickCount;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
         unsafe {
             let mut lii = LASTINPUTINFO {
@@ -359,11 +369,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_interval_fires() {
-        let mut config = ScheduleConfig::default();
-        config.interval_secs = 1; // 1-second interval
-        config.mode = "interval".to_string();
-        config.pause_when_fullscreen = false;
-        config.pause_when_idle_secs = 0;
+        let config = ScheduleConfig {
+            interval_secs: 1,
+            mode: "interval".to_string(),
+            pause_when_fullscreen: false,
+            pause_when_idle_secs: 0,
+            ..Default::default()
+        };
 
         let (scheduler, mut rx) = Scheduler::new(config);
 
@@ -374,17 +386,22 @@ mod tests {
 
         // Wait up to 3 seconds for at least one swap request
         let result = tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await;
-        assert!(result.is_ok(), "should have received a swap request within 3s");
+        assert!(
+            result.is_ok(),
+            "should have received a swap request within 3s"
+        );
         assert!(result.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn test_scheduler_pause_blocks_fire() {
-        let mut config = ScheduleConfig::default();
-        config.interval_secs = 1;
-        config.mode = "interval".to_string();
-        config.pause_when_fullscreen = false;
-        config.pause_when_idle_secs = 0;
+        let config = ScheduleConfig {
+            interval_secs: 1,
+            mode: "interval".to_string(),
+            pause_when_fullscreen: false,
+            pause_when_idle_secs: 0,
+            ..Default::default()
+        };
 
         let (scheduler, mut rx) = Scheduler::new(config);
         // Pause before starting
@@ -395,8 +412,7 @@ mod tests {
         });
 
         // After 2s, should have received nothing
-        let result =
-            tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
         assert!(result.is_err(), "paused scheduler should not fire");
     }
 }

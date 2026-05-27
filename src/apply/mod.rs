@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::UI::Shell::{
-    DesktopWallpaper, IDesktopWallpaper, DESKTOP_WALLPAPER_POSITION,
-    DWPOS_CENTER, DWPOS_FILL, DWPOS_FIT, DWPOS_SPAN, DWPOS_STRETCH, DWPOS_TILE,
-};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
+use windows::Win32::UI::Shell::{
+    DesktopWallpaper, IDesktopWallpaper, DESKTOP_WALLPAPER_POSITION, DWPOS_CENTER, DWPOS_FILL,
+    DWPOS_FIT, DWPOS_SPAN, DWPOS_STRETCH, DWPOS_TILE,
+};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -31,7 +31,7 @@ pub enum WallpaperFit {
 }
 
 impl WallpaperFit {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "fill" => WallpaperFit::Fill,
             "contain" | "fit" => WallpaperFit::Contain,
@@ -93,7 +93,9 @@ impl WallpaperApplier {
             };
             // PWSTR::to_string() returns Result<String, FromUtf16Error>
             let id = unsafe {
-                pwstr.to_string().unwrap_or_else(|_| format!("monitor-{}", i))
+                pwstr
+                    .to_string()
+                    .unwrap_or_else(|_| format!("monitor-{}", i))
             };
             monitors.push(MonitorInfo { id, index: i });
         }
@@ -138,13 +140,8 @@ impl WallpaperApplier {
         unsafe {
             // PCWSTR::null() for the monitor ID applies the wallpaper to all monitors.
             self.desktop
-                .SetWallpaper(
-                    PCWSTR::null(),
-                    PCWSTR::from_raw(path_wide.as_ptr()),
-                )
-                .with_context(|| {
-                    format!("IDesktopWallpaper::SetWallpaper(all, path={})", path_str)
-                })
+                .SetWallpaper(PCWSTR::null(), PCWSTR::from_raw(path_wide.as_ptr()))
+                .with_context(|| format!("IDesktopWallpaper::SetWallpaper(all, path={})", path_str))
         }
     }
 

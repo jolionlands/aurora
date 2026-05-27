@@ -118,19 +118,10 @@ impl Default for TransitionConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TriggerConfig {
     pub on_startup: Vec<String>,
     pub on_wiri_workspace: Vec<(i32, String)>,
-}
-
-impl Default for TriggerConfig {
-    fn default() -> Self {
-        Self {
-            on_startup: Vec::new(),
-            on_wiri_workspace: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

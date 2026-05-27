@@ -49,12 +49,12 @@ pub enum TransitionStyle {
 }
 
 impl TransitionStyle {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "crossfade" | "cross" => Self::Crossfade,
             "slideleft" | "slide_left" => Self::SlideLeft,
             "slideright" | "slide_right" => Self::SlideRight,
-            "wipetleft" | "wipe_left" => Self::WipeLeft,
+            "wipeleft" | "wipe_left" => Self::WipeLeft,
             "wiperight" | "wipe_right" => Self::WipeRight,
             "dissolve" => Self::Dissolve,
             "zoomin" | "zoom_in" => Self::ZoomIn,
@@ -82,7 +82,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "gpu" => Self::Gpu,
             "cpu" => Self::Cpu,
@@ -144,12 +144,7 @@ impl TransitionRenderer {
     ///
     /// After this returns, the caller should commit the new wallpaper via
     /// `IDesktopWallpaper::SetWallpaper`.
-    pub fn run(
-        &self,
-        monitor_bounds: Rect,
-        old: &DecodedImage,
-        new: &DecodedImage,
-    ) -> Result<()> {
+    pub fn run(&self, monitor_bounds: Rect, old: &DecodedImage, new: &DecodedImage) -> Result<()> {
         if self.style == TransitionStyle::None || self.duration_ms == 0 {
             return Ok(());
         }

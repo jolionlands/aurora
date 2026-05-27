@@ -41,21 +41,18 @@ fn run_windows(
     style: &TransitionStyle,
     duration_ms: u32,
 ) -> Result<()> {
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        GetDC, ReleaseDC, SelectObject, SetBitmapBits, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, DIB_RGB_COLORS, HBITMAP, SRCCOPY, StretchDIBits, STRETCH_HALFTONE,
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
+        SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-        RegisterClassExW, TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST,
-        MSG, PM_REMOVE, ULW_ALPHA, WINDOW_EX_STYLE, WM_PAINT, WNDCLASSEXW,
-        WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, CS_HREDRAW,
-        CS_VREDRAW, SetWindowPos, SWP_NOACTIVATE,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassExW,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, WNDCLASSEXW, WS_EX_LAYERED,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::COLORREF;
 
     unsafe {
         let class_name: Vec<u16> = "AuroraTransitionCPU\0".encode_utf16().collect();
@@ -96,8 +93,20 @@ fn run_windows(
         let mut blend_buf = vec![0u8; n_pixels * 4];
 
         // Scale old/new to monitor size (simple nearest-neighbour)
-        let old_scaled = scale_to(&old.data, old.width, old.height, width as u32, height as u32);
-        let new_scaled = scale_to(&new.data, new.width, new.height, width as u32, height as u32);
+        let old_scaled = scale_to(
+            &old.data,
+            old.width,
+            old.height,
+            width as u32,
+            height as u32,
+        );
+        let new_scaled = scale_to(
+            &new.data,
+            new.width,
+            new.height,
+            width as u32,
+            height as u32,
+        );
 
         // Pre-generate dissolve mask (random per pixel)
         let dissolve_mask: Vec<f32> = if *style == TransitionStyle::Dissolve {
@@ -151,8 +160,14 @@ fn run_windows(
             // Upload to DC
             StretchDIBits(
                 mem_dc,
-                0, 0, width, height,
-                0, 0, width, height,
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
                 Some(blend_buf.as_ptr() as *const std::ffi::c_void),
                 &bmi,
                 DIB_RGB_COLORS,
@@ -169,9 +184,9 @@ fn run_windows(
             std::thread::sleep(Duration::from_millis(FRAME_INTERVAL_MS));
         }
 
-        DeleteDC(mem_dc);
+        let _ = DeleteDC(mem_dc);
         ReleaseDC(None, screen_dc);
-        DeleteObject(bmp);
+        let _ = DeleteObject(bmp);
         DestroyWindow(hwnd).ok();
     }
 
@@ -213,9 +228,9 @@ fn blend_frame(
         }
         TransitionStyle::Dissolve => {
             // Each pixel transitions from old → new when progress > mask[pixel]
-            for i in 0..n_pixels {
+            for (i, mask) in dissolve_mask.iter().enumerate().take(n_pixels) {
                 let base = i * 4;
-                let src = if progress >= dissolve_mask[i] {
+                let src = if progress >= *mask {
                     &new[base..base + 4]
                 } else {
                     &old[base..base + 4]

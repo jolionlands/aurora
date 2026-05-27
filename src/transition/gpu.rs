@@ -60,34 +60,32 @@ fn run_d2d(
     style: &TransitionStyle,
     duration_ms: u32,
 ) -> Result<()> {
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows::Win32::Graphics::Direct2D::{
-        D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
-        D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-        D2D1_BITMAP_PROPERTIES, D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-        D2D1_HWND_RENDER_TARGET_PROPERTIES,
-        D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_RENDER_TARGET_PROPERTIES,
-        D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-        D2D1_FEATURE_LEVEL_DEFAULT,
-    };
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HINSTANCE, HWND};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
     };
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+        D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+        D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+        D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1_RENDER_TARGET_USAGE_NONE,
+    };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-        RegisterClassExW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassExW,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, WNDCLASSEXW, WS_EX_LAYERED,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
-    use windows::core::PCWSTR;
 
     unsafe {
         // ----------------------------------------------------------------
         // Create D2D factory
         // ----------------------------------------------------------------
-        let factory: ID2D1Factory =
-            D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
-                .context("D2D1CreateFactory failed")?;
+        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
+            .context("D2D1CreateFactory failed")?;
 
         // ----------------------------------------------------------------
         // Register + create a fullscreen topmost HWND
@@ -152,10 +150,20 @@ fn run_d2d(
         // ----------------------------------------------------------------
         // Upload bitmaps
         // ----------------------------------------------------------------
-        let old_scaled =
-            scale_to(&old.data, old.width, old.height, monitor_bounds.width, monitor_bounds.height);
-        let new_scaled =
-            scale_to(&new.data, new.width, new.height, monitor_bounds.width, monitor_bounds.height);
+        let old_scaled = scale_to(
+            &old.data,
+            old.width,
+            old.height,
+            monitor_bounds.width,
+            monitor_bounds.height,
+        );
+        let new_scaled = scale_to(
+            &new.data,
+            new.width,
+            new.height,
+            monitor_bounds.width,
+            monitor_bounds.height,
+        );
 
         let bmp_props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
@@ -172,10 +180,20 @@ fn run_d2d(
         let pitch = monitor_bounds.width * 4;
 
         let bmp_old: ID2D1Bitmap = rt
-            .CreateBitmap(bmp_size, Some(old_scaled.as_ptr() as *const _), pitch, &bmp_props)
+            .CreateBitmap(
+                bmp_size,
+                Some(old_scaled.as_ptr() as *const _),
+                pitch,
+                &bmp_props,
+            )
             .context("CreateBitmap (old) failed")?;
         let bmp_new: ID2D1Bitmap = rt
-            .CreateBitmap(bmp_size, Some(new_scaled.as_ptr() as *const _), pitch, &bmp_props)
+            .CreateBitmap(
+                bmp_size,
+                Some(new_scaled.as_ptr() as *const _),
+                pitch,
+                &bmp_props,
+            )
             .context("CreateBitmap (new) failed")?;
 
         // Dissolve mask (generated once before render loop)
@@ -202,9 +220,19 @@ fn run_d2d(
             let progress = (elapsed.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0);
 
             rt.BeginDraw();
-            rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
+            rt.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            }));
 
-            let full_rect = D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h };
+            let full_rect = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: w,
+                bottom: h,
+            };
 
             match style {
                 TransitionStyle::Crossfade => {
@@ -239,10 +267,20 @@ fn run_d2d(
                         right: w * 2.0 - offset,
                         bottom: h,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&old_dest), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&new_dest), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&old_dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&new_dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
 
                 TransitionStyle::SlideRight => {
@@ -259,10 +297,20 @@ fn run_d2d(
                         right: offset,
                         bottom: h,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&old_dest), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&new_dest), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&old_dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&new_dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
 
                 TransitionStyle::WipeLeft => {
@@ -274,10 +322,20 @@ fn run_d2d(
                         right: clip_w,
                         bottom: h,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&full_rect), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&clip_rect), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&clip_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&full_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&clip_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&clip_rect),
+                    );
                 }
 
                 TransitionStyle::WipeRight => {
@@ -288,10 +346,20 @@ fn run_d2d(
                         right: w,
                         bottom: h,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&full_rect), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&clip_rect), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&clip_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&full_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&clip_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&clip_rect),
+                    );
                 }
 
                 TransitionStyle::Dissolve => {
@@ -300,14 +368,12 @@ fn run_d2d(
                     // We CPU-blend and re-upload (acceptable for dissolve which is
                     // already pixel-scattered).
                     let mut frame_buf = vec![0u8; n_pixels * 4];
-                    for i in 0..n_pixels {
+                    for (i, mask) in dissolve_mask.iter().enumerate().take(n_pixels) {
                         let base = i * 4;
-                        if progress >= dissolve_mask[i] {
-                            frame_buf[base..base + 4]
-                                .copy_from_slice(&new_scaled[base..base + 4]);
+                        if progress >= *mask {
+                            frame_buf[base..base + 4].copy_from_slice(&new_scaled[base..base + 4]);
                         } else {
-                            frame_buf[base..base + 4]
-                                .copy_from_slice(&old_scaled[base..base + 4]);
+                            frame_buf[base..base + 4].copy_from_slice(&old_scaled[base..base + 4]);
                         }
                     }
                     // Upload frame as a fresh bitmap
@@ -317,8 +383,13 @@ fn run_d2d(
                         pitch,
                         &bmp_props,
                     ) {
-                        rt.DrawBitmap(&bmp_frame, Some(&full_rect), 1.0,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                        rt.DrawBitmap(
+                            &bmp_frame,
+                            Some(&full_rect),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            Some(&full_rect),
+                        );
                     }
                 }
 
@@ -333,10 +404,20 @@ fn run_d2d(
                         right: w - pad_x,
                         bottom: h - pad_y,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&full_rect), 1.0 - progress,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&zoom_rect), progress,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&full_rect),
+                        1.0 - progress,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&zoom_rect),
+                        progress,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
 
                 TransitionStyle::ZoomOut => {
@@ -350,15 +431,30 @@ fn run_d2d(
                         right: w - pad_x,
                         bottom: h - pad_y,
                     };
-                    rt.DrawBitmap(&bmp_old, Some(&zoom_rect), inv,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
-                    rt.DrawBitmap(&bmp_new, Some(&full_rect), progress,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                    rt.DrawBitmap(
+                        &bmp_old,
+                        Some(&zoom_rect),
+                        inv,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&full_rect),
+                        progress,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
 
                 TransitionStyle::None => {
-                    rt.DrawBitmap(&bmp_new, Some(&full_rect), 1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full_rect));
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&full_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
             }
 

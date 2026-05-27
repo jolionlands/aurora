@@ -138,10 +138,7 @@ pub enum IpcEvent {
 
     /// Emitted each time a wallpaper is successfully applied to a monitor.
     #[serde(rename = "wallpaper_changed")]
-    WallpaperChanged {
-        monitor_id: String,
-        path: String,
-    },
+    WallpaperChanged { monitor_id: String, path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -156,14 +153,20 @@ mod tests {
     fn test_status_roundtrip() {
         let msg = IpcMessage::Status;
         let raw = serde_json::to_string(&msg).unwrap();
-        assert!(raw.contains("\"status\""), "tag should be 'status': {}", raw);
+        assert!(
+            raw.contains("\"status\""),
+            "tag should be 'status': {}",
+            raw
+        );
         let parsed: IpcMessage = serde_json::from_str(&raw).unwrap();
         assert!(matches!(parsed, IpcMessage::Status));
     }
 
     #[test]
     fn test_pause_no_duration() {
-        let msg = IpcMessage::Pause { duration_secs: None };
+        let msg = IpcMessage::Pause {
+            duration_secs: None,
+        };
         let raw = serde_json::to_string(&msg).unwrap();
         let parsed: IpcMessage = serde_json::from_str(&raw).unwrap();
         match parsed {
@@ -174,7 +177,9 @@ mod tests {
 
     #[test]
     fn test_pause_with_duration() {
-        let msg = IpcMessage::Pause { duration_secs: Some(3600) };
+        let msg = IpcMessage::Pause {
+            duration_secs: Some(3600),
+        };
         let raw = serde_json::to_string(&msg).unwrap();
         let parsed: IpcMessage = serde_json::from_str(&raw).unwrap();
         match parsed {
@@ -193,7 +198,11 @@ mod tests {
         let raw = serde_json::to_string(&ev).unwrap();
         let parsed: IpcEvent = serde_json::from_str(&raw).unwrap();
         match parsed {
-            IpcEvent::Swapped { monitor, path, ts_ms } => {
+            IpcEvent::Swapped {
+                monitor,
+                path,
+                ts_ms,
+            } => {
                 assert_eq!(monitor, r"\\.\DISPLAY1\Monitor0");
                 assert_eq!(ts_ms, 1_700_000_000_000);
                 let _ = path;

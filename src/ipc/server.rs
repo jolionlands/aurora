@@ -51,7 +51,10 @@ impl IpcServer {
 
     /// Start the accept loop.  Returns only on fatal pipe error.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        info!("IPC server starting on {} (ACL: Admins+Owner only)", PIPE_PATH);
+        info!(
+            "IPC server starting on {} (ACL: Admins+Owner only)",
+            PIPE_PATH
+        );
 
         const MAX_RETRIES: u32 = 5;
         let mut retry_count = 0u32;
@@ -65,30 +68,40 @@ impl IpcServer {
                     first_instance = false;
                     s
                 }
-                Err(e) if first_instance => {
-                    match create_pipe_with_sa(false) {
-                        Ok(s) => {
-                            retry_count = 0;
-                            first_instance = false;
-                            s
-                        }
-                        Err(e2) => {
-                            retry_count += 1;
-                            warn!("Pipe create failed ({}/{}): {} / {}", retry_count, MAX_RETRIES, e, e2);
-                            if retry_count >= MAX_RETRIES {
-                                error!("IPC pipe creation failed {} times — giving up.", MAX_RETRIES);
-                                return Err(anyhow::anyhow!("Cannot create IPC pipe: {} / {}", e, e2));
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
+                Err(e) if first_instance => match create_pipe_with_sa(false) {
+                    Ok(s) => {
+                        retry_count = 0;
+                        first_instance = false;
+                        s
                     }
-                }
+                    Err(e2) => {
+                        retry_count += 1;
+                        warn!(
+                            "Pipe create failed ({}/{}): {} / {}",
+                            retry_count, MAX_RETRIES, e, e2
+                        );
+                        if retry_count >= MAX_RETRIES {
+                            error!(
+                                "IPC pipe creation failed {} times — giving up.",
+                                MAX_RETRIES
+                            );
+                            return Err(anyhow::anyhow!("Cannot create IPC pipe: {} / {}", e, e2));
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                },
                 Err(e) => {
                     retry_count += 1;
-                    warn!("Pipe create failed ({}/{}): {}", retry_count, MAX_RETRIES, e);
+                    warn!(
+                        "Pipe create failed ({}/{}): {}",
+                        retry_count, MAX_RETRIES, e
+                    );
                     if retry_count >= MAX_RETRIES {
-                        error!("IPC pipe creation failed {} times — giving up.", MAX_RETRIES);
+                        error!(
+                            "IPC pipe creation failed {} times — giving up.",
+                            MAX_RETRIES
+                        );
                         return Err(anyhow::anyhow!("Cannot create IPC pipe: {}", e));
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -151,7 +164,9 @@ impl IpcServer {
             // SubscribeEvents: ack, then stream events until client disconnects.
             if let IpcMessage::SubscribeEvents { ref types } = message {
                 info!("IPC: SubscribeEvents {:?}", types);
-                let ack = serde_json::to_vec(&serde_json::json!({"success": true, "subscription_id": 1}))?;
+                let ack = serde_json::to_vec(
+                    &serde_json::json!({"success": true, "subscription_id": 1}),
+                )?;
                 let _ = pipe.write_all(&ack).await;
 
                 let mut rx = self.event_tx.subscribe();
@@ -160,7 +175,10 @@ impl IpcServer {
                         Ok(ev) => {
                             let bytes = match serde_json::to_vec(&ev) {
                                 Ok(b) => b,
-                                Err(e) => { warn!("IPC: serialize event: {}", e); continue; }
+                                Err(e) => {
+                                    warn!("IPC: serialize event: {}", e);
+                                    continue;
+                                }
                             };
                             if pipe.write_all(&bytes).await.is_err() {
                                 debug!("IPC event subscriber disconnected");
@@ -345,7 +363,10 @@ fn create_pipe_with_sa(
     let sa_opt = match build_pipe_security_attributes() {
         Ok(s) => Some(s),
         Err(e) => {
-            warn!("Failed to build pipe security attributes: {} — using defaults", e);
+            warn!(
+                "Failed to build pipe security attributes: {} — using defaults",
+                e
+            );
             None
         }
     };
@@ -365,18 +386,17 @@ fn create_pipe_with_sa(
     Ok(server)
 }
 
-pub fn build_pipe_security_attributes() -> Result<windows::Win32::Security::SECURITY_ATTRIBUTES, anyhow::Error> {
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+pub fn build_pipe_security_attributes(
+) -> Result<windows::Win32::Security::SECURITY_ATTRIBUTES, anyhow::Error> {
+    use windows::core::PCWSTR;
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows::core::PCWSTR;
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 
     // D:(A;;GA;;;BA) = Allow GenericAll to BUILTIN\Administrators
     // (A;;GA;;;OW)   = Allow GenericAll to the object Owner
-    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;OW)\0"
-        .encode_utf16()
-        .collect();
+    let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;OW)\0".encode_utf16().collect();
 
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -402,7 +422,6 @@ pub fn build_pipe_security_attributes() -> Result<windows::Win32::Security::SECU
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_ipc_status_roundtrip() {
@@ -426,10 +445,14 @@ mod tests {
                 let n = s.read(&mut buf).await.expect("read");
                 let msg: IpcMessage = serde_json::from_slice(&buf[..n]).expect("parse");
                 let response = match msg {
-                    IpcMessage::Status => serde_json::json!({"success": true, "result": {"running": true}}),
+                    IpcMessage::Status => {
+                        serde_json::json!({"success": true, "result": {"running": true}})
+                    }
                     _ => serde_json::json!({"success": false}),
                 };
-                s.write_all(&serde_json::to_vec(&response).unwrap()).await.expect("write");
+                s.write_all(&serde_json::to_vec(&response).unwrap())
+                    .await
+                    .expect("write");
                 s.flush().await.expect("flush");
                 s.shutdown().await.ok();
                 n
@@ -452,7 +475,10 @@ mod tests {
             .expect("client write");
 
         let mut response_buf = Vec::new();
-        client.read_to_end(&mut response_buf).await.expect("client read");
+        client
+            .read_to_end(&mut response_buf)
+            .await
+            .expect("client read");
 
         let response: serde_json::Value =
             serde_json::from_slice(&response_buf).expect("parse response");

@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::scheduler::{SwapRequest, SwapReason};
+use crate::scheduler::{SwapReason, SwapRequest};
 
 const PIPE_NAME: &str = r"\\.\pipe\wiri_control";
 const RETRY_SECS: u64 = 30;
@@ -16,9 +16,7 @@ const RETRY_SECS: u64 = 30;
 /// Subscribe to wiri workspace events and forward them as SwapRequests.
 ///
 /// Spawns in the background — never returns under normal operation.
-pub async fn subscribe_wiri_events(
-    swap_tx: mpsc::UnboundedSender<SwapRequest>,
-) -> Result<()> {
+pub async fn subscribe_wiri_events(swap_tx: mpsc::UnboundedSender<SwapRequest>) -> Result<()> {
     loop {
         match try_connect_and_subscribe(&swap_tx).await {
             Ok(()) => {
@@ -34,9 +32,7 @@ pub async fn subscribe_wiri_events(
     }
 }
 
-async fn try_connect_and_subscribe(
-    swap_tx: &mpsc::UnboundedSender<SwapRequest>,
-) -> Result<()> {
+async fn try_connect_and_subscribe(swap_tx: &mpsc::UnboundedSender<SwapRequest>) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         connect_windows(swap_tx).await
@@ -51,9 +47,8 @@ async fn try_connect_and_subscribe(
 }
 
 #[cfg(target_os = "windows")]
-async fn connect_windows(
-    swap_tx: &mpsc::UnboundedSender<SwapRequest>,
-) -> Result<()> {
+#[allow(clippy::collapsible_match)]
+async fn connect_windows(swap_tx: &mpsc::UnboundedSender<SwapRequest>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ClientOptions;
 
@@ -66,7 +61,9 @@ async fn connect_windows(
     // Send subscription request
     let subscribe_msg = serde_json::json!({
         "type": "subscribe_events",
-        "event_types": ["workspace_switched"]
+        "data": {
+            "event_types": ["workspace_switched"]
+        }
     });
     let mut msg_bytes = serde_json::to_vec(&subscribe_msg)?;
     msg_bytes.push(b'\n');
