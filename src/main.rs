@@ -10,6 +10,7 @@ use aurora::hooks::StartupManager;
 use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
 use aurora::metrics::{serve_metrics, Metrics};
+use aurora::playlist::default_playlists_path;
 use aurora::runtime::{Runtime, RuntimeHandle, RuntimeStateSnapshot};
 use aurora::scheduler::Scheduler;
 
@@ -218,6 +219,8 @@ async fn main() -> Result<()> {
         runtime.index_arc(),
         Arc::clone(&metrics),
         config_path.clone(),
+        runtime.playlist_arc(),
+        default_playlists_path(),
     );
 
     // Extract the shared pause Arc so Runtime::run can check IPC pause state.

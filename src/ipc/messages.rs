@@ -107,6 +107,38 @@ pub enum IpcMessage {
     /// Query the currently displayed wallpaper path for each monitor.
     #[serde(rename = "get_current_wallpaper")]
     GetCurrentWallpaper,
+
+    // ------------------------------------------------------------------
+    // Playlist management
+    // ------------------------------------------------------------------
+
+    /// List all playlists and the active one.
+    #[serde(rename = "playlist_list")]
+    PlaylistList,
+
+    /// Create an empty playlist.
+    #[serde(rename = "playlist_create")]
+    PlaylistCreate { name: String },
+
+    /// Add a path to a playlist.
+    #[serde(rename = "playlist_add")]
+    PlaylistAdd { name: String, path: String },
+
+    /// Remove a path from a playlist.
+    #[serde(rename = "playlist_remove")]
+    PlaylistRemove { name: String, path: String },
+
+    /// Set the active playlist and immediately apply one of its wallpapers.
+    #[serde(rename = "playlist_activate")]
+    PlaylistActivate { name: String },
+
+    /// Clear the active playlist (return to full-index rotation).
+    #[serde(rename = "playlist_deactivate")]
+    PlaylistDeactivate,
+
+    /// Delete a playlist.
+    #[serde(rename = "playlist_delete")]
+    PlaylistDelete { name: String },
 }
 
 // ---------------------------------------------------------------------------

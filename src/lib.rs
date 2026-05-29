@@ -6,6 +6,7 @@ pub mod index;
 pub mod integrations;
 pub mod ipc;
 pub mod metrics;
+pub mod playlist;
 pub mod runtime;
 pub mod scheduler;
 pub mod transition;

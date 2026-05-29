@@ -337,6 +337,64 @@ impl IpcServer {
                     serde_json::json!({ "success": false, "error": "runtime not initialised" })
                 }
             }
+
+            // ------------------------------------------------------------------
+            // Playlist management
+            // ------------------------------------------------------------------
+
+            IpcMessage::PlaylistList => {
+                let h = runtime!();
+                let result = h.playlist_list();
+                serde_json::json!({ "success": true, "result": result })
+            }
+
+            IpcMessage::PlaylistCreate { name } => {
+                let h = runtime!();
+                match h.playlist_create(&name) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistAdd { name, path } => {
+                let h = runtime!();
+                match h.playlist_add(&name, &path) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistRemove { name, path } => {
+                let h = runtime!();
+                match h.playlist_remove(&name, &path) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistActivate { name } => {
+                let h = runtime!();
+                match h.playlist_activate(&name) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistDeactivate => {
+                let h = runtime!();
+                match h.playlist_deactivate() {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistDelete { name } => {
+                let h = runtime!();
+                match h.playlist_delete(&name) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
         }
     }
 }

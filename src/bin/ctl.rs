@@ -85,6 +85,58 @@ enum Command {
 
     /// Gracefully stop the aurora daemon.
     Quit,
+
+    /// Manage wallpaper playlists.
+    Playlist {
+        #[command(subcommand)]
+        action: PlaylistCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaylistCommand {
+    /// Print all playlists and which one is active.
+    List,
+
+    /// Create an empty playlist.
+    Create {
+        /// Name of the new playlist.
+        name: String,
+    },
+
+    /// Add a path to a playlist.
+    ///
+    /// Use the special value "current" to add whatever wallpaper is currently
+    /// displayed.
+    Add {
+        /// Name of the playlist.
+        name: String,
+        /// Relative or absolute path, or "current".
+        path: String,
+    },
+
+    /// Remove a path from a playlist.
+    Remove {
+        /// Name of the playlist.
+        name: String,
+        /// Path to remove (must match exactly what was added).
+        path: String,
+    },
+
+    /// Set the active playlist and immediately apply one of its wallpapers.
+    Activate {
+        /// Name of the playlist to activate.
+        name: String,
+    },
+
+    /// Clear the active playlist (return to full-index rotation).
+    Deactivate,
+
+    /// Delete a playlist entirely.
+    Delete {
+        /// Name of the playlist to delete.
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +290,119 @@ async fn main() -> Result<()> {
         Command::Quit => {
             let resp = send_message(&IpcMessage::Quit).await?;
             print_response(&resp, cli.json)?;
+        }
+
+        Command::Playlist { action } => {
+            handle_playlist(action, cli.json).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Playlist subcommand handler
+// ---------------------------------------------------------------------------
+
+async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Result<()> {
+    use aurora::ipc::{send_message, IpcMessage};
+
+    match action {
+        PlaylistCommand::List => {
+            let resp = send_message(&IpcMessage::PlaylistList).await?;
+            if as_json {
+                print_response(&resp, true)?;
+            } else {
+                let v: serde_json::Value = serde_json::from_slice(&resp)
+                    .unwrap_or_else(|_| serde_json::json!({"success": false, "error": "bad response"}));
+                let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                if success {
+                    let result = v.get("result").unwrap_or(&serde_json::Value::Null);
+                    let active = result.get("active").and_then(|a| a.as_str());
+                    let playlists = result
+                        .get("playlists")
+                        .and_then(|p| p.as_array())
+                        .map(|a| a.as_slice())
+                        .unwrap_or(&[]);
+                    if playlists.is_empty() {
+                        println!("(no playlists)");
+                    } else {
+                        for pl in playlists {
+                            let name = pl.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let shuffle = pl.get("shuffle").and_then(|s| s.as_bool()).unwrap_or(false);
+                            let count = pl
+                                .get("paths")
+                                .and_then(|p| p.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let marker = if active == Some(name) { " [active]" } else { "" };
+                            println!(
+                                "{}{} — {} file(s), shuffle: {}",
+                                name, marker, count, shuffle
+                            );
+                        }
+                    }
+                } else {
+                    let error = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+                    eprintln!("error: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        PlaylistCommand::Create { name } => {
+            let resp = send_message(&IpcMessage::PlaylistCreate { name }).await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Add { name, path } => {
+            // Resolve "current" to the actual wallpaper via a GetCurrentWallpaper round-trip.
+            let resolved_path = if path.eq_ignore_ascii_case("current") {
+                let resp = send_message(&IpcMessage::GetCurrentWallpaper).await?;
+                let v: serde_json::Value = serde_json::from_slice(&resp)
+                    .map_err(|e| anyhow::anyhow!("bad response from daemon: {}", e))?;
+                let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                if !success {
+                    let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                    anyhow::bail!("could not get current wallpaper: {}", err);
+                }
+                // Pick the first monitor's path.
+                v.get("result")
+                    .and_then(|r| r.as_object())
+                    .and_then(|m| m.values().next())
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("no current wallpaper reported by daemon"))?
+            } else {
+                path
+            };
+
+            let resp = send_message(&IpcMessage::PlaylistAdd {
+                name,
+                path: resolved_path,
+            })
+            .await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Remove { name, path } => {
+            let resp = send_message(&IpcMessage::PlaylistRemove { name, path }).await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Activate { name } => {
+            let resp = send_message(&IpcMessage::PlaylistActivate { name }).await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Deactivate => {
+            let resp = send_message(&IpcMessage::PlaylistDeactivate).await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Delete { name } => {
+            let resp = send_message(&IpcMessage::PlaylistDelete { name }).await?;
+            print_response(&resp, as_json)?;
         }
     }
 

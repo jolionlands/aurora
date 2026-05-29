@@ -19,6 +19,9 @@ use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
 use crate::ipc::messages::IpcEvent;
 use crate::metrics::Metrics;
+use crate::playlist::{
+    default_playlists_path, load_playlists, persist_playlists, PlaylistStore,
+};
 use crate::scheduler::{SwapReason, SwapRequest};
 use crate::transition::{
     Backend, DecodedImage as TransitionImage, Rect, TransitionRenderer, TransitionStyle,
@@ -76,6 +79,10 @@ pub struct Runtime {
     state: RuntimeState,
     config: Config,
     event_tx: Option<tokio::sync::broadcast::Sender<IpcEvent>>,
+    /// Shared playlist store — also held by RuntimeHandle for IPC mutations.
+    playlist_store: Arc<Mutex<PlaylistStore>>,
+    /// Sequential cursor: playlist_name → next_index.
+    playlist_cursor: std::collections::HashMap<String, usize>,
 }
 
 const HISTORY_CAP: usize = 50;
@@ -115,6 +122,16 @@ impl Runtime {
 
         let cache = SharedDecodeCache::new(16);
 
+        // Load playlist store from disk (creates empty default if file is absent).
+        let playlists_path = default_playlists_path();
+        let playlist_store = match load_playlists(&playlists_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to load playlists from {}: {} — starting with empty store", playlists_path.display(), e);
+                PlaylistStore::default()
+            }
+        };
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             cache,
@@ -124,6 +141,8 @@ impl Runtime {
             state: RuntimeState::new(),
             config: config.clone(),
             event_tx: None,
+            playlist_store: Arc::new(Mutex::new(playlist_store)),
+            playlist_cursor: std::collections::HashMap::new(),
         })
     }
 
@@ -135,6 +154,11 @@ impl Runtime {
     /// Expose the photo index Arc so main can hand it to RuntimeHandle.
     pub fn index_arc(&self) -> Arc<RwLock<PhotoIndex>> {
         Arc::clone(&self.index)
+    }
+
+    /// Expose the playlist store Arc so main can hand it to RuntimeHandle.
+    pub fn playlist_arc(&self) -> Arc<Mutex<PlaylistStore>> {
+        Arc::clone(&self.playlist_store)
     }
 
     /// Consume the runtime, processing SwapRequests until the channel closes.
@@ -195,12 +219,43 @@ impl Runtime {
         let new_path: PathBuf = if let Some(specific) = req.specific {
             specific
         } else {
-            let index = self.index.read();
-            let recent_window = self.config.schedule.min_repeat_window;
-            let entry = index
-                .pick_random(recent_window, &self.state.recent_paths)
-                .ok_or_else(|| anyhow::anyhow!("photo index is empty or all photos are banned"))?;
-            entry.path.clone()
+            // When a playlist is active, pick from it; otherwise use the full index.
+            let source_root = self
+                .config
+                .sources
+                .first()
+                .map(|s| s.path.clone());
+
+            let playlist_pick = {
+                let store = self.playlist_store.lock();
+                if store.active.is_some() {
+                    store.pick(source_root.as_deref(), &mut self.playlist_cursor)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(path) = playlist_pick {
+                path
+            } else if self.playlist_store.lock().active.is_some() {
+                // Playlist is active but all files are missing — fall through to index with a warning.
+                warn!("active playlist has no accessible files — falling back to full index");
+                let index = self.index.read();
+                let recent_window = self.config.schedule.min_repeat_window;
+                index
+                    .pick_random(recent_window, &self.state.recent_paths)
+                    .ok_or_else(|| anyhow::anyhow!("photo index is empty or all photos are banned"))?
+                    .path
+                    .clone()
+            } else {
+                let index = self.index.read();
+                let recent_window = self.config.schedule.min_repeat_window;
+                index
+                    .pick_random(recent_window, &self.state.recent_paths)
+                    .ok_or_else(|| anyhow::anyhow!("photo index is empty or all photos are banned"))?
+                    .path
+                    .clone()
+            }
         };
 
         // Per-monitor loop.
@@ -352,6 +407,10 @@ pub struct RuntimeHandle {
     paused: Arc<Mutex<PauseState>>,
     /// Path to the config file on disk, used by reload_from_disk().
     config_path: Arc<std::path::PathBuf>,
+    /// Shared playlist store.  IPC commands mutate this and persist to disk.
+    pub(crate) playlist_store: Arc<Mutex<PlaylistStore>>,
+    /// Path to the playlists KDL file on disk.
+    playlists_path: Arc<std::path::PathBuf>,
 }
 
 pub struct PauseState {
@@ -366,6 +425,8 @@ impl RuntimeHandle {
         index: Arc<RwLock<PhotoIndex>>,
         metrics: Arc<Metrics>,
         config_path: std::path::PathBuf,
+        playlist_store: Arc<Mutex<PlaylistStore>>,
+        playlists_path: std::path::PathBuf,
     ) -> Self {
         Self {
             swap_tx,
@@ -377,6 +438,8 @@ impl RuntimeHandle {
                 pause_until: None,
             })),
             config_path: Arc::new(config_path),
+            playlist_store,
+            playlists_path: Arc::new(playlists_path),
         }
     }
 
@@ -522,6 +585,96 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Playlist methods
+    // -----------------------------------------------------------------------
+
+    /// Return a JSON summary of all playlists + the active one.
+    pub fn playlist_list(&self) -> serde_json::Value {
+        let store = self.playlist_store.lock();
+        let items: Vec<serde_json::Value> = store
+            .playlists
+            .iter()
+            .map(|pl| {
+                serde_json::json!({
+                    "name": pl.name,
+                    "shuffle": pl.shuffle,
+                    "paths": pl.paths,
+                    "active": store.active.as_deref() == Some(pl.name.as_str()),
+                })
+            })
+            .collect();
+        serde_json::json!({ "playlists": items, "active": store.active })
+    }
+
+    /// Create an empty playlist and persist.
+    pub fn playlist_create(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.create(name)?;
+        }
+        self.persist_playlists()
+    }
+
+    /// Add a path to a playlist and persist.
+    pub fn playlist_add(&self, name: &str, path: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.add_path(name, path)?;
+        }
+        self.persist_playlists()
+    }
+
+    /// Remove a path from a playlist and persist.
+    pub fn playlist_remove(&self, name: &str, path: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.remove_path(name, path)?;
+        }
+        self.persist_playlists()
+    }
+
+    /// Activate a playlist, persist, and immediately trigger a swap.
+    pub fn playlist_activate(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.activate(name)?;
+        }
+        self.persist_playlists()?;
+        // Trigger an immediate swap so the new playlist's wallpaper shows at once.
+        let _ = self.swap_tx.send(SwapRequest {
+            reason: SwapReason::Manual,
+            specific: None,
+        });
+        Ok(())
+    }
+
+    /// Deactivate the current playlist and persist.
+    pub fn playlist_deactivate(&self) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.deactivate();
+        }
+        self.persist_playlists()
+    }
+
+    /// Delete a playlist and persist.
+    pub fn playlist_delete(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.delete(name)?;
+        }
+        self.persist_playlists()
+    }
+
+    /// Atomically write the playlist store to disk.
+    fn persist_playlists(&self) -> anyhow::Result<()> {
+        let store = self.playlist_store.lock();
+        persist_playlists(&store, &self.playlists_path)
+    }
+
+    // -----------------------------------------------------------------------
+
     /// Restore the previous photo from the history ring.
     /// Returns an error if there is no previous entry (history has fewer than 2 entries).
     pub fn prev(&self) -> anyhow::Result<()> {
@@ -552,6 +705,24 @@ impl RuntimeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convenience wrapper for tests that don't care about playlist persistence.
+    fn make_handle(
+        tx: mpsc::UnboundedSender<SwapRequest>,
+        state: Arc<Mutex<RuntimeStateSnapshot>>,
+        index: Arc<RwLock<PhotoIndex>>,
+        metrics: Arc<Metrics>,
+    ) -> RuntimeHandle {
+        RuntimeHandle::new(
+            tx,
+            state,
+            index,
+            metrics,
+            std::path::PathBuf::from("config.kdl"),
+            Arc::new(Mutex::new(PlaylistStore::default())),
+            std::path::PathBuf::from("playlists.kdl"),
+        )
+    }
 
     // -----------------------------------------------------------------------
     // test_runtime_history_bounded
@@ -628,13 +799,7 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(
-            tx,
-            state,
-            index,
-            metrics,
-            std::path::PathBuf::from("config.kdl"),
-        );
+        let handle = make_handle(tx, state, index, metrics);
 
         handle.pause(None);
         assert!(handle.pause_arc().lock().paused);
@@ -654,13 +819,7 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(
-            tx,
-            state,
-            index,
-            metrics,
-            std::path::PathBuf::from("config.kdl"),
-        );
+        let handle = make_handle(tx, state, index, metrics);
 
         handle.pause(Some(Duration::from_secs(60)));
         let pause_arc = handle.pause_arc();
@@ -693,13 +852,7 @@ mod tests {
         // Start with an empty index.
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(
-            tx,
-            state,
-            index,
-            Arc::clone(&metrics),
-            std::path::PathBuf::from("config.kdl"),
-        );
+        let handle = make_handle(tx, state, index, Arc::clone(&metrics));
 
         assert_eq!(
             metrics
@@ -742,13 +895,7 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(
-            tx,
-            state,
-            index,
-            metrics,
-            std::path::PathBuf::from("config.kdl"),
-        );
+        let handle = make_handle(tx, state, index, metrics);
 
         handle
             .prev()
@@ -775,13 +922,7 @@ mod tests {
         }));
         let index = Arc::new(RwLock::new(PhotoIndex::default()));
         let metrics = Metrics::new();
-        let handle = RuntimeHandle::new(
-            tx,
-            state,
-            index,
-            metrics,
-            std::path::PathBuf::from("config.kdl"),
-        );
+        let handle = make_handle(tx, state, index, metrics);
 
         let result = handle.prev();
         assert!(result.is_err(), "prev on empty history should return Err");
