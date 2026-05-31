@@ -120,7 +120,16 @@ impl Runtime {
         let backend = Backend::parse(&config.transitions.renderer);
         let transitions = TransitionRenderer::new(style, config.transitions.duration_ms, backend);
 
-        let cache = SharedDecodeCache::new(16);
+        let bytes_per_4k_bgra = 3840usize * 2160usize * 4usize;
+        let configured_cache_bytes = (config.cache.decoded_mb as usize).saturating_mul(1024 * 1024);
+        let cache_capacity = (configured_cache_bytes / bytes_per_4k_bgra)
+            .max(config.cache.prefetch_count.saturating_add(1))
+            .max(1);
+        info!(
+            "decode cache capacity: {} entries (~{} MB budget)",
+            cache_capacity, config.cache.decoded_mb
+        );
+        let cache = SharedDecodeCache::new(cache_capacity);
 
         // Load playlist store from disk (creates empty default if file is absent).
         let playlists_path = default_playlists_path();
