@@ -280,9 +280,7 @@ impl Runtime {
             let fit = WallpaperFit::parse(fit_str);
             self.applier.set_fit(fit)?;
 
-            // Target decode resolution: use monitor bounds if known, else generous default.
-            // IDesktopWallpaper doesn't expose resolution directly so we use a safe default.
-            let (tw, th) = (3840u32, 2160u32);
+            let (tw, th) = (monitor.width, monitor.height);
 
             // Decode the new image.
             let t0 = std::time::Instant::now();
