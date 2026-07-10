@@ -31,6 +31,42 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// Resize an image to cover the monitor while preserving aspect ratio, then
+/// crop the centered excess. This matches `IDesktopWallpaper`'s `fill` mode.
+pub(crate) fn scale_to_cover(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let output_len = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(0);
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return vec![0; output_len];
+    }
+
+    let Some(source) = image::RgbaImage::from_raw(src_w, src_h, src.to_vec()) else {
+        return vec![0; output_len];
+    };
+    let scale = (dst_w as f64 / src_w as f64).max(dst_h as f64 / src_h as f64);
+    let scaled_w = ((src_w as f64 * scale).ceil() as u32).max(dst_w);
+    let scaled_h = ((src_h as f64 * scale).ceil() as u32).max(dst_h);
+    let scaled = image::imageops::resize(
+        &source,
+        scaled_w,
+        scaled_h,
+        image::imageops::FilterType::Triangle,
+    );
+    let left = (scaled_w - dst_w) / 2;
+    let top = (scaled_h - dst_h) / 2;
+    image::imageops::crop_imm(&scaled, left, top, dst_w, dst_h)
+        .to_image()
+        .into_raw()
+}
+
 // ---------------------------------------------------------------------------
 // Style
 // ---------------------------------------------------------------------------
@@ -163,5 +199,26 @@ impl TransitionRenderer {
                 cpu::run_transition(monitor_bounds, old, new, effective_style, self.duration_ms)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_to_cover;
+
+    #[test]
+    fn scale_to_cover_crops_without_stretching() {
+        // 4x2 source covered into a 2x2 target: the left/right edges crop.
+        let mut src = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4u8 {
+                src.extend_from_slice(&[x, 0, 0, 255]);
+            }
+        }
+        let out = scale_to_cover(&src, 4, 2, 2, 2);
+        assert_eq!(out.len(), 16);
+        assert_eq!(out[0], out[8]);
+        assert!(out[0] > 0 && out[0] < 3);
+        assert!(out[4] > out[0]);
     }
 }

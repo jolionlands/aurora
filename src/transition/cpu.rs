@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use super::{DecodedImage, Rect, TransitionStyle};
+use super::{scale_to_cover, DecodedImage, Rect, TransitionStyle};
 
 // Frame target: 60 fps ≈ 16.67 ms per frame
 const FRAME_INTERVAL_MS: u64 = 17;
@@ -96,15 +96,15 @@ fn run_windows(
         // Allocate a blended BGRA buffer
         let mut blend_buf = vec![0u8; n_pixels * 4];
 
-        // Scale old/new to monitor size (simple nearest-neighbour)
-        let old_scaled = scale_to(
+        // Scale old/new to monitor size with the same centered crop as Windows.
+        let old_scaled = scale_to_cover(
             &old.data,
             old.width,
             old.height,
             width as u32,
             height as u32,
         );
-        let new_scaled = scale_to(
+        let new_scaled = scale_to_cover(
             &new.data,
             new.width,
             new.height,
@@ -259,7 +259,8 @@ fn blend_frame(
                 } else {
                     &old[base..base + 4]
                 };
-                out[base..base + 4].copy_from_slice(src);
+                out[base..base + 3].copy_from_slice(&src[..3]);
+                out[base + 3] = 255;
             }
         }
         // For any other style (shouldn't reach here in v1), fall back to crossfade
@@ -280,21 +281,4 @@ fn blend_frame(
 #[inline]
 fn blend_u8(a: u8, b: u8, wa: f32, wb: f32) -> u8 {
     ((a as f32 * wa) + (b as f32 * wb)).clamp(0.0, 255.0) as u8
-}
-
-/// Nearest-neighbour scale of a BGRA buffer.
-fn scale_to(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
-    for dy in 0..dst_h {
-        let sy = (dy as f32 * src_h as f32 / dst_h as f32) as u32;
-        for dx in 0..dst_w {
-            let sx = (dx as f32 * src_w as f32 / dst_w as f32) as u32;
-            let src_idx = ((sy * src_w + sx) * 4) as usize;
-            let dst_idx = ((dy * dst_w + dx) * 4) as usize;
-            if src_idx + 3 < src.len() && dst_idx + 3 < out.len() {
-                out[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
-            }
-        }
-    }
-    out
 }

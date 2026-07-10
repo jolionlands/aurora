@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use super::{DecodedImage, Rect, TransitionStyle};
+use super::{scale_to_cover, DecodedImage, Rect, TransitionStyle};
 
 const FRAME_INTERVAL_MS: u64 = 17; // ~60 fps
 
@@ -33,7 +33,6 @@ pub fn is_available() -> bool {
         false
     }
 }
-
 pub fn run_transition(
     monitor_bounds: Rect,
     old: &DecodedImage,
@@ -63,7 +62,8 @@ fn run_d2d(
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HINSTANCE, HWND};
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+        D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+        D2D_RECT_F, D2D_SIZE_U,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
@@ -150,14 +150,14 @@ fn run_d2d(
         // ----------------------------------------------------------------
         // Upload bitmaps
         // ----------------------------------------------------------------
-        let old_scaled = scale_to(
+        let old_scaled = scale_to_cover(
             &old.data,
             old.width,
             old.height,
             monitor_bounds.width,
             monitor_bounds.height,
         );
-        let new_scaled = scale_to(
+        let new_scaled = scale_to_cover(
             &new.data,
             new.width,
             new.height,
@@ -168,7 +168,7 @@ fn run_d2d(
         let bmp_props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
             },
             dpiX: 96.0,
             dpiY: 96.0,
@@ -485,21 +485,4 @@ unsafe extern "system" fn d2d_wnd_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// Nearest-neighbour BGRA scale.
-fn scale_to(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
-    for dy in 0..dst_h {
-        let sy = (dy as f32 * src_h as f32 / dst_h as f32) as u32;
-        for dx in 0..dst_w {
-            let sx = (dx as f32 * src_w as f32 / dst_w as f32) as u32;
-            let s = ((sy * src_w + sx) * 4) as usize;
-            let d = ((dy * dst_w + dx) * 4) as usize;
-            if s + 3 < src.len() && d + 3 < out.len() {
-                out[d..d + 4].copy_from_slice(&src[s..s + 4]);
-            }
-        }
-    }
-    out
 }
