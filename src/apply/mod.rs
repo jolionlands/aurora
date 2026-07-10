@@ -18,6 +18,10 @@ pub struct MonitorInfo {
     pub id: String,
     /// 0-based display index as returned by the shell API.
     pub index: u32,
+    /// Physical monitor origin in virtual-screen coordinates.
+    pub x: i32,
+    /// Physical monitor origin in virtual-screen coordinates.
+    pub y: i32,
     /// Physical monitor width in pixels.
     pub width: u32,
     /// Physical monitor height in pixels.
@@ -82,6 +86,8 @@ impl WallpaperApplier {
 
     /// Enumerate all monitors known to the shell wallpaper API.
     pub fn list_monitors(&self) -> Result<Vec<MonitorInfo>> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+
         let count = unsafe {
             self.desktop
                 .GetMonitorDevicePathCount()
@@ -97,29 +103,30 @@ impl WallpaperApplier {
             };
             // PWSTR::to_string() returns Result<String, FromUtf16Error>
             let id = unsafe {
-                pwstr
+                let id = pwstr
                     .to_string()
-                    .unwrap_or_else(|_| format!("monitor-{}", i))
+                    .unwrap_or_else(|_| format!("monitor-{}", i));
+                CoTaskMemFree(Some(pwstr.0.cast()));
+                id
             };
-            let mut width = 3840u32;
-            let mut height = 2160u32;
             let monitor_wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0u16)).collect();
-            if let Ok(rect) = unsafe {
+            let rect = unsafe {
                 self.desktop
                     .GetMonitorRECT(PCWSTR::from_raw(monitor_wide.as_ptr()))
-            } {
-                let w = rect.right.saturating_sub(rect.left);
-                let h = rect.bottom.saturating_sub(rect.top);
-                if w > 0 && h > 0 {
-                    width = w as u32;
-                    height = h as u32;
-                }
+                    .with_context(|| format!("GetMonitorRECT({})", id))?
+            };
+            let width = rect.right.saturating_sub(rect.left);
+            let height = rect.bottom.saturating_sub(rect.top);
+            if width <= 0 || height <= 0 {
+                anyhow::bail!("GetMonitorRECT({}) returned an empty rectangle", id);
             }
             monitors.push(MonitorInfo {
                 id,
                 index: i,
-                width,
-                height,
+                x: rect.left,
+                y: rect.top,
+                width: width as u32,
+                height: height as u32,
             });
         }
         Ok(monitors)
@@ -170,6 +177,8 @@ impl WallpaperApplier {
 
     /// Get the current wallpaper path for a specific monitor.
     pub fn get_current(&self, monitor_id: &str) -> Result<Option<std::path::PathBuf>> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+
         let monitor_wide: Vec<u16> = monitor_id
             .encode_utf16()
             .chain(std::iter::once(0u16))
@@ -191,7 +200,11 @@ impl WallpaperApplier {
             }
         };
 
-        let s = unsafe { pwstr.to_string().unwrap_or_default() };
+        let s = unsafe {
+            let s = pwstr.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(pwstr.0.cast()));
+            s
+        };
         if s.is_empty() {
             Ok(None)
         } else {

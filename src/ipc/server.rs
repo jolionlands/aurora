@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::messages::{IpcEvent, IpcMessage};
-use super::PIPE_PATH;
+use super::{read_frame, write_frame, PIPE_PATH};
 use crate::runtime::RuntimeHandle;
 
 // ---------------------------------------------------------------------------
@@ -129,80 +129,78 @@ impl IpcServer {
         &self,
         mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
     ) -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
-        let mut buffer = vec![0u8; 65536];
+        let payload = match read_frame(&mut pipe).await? {
+            Some(payload) => payload,
+            None => {
+                info!("IPC client disconnected");
+                return Ok(());
+            }
+        };
 
-        loop {
-            let n = match pipe.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("IPC client disconnected");
-                    return Ok(());
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        info!("IPC client disconnected (broken pipe)");
-                        return Ok(());
-                    }
-                    return Err(e.into());
-                }
-            };
+        let message: IpcMessage = match serde_json::from_slice(&payload) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("IPC: Failed to parse message: {}", e);
+                let err = serde_json::json!({
+                    "success": false,
+                    "error": format!("Invalid message: {}", e)
+                });
+                let bytes = serde_json::to_vec(&err)?;
+                let _ = write_frame(&mut pipe, &bytes).await;
+                let _ = pipe.shutdown().await;
+                return Ok(());
+            }
+        };
 
-            let message: IpcMessage = match serde_json::from_slice(&buffer[..n]) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("IPC: Failed to parse message: {}", e);
-                    let err = serde_json::json!({"success": false, "error": format!("Invalid message: {}", e)});
-                    let _ = pipe.write_all(&serde_json::to_vec(&err)?).await;
-                    continue;
-                }
-            };
+        debug!("IPC received: {:?}", message);
 
-            debug!("IPC received: {:?}", message);
+        // SubscribeEvents: ack, then stream events until client disconnects.
+        if let IpcMessage::SubscribeEvents { ref types } = message {
+            info!("IPC: SubscribeEvents {:?}", types);
+            let type_filter = types.clone();
+            let ack =
+                serde_json::to_vec(&serde_json::json!({"success": true, "subscription_id": 1}))?;
+            write_frame(&mut pipe, &ack).await?;
 
-            // SubscribeEvents: ack, then stream events until client disconnects.
-            if let IpcMessage::SubscribeEvents { ref types } = message {
-                info!("IPC: SubscribeEvents {:?}", types);
-                let ack = serde_json::to_vec(
-                    &serde_json::json!({"success": true, "subscription_id": 1}),
-                )?;
-                let _ = pipe.write_all(&ack).await;
-
-                let mut rx = self.event_tx.subscribe();
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            let bytes = match serde_json::to_vec(&ev) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!("IPC: serialize event: {}", e);
-                                    continue;
-                                }
-                            };
-                            if pipe.write_all(&bytes).await.is_err() {
-                                debug!("IPC event subscriber disconnected");
-                                return Ok(());
+            let mut rx = self.event_tx.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if !type_filter.is_empty()
+                            && !type_filter.iter().any(|wanted| wanted == event_type(&ev))
+                        {
+                            continue;
+                        }
+                        let bytes = match serde_json::to_vec(&ev) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("IPC: serialize event: {}", e);
+                                continue;
                             }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("IPC event subscriber lagged by {} events", n);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            debug!("IPC event broadcast channel closed");
+                        };
+                        if write_frame(&mut pipe, &bytes).await.is_err() {
+                            debug!("IPC event subscriber disconnected");
                             return Ok(());
                         }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("IPC event subscriber lagged by {} events", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("IPC event broadcast channel closed");
+                        return Ok(());
+                    }
                 }
             }
-
-            let response = self.process_message(message);
-            let bytes = serde_json::to_vec(&response)?;
-            let _ = pipe.write_all(&bytes).await;
-            let _ = pipe.flush().await;
-            let _ = pipe.shutdown().await;
-            return Ok(());
         }
+
+        let response = self.process_message(message);
+        let bytes = serde_json::to_vec(&response)?;
+        write_frame(&mut pipe, &bytes).await?;
+        let _ = pipe.shutdown().await;
+        Ok(())
     }
 
     fn process_message(&self, message: IpcMessage) -> serde_json::Value {
@@ -244,7 +242,13 @@ impl IpcServer {
                     match handle.reload_from_disk() {
                         Ok(()) => {
                             self.broadcast_event(IpcEvent::ConfigReloaded);
-                            serde_json::json!({ "success": true })
+                            serde_json::json!({
+                                "success": true,
+                                "result": {
+                                    "index_reloaded": true,
+                                    "restart_required": ["schedule", "transitions", "monitors", "cache"]
+                                }
+                            })
                         }
                         Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
                     }
@@ -295,8 +299,10 @@ impl IpcServer {
 
             IpcMessage::Set { path } => {
                 let h = runtime!();
-                h.set_specific(std::path::PathBuf::from(path));
-                serde_json::json!({ "success": true })
+                match h.set_specific(std::path::PathBuf::from(path)) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
             }
 
             IpcMessage::SetFolder { path } => {
@@ -341,7 +347,6 @@ impl IpcServer {
             // ------------------------------------------------------------------
             // Playlist management
             // ------------------------------------------------------------------
-
             IpcMessage::PlaylistList => {
                 let h = runtime!();
                 let result = h.playlist_list();
@@ -359,6 +364,39 @@ impl IpcServer {
             IpcMessage::PlaylistAdd { name, path } => {
                 let h = runtime!();
                 match h.playlist_add(&name, &path) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistTag {
+                name,
+                path,
+                kind,
+                tags,
+            } => {
+                let h = runtime!();
+                match h.playlist_tag(&name, &path, &kind, tags) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistRate { name, path, rating } => {
+                let h = runtime!();
+                match h.playlist_rate(&name, &path, rating) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistFrequency {
+                name,
+                path,
+                frequency,
+            } => {
+                let h = runtime!();
+                match h.playlist_frequency(&name, &path, frequency) {
                     Ok(()) => serde_json::json!({ "success": true }),
                     Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
                 }
@@ -399,6 +437,16 @@ impl IpcServer {
     }
 }
 
+fn event_type(event: &IpcEvent) -> &'static str {
+    match event {
+        IpcEvent::Swapped { .. } => "swapped",
+        IpcEvent::Paused => "paused",
+        IpcEvent::Resumed => "resumed",
+        IpcEvent::ConfigReloaded => "config_reloaded",
+        IpcEvent::WallpaperChanged { .. } => "wallpaper_changed",
+    }
+}
+
 impl Default for IpcServer {
     fn default() -> Self {
         Self::new()
@@ -418,34 +466,39 @@ fn create_pipe_with_sa(
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    let sa_opt = match build_pipe_security_attributes() {
-        Ok(s) => Some(s),
-        Err(e) => {
-            warn!(
-                "Failed to build pipe security attributes: {} — using defaults",
-                e
-            );
-            None
-        }
-    };
-    let sa_ptr: *mut std::ffi::c_void = match &sa_opt {
-        Some(sa) => sa as *const _ as *mut std::ffi::c_void,
-        None => std::ptr::null_mut(),
-    };
+    // Never fall back to the default named-pipe ACL: that can grant control to
+    // users outside the daemon owner/Administrators SDDL below.
+    let sa = build_pipe_security_attributes()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let sa_ptr = &sa.raw as *const _ as *mut std::ffi::c_void;
 
-    // SAFETY: sa_ptr is either null or points to local stack that outlives this
-    // synchronous call. The SA is dropped before any .await in the caller.
-    let server = unsafe {
+    // SAFETY: sa_ptr points to local stack that outlives this
+    // synchronous call. The owned descriptor is freed when this function exits.
+    Ok(unsafe {
         ServerOptions::new()
             .first_pipe_instance(first_instance)
             .create_with_security_attributes_raw(PIPE_PATH, sa_ptr)?
-    };
-    let _ = sa_opt; // keep alive until after create
-    Ok(server)
+    })
 }
 
-pub fn build_pipe_security_attributes(
-) -> Result<windows::Win32::Security::SECURITY_ATTRIBUTES, anyhow::Error> {
+struct OwnedPipeSecurityAttributes {
+    raw: windows::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+impl Drop for OwnedPipeSecurityAttributes {
+    fn drop(&mut self) {
+        if !self.raw.lpSecurityDescriptor.is_null() {
+            use windows::Win32::Foundation::{LocalFree, HLOCAL};
+            // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW
+            // allocates this descriptor with LocalAlloc.
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.raw.lpSecurityDescriptor));
+            }
+        }
+    }
+}
+
+fn build_pipe_security_attributes() -> Result<OwnedPipeSecurityAttributes, anyhow::Error> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -466,10 +519,12 @@ pub fn build_pipe_security_attributes(
         )?;
     }
 
-    Ok(windows::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: false.into(),
+    Ok(OwnedPipeSecurityAttributes {
+        raw: windows::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        },
     })
 }
 
@@ -481,9 +536,27 @@ pub fn build_pipe_security_attributes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn event_type_matches_wire_names() {
+        assert_eq!(event_type(&IpcEvent::Paused), "paused");
+        assert_eq!(
+            event_type(&IpcEvent::WallpaperChanged {
+                monitor_id: "m".into(),
+                path: "p".into(),
+            }),
+            "wallpaper_changed"
+        );
+    }
+
+    #[test]
+    fn pipe_security_attributes_build_and_drop() {
+        let attrs = build_pipe_security_attributes().expect("build pipe ACL");
+        assert!(!attrs.raw.lpSecurityDescriptor.is_null());
+    }
+
     #[tokio::test]
     async fn test_ipc_status_roundtrip() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
         // Use a unique pipe name for the test to avoid clashing with a running daemon.
@@ -497,25 +570,22 @@ mod tests {
                 .expect("create test pipe");
 
             server.connect().await.expect("connect");
-            let mut buf = vec![0u8; 4096];
-            let n = {
-                let mut s = server;
-                let n = s.read(&mut buf).await.expect("read");
-                let msg: IpcMessage = serde_json::from_slice(&buf[..n]).expect("parse");
-                let response = match msg {
-                    IpcMessage::Status => {
-                        serde_json::json!({"success": true, "result": {"running": true}})
-                    }
-                    _ => serde_json::json!({"success": false}),
-                };
-                s.write_all(&serde_json::to_vec(&response).unwrap())
-                    .await
-                    .expect("write");
-                s.flush().await.expect("flush");
-                s.shutdown().await.ok();
-                n
+            let mut s = server;
+            let payload = read_frame(&mut s)
+                .await
+                .expect("read frame")
+                .expect("client frame");
+            let msg: IpcMessage = serde_json::from_slice(&payload).expect("parse");
+            let response = match msg {
+                IpcMessage::Status => {
+                    serde_json::json!({"success": true, "result": {"running": true}})
+                }
+                _ => serde_json::json!({"success": false}),
             };
-            n
+            write_frame(&mut s, &serde_json::to_vec(&response).unwrap())
+                .await
+                .expect("write frame");
+            s.shutdown().await.ok();
         });
 
         // Give the server a moment to create the pipe.
@@ -527,16 +597,14 @@ mod tests {
             .expect("open client pipe");
 
         let msg = IpcMessage::Status;
-        client
-            .write_all(&serde_json::to_vec(&msg).unwrap())
+        write_frame(&mut client, &serde_json::to_vec(&msg).unwrap())
             .await
             .expect("client write");
 
-        let mut response_buf = Vec::new();
-        client
-            .read_to_end(&mut response_buf)
+        let response_buf = read_frame(&mut client)
             .await
-            .expect("client read");
+            .expect("client read frame")
+            .expect("response frame");
 
         let response: serde_json::Value =
             serde_json::from_slice(&response_buf).expect("parse response");

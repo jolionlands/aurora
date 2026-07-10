@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,51 @@ pub struct DecodedImage {
     pub bgra: Vec<u8>,
 }
 
+/// Refuse inputs that would make the image decoder or autotag payload
+/// unbounded before reading the full file into memory.
+pub const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
+fn validate_file_size(path: &Path) -> Result<()> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("metadata for image {:?}", path))?;
+    if !metadata.is_file() {
+        bail!("image path is not a file: {:?}", path);
+    }
+    if metadata.len() > MAX_IMAGE_FILE_BYTES {
+        bail!(
+            "image file {:?} is {} bytes; maximum is {} bytes",
+            path,
+            metadata.len(),
+            MAX_IMAGE_FILE_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn validate_pixel_dimensions(width: u32, height: u32) -> Result<()> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        bail!(
+            "image dimensions {}x{} ({} pixels) exceed maximum of {} pixels",
+            width,
+            height,
+            pixels,
+            MAX_IMAGE_PIXELS
+        );
+    }
+    Ok(())
+}
+
+/// Validate an image before callers read or decode its full contents.
+pub fn validate_image_file(path: &Path) -> Result<(u32, u32)> {
+    validate_file_size(path)?;
+    let dimensions = image::image_dimensions(path)
+        .with_context(|| format!("read image dimensions for {:?}", path))?;
+    validate_pixel_dimensions(dimensions.0, dimensions.1)?;
+    Ok(dimensions)
+}
+
 // ---------------------------------------------------------------------------
 // Decode pipeline
 // ---------------------------------------------------------------------------
@@ -26,6 +71,13 @@ pub struct DecodedImage {
 /// Fallback path: Windows Imaging Component (WIC) for formats like HEIC that
 /// the `image` crate does not support.
 pub fn decode_image(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedImage> {
+    validate_file_size(path)?;
+    // `image_dimensions` reads only the format header. If this format is
+    // WIC-only, the fallback validates dimensions after opening its frame.
+    if let Ok((src_w, src_h)) = image::image_dimensions(path) {
+        validate_pixel_dimensions(src_w, src_h)?;
+    }
+
     // Try the pure-Rust `image` crate first.
     match decode_via_image_crate(path, target_w, target_h) {
         Ok(img) => return Ok(img),
@@ -133,6 +185,8 @@ fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedIm
             .GetSize(&mut src_w, &mut src_h)
             .context("WIC GetSize")?;
 
+        validate_pixel_dimensions(src_w, src_h)?;
+
         let (new_w, new_h) = fit_dimensions(src_w, src_h, target_w, target_h);
 
         // Scale via IWICBitmapScaler
@@ -186,13 +240,24 @@ type CacheKey = (std::path::PathBuf, u32, u32);
 
 pub struct DecodeCache {
     capacity: usize,
+    max_bytes: usize,
+    bytes: usize,
     entries: VecDeque<(CacheKey, Arc<DecodedImage>)>,
 }
 
 impl DecodeCache {
     pub fn new(capacity: usize) -> Self {
+        Self::with_byte_budget(capacity, usize::MAX)
+    }
+
+    /// Build a count- and byte-bounded cache.  The byte limit is based on the
+    /// actual decoded BGRA buffers, rather than a fixed resolution estimate,
+    /// so a cache of large-monitor images cannot silently exceed its budget.
+    pub fn with_byte_budget(capacity: usize, max_bytes: usize) -> Self {
         Self {
             capacity: capacity.max(1),
+            max_bytes,
+            bytes: 0,
             entries: VecDeque::new(),
         }
     }
@@ -213,11 +278,29 @@ impl DecodeCache {
     pub fn insert(&mut self, key: CacheKey, value: Arc<DecodedImage>) {
         // Remove existing entry for this key if present
         if let Some(pos) = self.entries.iter().position(|(k, _)| k == &key) {
-            self.entries.remove(pos);
+            if let Some((_, old)) = self.entries.remove(pos) {
+                self.bytes = self.bytes.saturating_sub(old.bgra.len());
+            }
         }
-        if self.entries.len() >= self.capacity {
-            self.entries.pop_back();
+
+        let value_bytes = value.bgra.len();
+        // A single image larger than the budget is never cacheable.  Keeping
+        // it out is preferable to evicting the whole cache and still
+        // exceeding the configured memory bound.
+        if value_bytes > self.max_bytes {
+            return;
         }
+
+        while self.entries.len() >= self.capacity
+            || self.bytes.saturating_add(value_bytes) > self.max_bytes
+        {
+            if let Some((_, old)) = self.entries.pop_back() {
+                self.bytes = self.bytes.saturating_sub(old.bgra.len());
+            } else {
+                break;
+            }
+        }
+        self.bytes = self.bytes.saturating_add(value_bytes);
         self.entries.push_front((key, value));
     }
 
@@ -228,6 +311,10 @@ impl DecodeCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 // Thread-safe wrapper
@@ -236,6 +323,12 @@ pub struct SharedDecodeCache(Mutex<DecodeCache>);
 impl SharedDecodeCache {
     pub fn new(capacity: usize) -> Self {
         Self(Mutex::new(DecodeCache::new(capacity)))
+    }
+
+    pub fn with_byte_budget(capacity: usize, max_bytes: usize) -> Self {
+        Self(Mutex::new(DecodeCache::with_byte_budget(
+            capacity, max_bytes,
+        )))
     }
 
     pub fn get_or_decode(
@@ -338,6 +431,44 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_cache_byte_budget_evicts_actual_size() {
+        let mut cache = DecodeCache::with_byte_budget(8, 10);
+        let image = |size: usize| {
+            Arc::new(DecodedImage {
+                width: 1,
+                height: 1,
+                bgra: vec![0; size],
+            })
+        };
+        let key = |n: u32| (std::path::PathBuf::from(format!("img{}.jpg", n)), 1, 1);
+
+        cache.insert(key(1), image(8));
+        assert_eq!(cache.bytes(), 8);
+        cache.insert(key(2), image(4));
+
+        // The second image does not fit beside the first, so the LRU is
+        // evicted and the byte budget remains intact.
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 4);
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(2)).is_some());
+    }
+
+    #[test]
+    fn test_decode_cache_skips_single_oversized_image() {
+        let mut cache = DecodeCache::with_byte_budget(2, 4);
+        let image = Arc::new(DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0; 5],
+        });
+
+        cache.insert((std::path::PathBuf::from("too-large.jpg"), 1, 1), image);
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
     fn test_fit_dimensions_no_upscale() {
         let (w, h) = fit_dimensions(800, 600, 1920, 1080);
         assert_eq!((w, h), (800, 600), "should not upscale");
@@ -356,5 +487,20 @@ mod tests {
         assert_eq!(w, 1280);
         // height should be proportional: 1080 * (1280/3840) = 360
         assert_eq!(h, 360);
+    }
+
+    #[test]
+    fn test_validate_pixel_dimensions_rejects_pixel_bomb() {
+        let err = validate_pixel_dimensions(10_000, 10_001).unwrap_err();
+        assert!(err.to_string().contains("exceed maximum"));
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_file_before_reading_contents() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_IMAGE_FILE_BYTES + 1).unwrap();
+
+        let err = decode_image(file.path(), 1920, 1080).unwrap_err();
+        assert!(err.to_string().contains("maximum is"));
     }
 }

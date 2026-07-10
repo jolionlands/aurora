@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 thiserror = "1.0"
 notify = "6.1"
 image = { version = "0.25", features = ["jpeg", "png", "gif", "webp", "tiff", "bmp", "ico", "avif"] }
@@ -56,6 +57,7 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_System_WindowsProgramming",
     "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
 ] }
 
 [profile.release]

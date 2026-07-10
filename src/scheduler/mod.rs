@@ -154,16 +154,11 @@ impl Scheduler {
                 continue;
             }
 
-            // Idle check
+            // Idle threshold means pause scheduling while the user is away.
             if self.config.pause_when_idle_secs > 0 {
                 let idle_secs = get_idle_secs();
                 if idle_secs >= self.config.pause_when_idle_secs as u64 {
-                    // System is idle — fire if on_idle is configured, otherwise skip
-                    let _ = self.swap_tx.send(SwapRequest {
-                        reason: SwapReason::OnIdle,
-                        specific: None,
-                    });
-                    st.last_swap = Some(Instant::now());
+                    // System is idle; skip scheduled swaps.
                     drop(st);
                     continue;
                 }

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
@@ -39,6 +41,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    enable_dpi_awareness();
+
     // ---------------------------------------------------------------------------
     // 1. Tracing / logging
     // ---------------------------------------------------------------------------
@@ -296,3 +300,16 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+
+    // Must happen before Aurora creates transition HWNDs or queries monitor geometry.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_dpi_awareness() {}

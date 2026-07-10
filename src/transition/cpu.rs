@@ -43,15 +43,17 @@ fn run_windows(
 ) -> Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::Foundation::{COLORREF, POINT};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-        SelectObject, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
-        SRCCOPY,
+        SelectObject, StretchDIBits, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassExW,
-        TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, WNDCLASSEXW, WS_EX_LAYERED,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE,
+        SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
 
     unsafe {
@@ -84,6 +86,8 @@ fn run_windows(
             None,
         )
         .context("CreateWindowExW failed")?;
+
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let width = monitor_bounds.width as i32;
         let height = monitor_bounds.height as i32;
@@ -172,6 +176,26 @@ fn run_windows(
                 &bmi,
                 DIB_RGB_COLORS,
                 SRCCOPY,
+            );
+
+            // Present the blended frame to the layered window
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let pt_src = POINT { x: 0, y: 0 };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                None,
+                None,
+                None,
+                mem_dc,
+                Some(&pt_src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
             );
 
             // Pump messages so the window stays responsive

@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::config::types::SourceConfig;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::Rng;
 
@@ -43,7 +44,27 @@ impl PhotoIndex {
         let exts: Vec<String> = extensions.iter().map(|e| e.to_lowercase()).collect();
 
         for root in roots {
-            collect_files(root, &exts, recursive, &mut index)?;
+            collect_files(root, &exts, recursive, 0, 0, &mut index)?;
+        }
+
+        Ok(index)
+    }
+
+    /// Scan configured sources, preserving each source's extension, recursion,
+    /// and minimum-dimension rules.
+    pub fn scan_sources(sources: &[SourceConfig]) -> Result<Self> {
+        let mut index = PhotoIndex::default();
+
+        for source in sources {
+            let exts: Vec<String> = source.extensions.iter().map(|e| e.to_lowercase()).collect();
+            collect_files(
+                &source.path,
+                &exts,
+                source.recursive,
+                source.min_width,
+                source.min_height,
+                &mut index,
+            )?;
         }
 
         Ok(index)
@@ -92,19 +113,36 @@ impl PhotoIndex {
         recent_window: usize,
         recent_paths: &VecDeque<PathBuf>,
     ) -> Option<&PhotoEntry> {
-        let recent_set: std::collections::HashSet<&PathBuf> =
-            recent_paths.iter().rev().take(recent_window).collect();
+        // Cap the anti-repeat window so we never exclude every photo.
+        let effective_window = recent_window.min(self.photos.len().saturating_sub(1));
+        let recent_path_set: std::collections::HashSet<&PathBuf> =
+            recent_paths.iter().rev().take(effective_window).collect();
+        let recent_hashes = self.recent_hashes(&recent_path_set);
 
         let candidates: Vec<usize> = self
             .photos
             .iter()
             .enumerate()
-            .filter(|(_, e)| !e.banned && !recent_set.contains(&e.path))
+            .filter(|(_, e)| {
+                !e.banned && !recent_path_set.contains(&e.path) && !recent_hashes.contains(&e.hash)
+            })
             .map(|(i, _)| i)
             .collect();
 
         if candidates.is_empty() {
-            return None;
+            // Small library: every photo is in the recent window -- fall back to all non-banned.
+            let all: Vec<usize> = self
+                .photos
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.banned)
+                .map(|(i, _)| i)
+                .collect();
+            if all.is_empty() {
+                return None;
+            }
+            let idx = all[rand::thread_rng().gen_range(0..all.len())];
+            return Some(&self.photos[idx]);
         }
 
         let idx = candidates[rand::thread_rng().gen_range(0..candidates.len())];
@@ -134,14 +172,18 @@ impl PhotoIndex {
         recent_window: usize,
         recent_paths: &VecDeque<PathBuf>,
     ) -> Option<&PhotoEntry> {
-        let recent_set: std::collections::HashSet<&PathBuf> =
-            recent_paths.iter().rev().take(recent_window).collect();
+        let effective_window = recent_window.min(self.photos.len().saturating_sub(1));
+        let recent_path_set: std::collections::HashSet<&PathBuf> =
+            recent_paths.iter().rev().take(effective_window).collect();
+        let recent_hashes = self.recent_hashes(&recent_path_set);
 
         let candidates: Vec<(usize, u32)> = self
             .photos
             .iter()
             .enumerate()
-            .filter(|(_, e)| !e.banned && !recent_set.contains(&e.path))
+            .filter(|(_, e)| {
+                !e.banned && !recent_path_set.contains(&e.path) && !recent_hashes.contains(&e.hash)
+            })
             .map(|(i, e)| {
                 let w = e.rating.map(|r| r as u32 + 1).unwrap_or(1);
                 (i, w)
@@ -149,18 +191,47 @@ impl PhotoIndex {
             .collect();
 
         if candidates.is_empty() {
-            return None;
+            // Fall back to all non-banned photos.
+            let all: Vec<(usize, u32)> = self
+                .photos
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.banned)
+                .map(|(i, e)| {
+                    let w = e.rating.map(|r| r as u32 + 1).unwrap_or(1);
+                    (i, w)
+                })
+                .collect();
+            if all.is_empty() {
+                return None;
+            }
+            let total: u64 = all
+                .iter()
+                .map(|(_, w)| u64::from(*w))
+                .fold(0, u64::saturating_add);
+            let mut pick = rand::thread_rng().gen_range(0..total);
+            for (idx, w) in &all {
+                let weight = u64::from(*w);
+                if pick < weight {
+                    return Some(&self.photos[*idx]);
+                }
+                pick -= weight;
+            }
+            return Some(&self.photos[all.last().unwrap().0]);
         }
 
-        let total: u32 = candidates.iter().map(|(_, w)| w).sum();
+        let total: u64 = candidates
+            .iter()
+            .map(|(_, w)| u64::from(*w))
+            .fold(0, u64::saturating_add);
         let mut pick = rand::thread_rng().gen_range(0..total);
         for (idx, w) in &candidates {
-            if pick < *w {
+            let weight = u64::from(*w);
+            if pick < weight {
                 return Some(&self.photos[*idx]);
             }
-            pick -= w;
+            pick -= weight;
         }
-        // fallback
         Some(&self.photos[candidates.last().unwrap().0])
     }
 
@@ -168,10 +239,15 @@ impl PhotoIndex {
     // Mutations
     // -----------------------------------------------------------------------
 
-    pub fn ban(&mut self, hash: &str) {
-        if let Some(&idx) = self.by_hash.get(hash) {
-            self.photos[idx].banned = true;
+    pub fn ban(&mut self, hash: &str) -> bool {
+        let mut found = false;
+        for entry in &mut self.photos {
+            if entry.hash == hash {
+                entry.banned = true;
+                found = true;
+            }
         }
+        found
     }
 
     pub fn rate(&mut self, idx: usize, stars: u8) {
@@ -187,6 +263,17 @@ impl PhotoIndex {
     pub fn is_empty(&self) -> bool {
         self.photos.is_empty()
     }
+
+    fn recent_hashes(
+        &self,
+        recent_paths: &std::collections::HashSet<&PathBuf>,
+    ) -> std::collections::HashSet<String> {
+        self.photos
+            .iter()
+            .filter(|entry| recent_paths.contains(&entry.path))
+            .map(|entry| entry.hash.clone())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +284,8 @@ fn collect_files(
     dir: &Path,
     extensions: &[String],
     recursive: bool,
+    min_width: u32,
+    min_height: u32,
     index: &mut PhotoIndex,
 ) -> Result<()> {
     let read_dir =
@@ -209,7 +298,7 @@ fn collect_files(
 
         if meta.is_dir() {
             if recursive {
-                collect_files(&path, extensions, true, index)?;
+                collect_files(&path, extensions, true, min_width, min_height, index)?;
             }
             continue;
         }
@@ -228,24 +317,44 @@ fn collect_files(
             continue;
         }
 
-        let photo = build_entry(&path, &meta)?;
-        let hash = photo.hash.clone();
-        let idx = index.photos.len();
-        index.photos.push(photo);
-        index.by_hash.insert(hash, idx);
+        match build_entry(&path, &meta, min_width, min_height) {
+            Ok(Some(photo)) => {
+                let hash = photo.hash.clone();
+                let idx = index.photos.len();
+                index.photos.push(photo);
+                index.by_hash.entry(hash).or_insert(idx);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("skipping image {}: {}", path.display(), e);
+            }
+        }
     }
 
     Ok(())
 }
 
-fn build_entry(path: &Path, meta: &std::fs::Metadata) -> Result<PhotoEntry> {
+fn build_entry(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    min_width: u32,
+    min_height: u32,
+) -> Result<Option<PhotoEntry>> {
     let size_bytes = meta.len();
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let hash = hash_first_8k(path)?;
-    let (exif_date, width, height) = read_exif_dims(path);
+    let (verified_width, verified_height) = validate_image_dimensions(path)
+        .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
+    if verified_width < min_width || verified_height < min_height {
+        return Ok(None);
+    }
+
+    let hash = hash_file(path)?;
+    let (exif_date, exif_width, exif_height) = read_exif_dims(path);
+    let width = exif_width.or(Some(verified_width));
+    let height = exif_height.or(Some(verified_height));
     let rating = read_xmp_rating(path);
 
-    Ok(PhotoEntry {
+    Ok(Some(PhotoEntry {
         path: path.to_path_buf(),
         size_bytes,
         mtime,
@@ -255,18 +364,42 @@ fn build_entry(path: &Path, meta: &std::fs::Metadata) -> Result<PhotoEntry> {
         rating,
         hash,
         banned: false,
-    })
+    }))
 }
 
 /// Blake3 hash of first 8 KB — returned as lowercase hex.
-fn hash_first_8k(path: &Path) -> Result<String> {
+fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {:?} for hashing", path))?;
-    let mut buf = vec![0u8; 8192];
-    let n = file.read(&mut buf).context("read error")?;
-    let digest = blake3::hash(&buf[..n]);
-    Ok(digest.to_hex().to_string())
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).context("read error")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn validate_image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    match image::image_dimensions(path) {
+        Ok(dims) => Ok(dims),
+        Err(e) => {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if ext == "heic" || ext == "heif" {
+                Ok((u32::MAX, u32::MAX))
+            } else {
+                Err(e.into())
+            }
+        }
+    }
 }
 
 /// Read EXIF DateTimeOriginal and image dimensions.
@@ -347,17 +480,13 @@ fn read_xmp_rating(path: &Path) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use image::{ImageBuffer, Rgb};
 
     fn make_temp_jpg(dir: &std::path::Path, name: &str) -> PathBuf {
         let p = dir.join(name);
-        // Minimal valid JFIF header so the file has contents and is non-zero.
-        let mut f = std::fs::File::create(&p).unwrap();
-        // Write a tiny JPEG-like header (not a real JPEG, but enough for our scanner)
-        f.write_all(&[
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00,
-        ])
-        .unwrap();
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(16, 16, |_, _| Rgb([255u8, 0, 0]));
+        img.save(&p).unwrap();
         p
     }
 

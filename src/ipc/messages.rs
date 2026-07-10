@@ -88,7 +88,8 @@ pub enum IpcMessage {
     #[serde(rename = "stats")]
     Stats,
 
-    /// Reload configuration from disk.
+    /// Reload photo sources from disk. Schedule, transition, monitor, and
+    /// cache settings still require a daemon restart.
     #[serde(rename = "reload")]
     Reload,
 
@@ -111,7 +112,6 @@ pub enum IpcMessage {
     // ------------------------------------------------------------------
     // Playlist management
     // ------------------------------------------------------------------
-
     /// List all playlists and the active one.
     #[serde(rename = "playlist_list")]
     PlaylistList,
@@ -123,6 +123,32 @@ pub enum IpcMessage {
     /// Add a path to a playlist.
     #[serde(rename = "playlist_add")]
     PlaylistAdd { name: String, path: String },
+
+    /// Replace tags on a playlist path.
+    #[serde(rename = "playlist_tag")]
+    PlaylistTag {
+        name: String,
+        path: String,
+        #[serde(default = "default_tag_kind")]
+        kind: String,
+        tags: Vec<String>,
+    },
+
+    /// Set a playlist path rating.
+    #[serde(rename = "playlist_rate")]
+    PlaylistRate {
+        name: String,
+        path: String,
+        rating: u8,
+    },
+
+    /// Set a playlist path frequency weight.
+    #[serde(rename = "playlist_frequency")]
+    PlaylistFrequency {
+        name: String,
+        path: String,
+        frequency: u32,
+    },
 
     /// Remove a path from a playlist.
     #[serde(rename = "playlist_remove")]
@@ -139,6 +165,10 @@ pub enum IpcMessage {
     /// Delete a playlist.
     #[serde(rename = "playlist_delete")]
     PlaylistDelete { name: String },
+}
+
+fn default_tag_kind() -> String {
+    "general".to_string()
 }
 
 // ---------------------------------------------------------------------------

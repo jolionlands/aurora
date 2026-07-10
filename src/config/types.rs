@@ -77,7 +77,7 @@ impl Default for ScheduleConfig {
             on_workspace_change: false,
             pause_when_fullscreen: true,
             pause_when_idle_secs: 0,
-            min_repeat_window: 20,
+            min_repeat_window: 200,
         }
     }
 }

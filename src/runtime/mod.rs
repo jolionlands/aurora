@@ -19,9 +19,7 @@ use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
 use crate::ipc::messages::IpcEvent;
 use crate::metrics::Metrics;
-use crate::playlist::{
-    default_playlists_path, load_playlists, persist_playlists, PlaylistStore,
-};
+use crate::playlist::{default_playlists_path, load_playlists, persist_playlists, PlaylistStore};
 use crate::scheduler::{SwapReason, SwapRequest};
 use crate::transition::{
     Backend, DecodedImage as TransitionImage, Rect, TransitionRenderer, TransitionStyle,
@@ -86,30 +84,29 @@ pub struct Runtime {
 }
 
 const HISTORY_CAP: usize = 50;
+const BYTES_PER_4K_BGRA: usize = 3840 * 2160 * 4;
+
+fn cache_budget_bytes(decoded_mb: u32) -> usize {
+    let bytes = u64::from(decoded_mb).saturating_mul(1024 * 1024);
+    bytes.min(usize::MAX as u64) as usize
+}
+
+/// Return a count bound and the prefetch hint that fits inside it.  The
+/// decoded cache also enforces the byte budget against actual image sizes;
+/// this count is only the cheap upper bound used by the LRU container.
+fn cache_settings(decoded_bytes: usize, requested_prefetch: usize) -> (usize, usize) {
+    let capacity = (decoded_bytes / BYTES_PER_4K_BGRA).max(1);
+    let effective_prefetch = requested_prefetch.min(capacity.saturating_sub(1));
+    (capacity, effective_prefetch)
+}
 
 impl Runtime {
     pub fn new(config: &Config, applier: WallpaperApplier, metrics: Arc<Metrics>) -> Result<Self> {
         // Build photo index from configured sources.
-        let roots: Vec<PathBuf> = config.sources.iter().map(|s| s.path.clone()).collect();
-        let extensions = if roots.is_empty() {
-            vec!["jpg".to_string(), "jpeg".to_string(), "png".to_string()]
-        } else {
-            config
-                .sources
-                .first()
-                .map(|s| s.extensions.clone())
-                .unwrap_or_default()
-        };
-
-        let index = if roots.is_empty() {
+        let index = if config.sources.is_empty() {
             PhotoIndex::default()
         } else {
-            PhotoIndex::scan(
-                &roots,
-                &extensions,
-                config.sources.first().map(|s| s.recursive).unwrap_or(true),
-            )
-            .context("scanning photo sources")?
+            PhotoIndex::scan_sources(&config.sources).context("scanning photo sources")?
         };
 
         let index_size = index.len() as u64;
@@ -120,23 +117,28 @@ impl Runtime {
         let backend = Backend::parse(&config.transitions.renderer);
         let transitions = TransitionRenderer::new(style, config.transitions.duration_ms, backend);
 
-        let bytes_per_4k_bgra = 3840usize * 2160usize * 4usize;
-        let configured_cache_bytes = (config.cache.decoded_mb as usize).saturating_mul(1024 * 1024);
-        let cache_capacity = (configured_cache_bytes / bytes_per_4k_bgra)
-            .max(config.cache.prefetch_count.saturating_add(1))
-            .max(1);
+        let configured_cache_bytes = cache_budget_bytes(config.cache.decoded_mb);
+        let (cache_capacity, effective_prefetch) =
+            cache_settings(configured_cache_bytes, config.cache.prefetch_count);
         info!(
-            "decode cache capacity: {} entries (~{} MB budget)",
-            cache_capacity, config.cache.decoded_mb
+            "decode cache capacity: {} entries (~{} MB budget, prefetch {}/{})",
+            cache_capacity,
+            config.cache.decoded_mb,
+            effective_prefetch,
+            config.cache.prefetch_count
         );
-        let cache = SharedDecodeCache::new(cache_capacity);
+        let cache = SharedDecodeCache::with_byte_budget(cache_capacity, configured_cache_bytes);
 
         // Load playlist store from disk (creates empty default if file is absent).
         let playlists_path = default_playlists_path();
         let playlist_store = match load_playlists(&playlists_path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("failed to load playlists from {}: {} — starting with empty store", playlists_path.display(), e);
+                tracing::warn!(
+                    "failed to load playlists from {}: {} — starting with empty store",
+                    playlists_path.display(),
+                    e
+                );
                 PlaylistStore::default()
             }
         };
@@ -224,21 +226,57 @@ impl Runtime {
             return Ok(());
         }
 
+        // IDesktopWallpaper::SetPosition is global, not per-monitor. Pick the
+        // first monitor's configured mode once instead of letting the last
+        // monitor in the loop silently win.
+        let fit_for = |monitor_id: &str| {
+            self.config
+                .monitors
+                .iter()
+                .find(|m| m.name == monitor_id)
+                .map(|m| WallpaperFit::parse(m.fit.as_str()))
+                .unwrap_or(WallpaperFit::Fill)
+        };
+        let global_fit = fit_for(&monitors[0].id);
+        if monitors
+            .iter()
+            .skip(1)
+            .any(|m| fit_for(&m.id) != global_fit)
+        {
+            warn!(
+                "per-monitor fit overrides differ, but Windows applies one global wallpaper position; using {}",
+                self.config
+                    .monitors
+                    .iter()
+                    .find(|m| m.name == monitors[0].id)
+                    .map(|m| m.fit.as_str())
+                    .unwrap_or("fill")
+            );
+        }
+        self.applier.set_fit(global_fit)?;
+
         // Pick target path.
         let new_path: PathBuf = if let Some(specific) = req.specific {
             specific
         } else {
             // When a playlist is active, pick from it; otherwise use the full index.
-            let source_root = self
+            let source_roots: Vec<&std::path::Path> = self
                 .config
                 .sources
-                .first()
-                .map(|s| s.path.clone());
+                .iter()
+                .map(|source| source.path.as_path())
+                .collect();
 
+            let recent_window = self.config.schedule.min_repeat_window;
             let playlist_pick = {
                 let store = self.playlist_store.lock();
                 if store.active.is_some() {
-                    store.pick(source_root.as_deref(), &mut self.playlist_cursor)
+                    store.pick_from_roots(
+                        &source_roots,
+                        &mut self.playlist_cursor,
+                        recent_window,
+                        &self.state.recent_paths,
+                    )
                 } else {
                     None
                 }
@@ -253,7 +291,9 @@ impl Runtime {
                 let recent_window = self.config.schedule.min_repeat_window;
                 index
                     .pick_random(recent_window, &self.state.recent_paths)
-                    .ok_or_else(|| anyhow::anyhow!("photo index is empty or all photos are banned"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("photo index is empty or all photos are banned")
+                    })?
                     .path
                     .clone()
             } else {
@@ -261,7 +301,9 @@ impl Runtime {
                 let recent_window = self.config.schedule.min_repeat_window;
                 index
                     .pick_random(recent_window, &self.state.recent_paths)
-                    .ok_or_else(|| anyhow::anyhow!("photo index is empty or all photos are banned"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("photo index is empty or all photos are banned")
+                    })?
                     .path
                     .clone()
             }
@@ -269,17 +311,6 @@ impl Runtime {
 
         // Per-monitor loop.
         for monitor in &monitors {
-            // Look up monitor fit override.
-            let fit_str = self
-                .config
-                .monitors
-                .iter()
-                .find(|m| m.name == monitor.id)
-                .map(|m| m.fit.as_str())
-                .unwrap_or("fill");
-            let fit = WallpaperFit::parse(fit_str);
-            self.applier.set_fit(fit)?;
-
             let (tw, th) = (monitor.width, monitor.height);
 
             // Decode the new image.
@@ -313,10 +344,10 @@ impl Runtime {
                             data: new_decoded.bgra.clone(),
                         };
                         let bounds = Rect {
-                            x: 0,
-                            y: 0,
-                            width: new_decoded.width,
-                            height: new_decoded.height,
+                            x: monitor.x,
+                            y: monitor.y,
+                            width: monitor.width,
+                            height: monitor.height,
                         };
                         if let Err(e) = self.transitions.run(bounds, &old_ti, &new_ti) {
                             warn!("transition error (continuing with direct apply): {}", e);
@@ -371,6 +402,13 @@ impl Runtime {
             .unwrap_or_default()
             .as_millis() as u64;
         for monitor in &monitors {
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(IpcEvent::Swapped {
+                    monitor: monitor.id.clone(),
+                    path: new_path.display().to_string(),
+                    ts_ms,
+                });
+            }
             debug!(
                 "swapped monitor={} path={} ts_ms={}",
                 monitor.id,
@@ -478,11 +516,16 @@ impl RuntimeHandle {
     }
 
     /// Force-apply a specific path.
-    pub fn set_specific(&self, path: PathBuf) {
-        let _ = self.swap_tx.send(SwapRequest {
-            reason: SwapReason::Manual,
-            specific: Some(path),
-        });
+    pub fn set_specific(&self, path: PathBuf) -> anyhow::Result<()> {
+        if !path.is_file() {
+            anyhow::bail!("wallpaper path is not a file: {}", path.display());
+        }
+        self.swap_tx
+            .send(SwapRequest {
+                reason: SwapReason::Manual,
+                specific: Some(path),
+            })
+            .map_err(|_| anyhow::anyhow!("runtime swap channel is closed"))
     }
 
     /// Return a JSON status blob for IPC Status / Stats.
@@ -515,8 +558,11 @@ impl RuntimeHandle {
     /// Ban the photo with the given hash via the index.
     pub fn ban(&self, hash: &str) -> serde_json::Value {
         let mut index = self.index.write();
-        index.ban(hash);
-        serde_json::json!({"success": true})
+        if index.ban(hash) {
+            serde_json::json!({"success": true})
+        } else {
+            serde_json::json!({"success": false, "error": "photo hash not found in index"})
+        }
     }
 
     /// Return a snapshot of the current wallpaper path for each monitor.
@@ -535,22 +581,10 @@ impl RuntimeHandle {
         let config = crate::config::parse::parse_kdl_config(&src)
             .with_context(|| format!("parse config {}", self.config_path.display()))?;
 
-        let roots: Vec<PathBuf> = config.sources.iter().map(|s| s.path.clone()).collect();
-        let extensions: Vec<String> = if roots.is_empty() {
-            vec!["jpg".to_string(), "jpeg".to_string(), "png".to_string()]
-        } else {
-            config
-                .sources
-                .first()
-                .map(|s| s.extensions.clone())
-                .unwrap_or_default()
-        };
-        let recursive = config.sources.first().map(|s| s.recursive).unwrap_or(true);
-
-        let new_index = if roots.is_empty() {
+        let new_index = if config.sources.is_empty() {
             PhotoIndex::default()
         } else {
-            PhotoIndex::scan(&roots, &extensions, recursive)
+            PhotoIndex::scan_sources(&config.sources)
                 .context("scanning photo sources during reload")?
         };
 
@@ -567,6 +601,11 @@ impl RuntimeHandle {
     /// Narrow the active photo pool to a single folder for this session.
     /// Pass an empty path to revert to the full configured source list.
     pub fn set_folder(&self, path: PathBuf) -> anyhow::Result<()> {
+        if path.as_os_str().is_empty() {
+            info!("set_folder: empty path - rebuilding configured sources");
+            self.reload_from_disk()?;
+            return Ok(());
+        }
         let default_extensions: Vec<String> = ["jpg", "jpeg", "png", "webp", "gif"]
             .iter()
             .map(|s| s.to_string())
@@ -603,10 +642,67 @@ impl RuntimeHandle {
             .playlists
             .iter()
             .map(|pl| {
+                let items: Vec<serde_json::Value> = pl
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        let mut tag_groups = serde_json::Map::new();
+                        tag_groups.insert(
+                            "general".to_string(),
+                            serde_json::json!(pl.tags.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "theme".to_string(),
+                            serde_json::json!(pl.themes.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "content".to_string(),
+                            serde_json::json!(pl.content.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "color".to_string(),
+                            serde_json::json!(pl.colors.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "source".to_string(),
+                            serde_json::json!(pl.sources.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "medium".to_string(),
+                            serde_json::json!(pl.media.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "safety".to_string(),
+                            serde_json::json!(pl.safety.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "franchise".to_string(),
+                            serde_json::json!(pl.franchises.get(path).cloned().unwrap_or_default()),
+                        );
+                        tag_groups.insert(
+                            "character".to_string(),
+                            serde_json::json!(pl.characters.get(path).cloned().unwrap_or_default()),
+                        );
+                        for (kind, group) in &pl.custom_tags {
+                            tag_groups.insert(
+                                kind.clone(),
+                                serde_json::json!(group.get(path).cloned().unwrap_or_default()),
+                            );
+                        }
+                        serde_json::json!({
+                            "path": path,
+                            "tags": pl.tags.get(path).cloned().unwrap_or_default(),
+                            "tag_groups": tag_groups,
+                            "rating": pl.ratings.get(path).copied(),
+                            "frequency": pl.frequencies.get(path).copied().unwrap_or(1),
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
                     "name": pl.name,
                     "shuffle": pl.shuffle,
                     "paths": pl.paths,
+                    "items": items,
                     "active": store.active.as_deref() == Some(pl.name.as_str()),
                 })
             })
@@ -628,6 +724,36 @@ impl RuntimeHandle {
         {
             let mut store = self.playlist_store.lock();
             store.add_path(name, path)?;
+        }
+        self.persist_playlists()
+    }
+
+    pub fn playlist_tag(
+        &self,
+        name: &str,
+        path: &str,
+        kind: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.set_tag_group(name, path, kind, tags)?;
+        }
+        self.persist_playlists()
+    }
+
+    pub fn playlist_rate(&self, name: &str, path: &str, rating: u8) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.set_rating(name, path, rating)?;
+        }
+        self.persist_playlists()
+    }
+
+    pub fn playlist_frequency(&self, name: &str, path: &str, frequency: u32) -> anyhow::Result<()> {
+        {
+            let mut store = self.playlist_store.lock();
+            store.set_frequency(name, path, frequency)?;
         }
         self.persist_playlists()
     }
@@ -712,6 +838,20 @@ impl RuntimeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cache_settings_clamps_prefetch_to_budget() {
+        let (capacity, prefetch) = cache_settings(BYTES_PER_4K_BGRA * 2, usize::MAX);
+        assert_eq!(capacity, 2);
+        assert_eq!(prefetch, 1, "one slot must remain for the active image");
+
+        let (capacity, prefetch) = cache_settings(0, usize::MAX);
+        assert_eq!(capacity, 1);
+        assert_eq!(
+            prefetch, 0,
+            "zero-byte budget cannot reserve a prefetch slot"
+        );
+    }
 
     /// Convenience wrapper for tests that don't care about playlist persistence.
     fn make_handle(
@@ -841,13 +981,13 @@ mod tests {
 
     #[test]
     fn test_handle_set_folder_replaces_index() {
-        use std::io::Write;
+        use image::{ImageBuffer, Rgb};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        // Write a tiny JPEG-like file so the scanner finds it.
         let p = dir.path().join("test.jpg");
-        let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).unwrap();
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(16, 16, |_, _| Rgb([255u8, 0, 0]));
+        img.save(&p).unwrap();
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(RuntimeStateSnapshot {
@@ -933,5 +1073,26 @@ mod tests {
 
         let result = handle.prev();
         assert!(result.is_err(), "prev on empty history should return Err");
+    }
+
+    #[test]
+    fn test_handle_set_specific_rejects_missing_file() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(RuntimeStateSnapshot {
+            paused: false,
+            current_path: HashMap::new(),
+            history_len: 0,
+            history: VecDeque::new(),
+        }));
+        let index = Arc::new(RwLock::new(PhotoIndex::default()));
+        let handle = make_handle(tx, state, index, Metrics::new());
+
+        assert!(handle
+            .set_specific(PathBuf::from("does-not-exist.jpg"))
+            .is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid path must not enqueue a swap"
+        );
     }
 }
