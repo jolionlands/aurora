@@ -1,14 +1,12 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-// TODO(audit): wire to crate::config::types::ScheduleConfig when foundation wires modules
 use crate::config::types::ScheduleConfig;
+
+pub const SWAP_QUEUE_CAPACITY: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -26,47 +24,8 @@ pub enum SwapReason {
     Interval,
     AtTime,
     Manual,
+    Previous,
     WorkspaceChange,
-    OnIdle,
-}
-
-#[derive(Debug, Clone)]
-pub struct HistoryEntry {
-    pub path: PathBuf,
-    pub swapped_at: Instant,
-    pub reason: SwapReason,
-}
-
-#[derive(Debug)]
-pub struct SchedulerState {
-    pub paused: bool,
-    pub pause_until: Option<Instant>,
-    pub last_swap: Option<Instant>,
-    pub recent_paths: VecDeque<PathBuf>,
-    pub history: VecDeque<HistoryEntry>,
-}
-
-impl SchedulerState {
-    fn new() -> Self {
-        Self {
-            paused: false,
-            pause_until: None,
-            last_swap: None,
-            recent_paths: VecDeque::new(),
-            history: VecDeque::new(),
-        }
-    }
-
-    fn is_effectively_paused(&mut self) -> bool {
-        if let Some(until) = self.pause_until {
-            if Instant::now() >= until {
-                // timed pause expired — auto-resume
-                self.paused = false;
-                self.pause_until = None;
-            }
-        }
-        self.paused
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,56 +34,19 @@ impl SchedulerState {
 
 pub struct Scheduler {
     config: ScheduleConfig,
-    state: Arc<Mutex<SchedulerState>>,
-    swap_tx: mpsc::UnboundedSender<SwapRequest>,
+    swap_tx: mpsc::Sender<SwapRequest>,
 }
 
 impl Scheduler {
     /// Construct scheduler + return the receiver end so callers can act on swaps.
-    pub fn new(config: ScheduleConfig) -> (Self, mpsc::UnboundedReceiver<SwapRequest>) {
-        let (swap_tx, swap_rx) = mpsc::unbounded_channel();
-        let scheduler = Self {
-            config,
-            state: Arc::new(Mutex::new(SchedulerState::new())),
-            swap_tx,
-        };
+    pub fn new(config: ScheduleConfig) -> (Self, mpsc::Receiver<SwapRequest>) {
+        let (swap_tx, swap_rx) = mpsc::channel(SWAP_QUEUE_CAPACITY);
+        let scheduler = Self { config, swap_tx };
         (scheduler, swap_rx)
     }
 
-    // -----------------------------------------------------------------------
-    // Control API
-    // -----------------------------------------------------------------------
-
-    /// Pause indefinitely, or for `duration` if provided.
-    pub fn pause(&self, duration: Option<Duration>) {
-        let mut st = self.state.lock();
-        st.paused = true;
-        st.pause_until = duration.map(|d| Instant::now() + d);
-    }
-
-    /// Resume from a pause immediately.
-    pub fn resume(&self) {
-        let mut st = self.state.lock();
-        st.paused = false;
-        st.pause_until = None;
-    }
-
-    /// Force an immediate swap (manual skip).
-    pub fn skip(&self) {
-        let _ = self.swap_tx.send(SwapRequest {
-            reason: SwapReason::Manual,
-            specific: None,
-        });
-    }
-
-    /// Send a workspace-change swap.
-    pub fn on_workspace_change(&self) {
-        if self.config.on_workspace_change {
-            let _ = self.swap_tx.send(SwapRequest {
-                reason: SwapReason::WorkspaceChange,
-                specific: None,
-            });
-        }
+    pub fn sender(&self) -> mpsc::Sender<SwapRequest> {
+        self.swap_tx.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -136,21 +58,13 @@ impl Scheduler {
         let mut interval_ticker = tokio::time::interval(Duration::from_secs(1));
         // Track which at_times we have already fired this minute to avoid double-fire.
         let mut last_at_fired: Option<(u32, u32)> = None;
+        let mut last_swap = None;
 
         loop {
             interval_ticker.tick().await;
 
-            let mut st = self.state.lock();
-
-            // Auto-resume timed pause
-            if st.is_effectively_paused() {
-                drop(st);
-                continue;
-            }
-
             // Fullscreen check
             if self.config.pause_when_fullscreen && is_fullscreen_active() {
-                drop(st);
                 continue;
             }
 
@@ -159,39 +73,25 @@ impl Scheduler {
                 let idle_secs = get_idle_secs();
                 if idle_secs >= self.config.pause_when_idle_secs as u64 {
                     // System is idle; skip scheduled swaps.
-                    drop(st);
                     continue;
                 }
             }
 
             // at_times check
-            let now_local = chrono::Local::now();
-            let current_hm = (
-                now_local
-                    .format("%H")
-                    .to_string()
-                    .parse::<u32>()
-                    .unwrap_or(0),
-                now_local
-                    .format("%M")
-                    .to_string()
-                    .parse::<u32>()
-                    .unwrap_or(0),
-            );
+            let current_hm = local_hour_minute();
 
             let at_times = parse_at_times(&self.config.at_times);
             let should_at_fire =
-                at_times.contains(&current_hm) && last_at_fired != Some(current_hm);
+                should_fire_at(&self.config.mode, &at_times, current_hm, last_at_fired);
 
             if should_at_fire {
-                last_at_fired = Some(current_hm);
-                let _ = self.swap_tx.send(SwapRequest {
+                let enqueued = self.try_enqueue_automatic(SwapRequest {
                     reason: SwapReason::AtTime,
                     specific: None,
                 });
-                st.last_swap = Some(Instant::now());
-                drop(st);
-                continue;
+                if record_at_enqueue(enqueued, current_hm, &mut last_at_fired, &mut last_swap) {
+                    continue;
+                }
             }
 
             // Reset last_at_fired when the minute has changed
@@ -202,29 +102,52 @@ impl Scheduler {
             }
 
             // Interval check
-            if self.config.mode == "interval" || self.config.mode.is_empty() {
-                let due = match st.last_swap {
+            if self.config.mode == "interval" {
+                let due = match last_swap {
                     None => true,
                     Some(last) => {
                         Instant::now().duration_since(last).as_secs() >= self.config.interval_secs
                     }
                 };
-                if due {
-                    let _ = self.swap_tx.send(SwapRequest {
+                if due
+                    && self.try_enqueue_automatic(SwapRequest {
                         reason: SwapReason::Interval,
                         specific: None,
-                    });
-                    st.last_swap = Some(Instant::now());
+                    })
+                {
+                    last_swap = Some(Instant::now());
                 }
             }
-
-            drop(st);
         }
     }
 
-    pub fn state(&self) -> Arc<Mutex<SchedulerState>> {
-        Arc::clone(&self.state)
+    fn try_enqueue_automatic(&self, request: SwapRequest) -> bool {
+        match self.swap_tx.try_send(request) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                tracing::debug!(?request.reason, "swap queue full; coalescing automatic request");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
+}
+
+fn record_at_enqueue(
+    enqueued: bool,
+    current_hm: (u32, u32),
+    last_at_fired: &mut Option<(u32, u32)>,
+    last_swap: &mut Option<Instant>,
+) -> bool {
+    if enqueued {
+        *last_at_fired = Some(current_hm);
+        *last_swap = Some(Instant::now());
+    }
+    enqueued
+}
+
+pub(crate) fn checked_pause_deadline(duration: Option<Duration>) -> Option<Instant> {
+    duration.and_then(|duration| Instant::now().checked_add(duration))
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +157,15 @@ impl Scheduler {
 /// Parse "HH:MM" strings → (hour, minute) tuples.
 pub fn parse_at_times(at_times: &[String]) -> Vec<(u32, u32)> {
     at_times.iter().filter_map(|s| parse_hhmm(s).ok()).collect()
+}
+
+fn should_fire_at(
+    mode: &str,
+    at_times: &[(u32, u32)],
+    current_hm: (u32, u32),
+    last_at_fired: Option<(u32, u32)>,
+) -> bool {
+    mode == "at" && at_times.contains(&current_hm) && last_at_fired != Some(current_hm)
 }
 
 pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
@@ -259,6 +191,11 @@ pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
 // ---------------------------------------------------------------------------
 // Windows platform helpers
 // ---------------------------------------------------------------------------
+
+fn local_hour_minute() -> (u32, u32) {
+    let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    (u32::from(now.wHour), u32::from(now.wMinute))
+}
 
 /// Returns true if the foreground window covers an entire monitor.
 fn is_fullscreen_active() -> bool {
@@ -318,15 +255,17 @@ fn get_idle_secs() -> u64 {
             if !GetLastInputInfo(&mut lii).as_bool() {
                 return 0;
             }
-            let now_ms = GetTickCount() as u64;
-            let last_ms = lii.dwTime as u64;
-            now_ms.saturating_sub(last_ms) / 1000
+            idle_millis(GetTickCount(), lii.dwTime) as u64 / 1000
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         0
     }
+}
+
+fn idle_millis(now_ms: u32, last_input_ms: u32) -> u32 {
+    now_ms.wrapping_sub(last_input_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +297,72 @@ mod tests {
         assert!(parse_hhmm("1200").is_err());
     }
 
+    #[test]
+    fn at_times_only_fire_in_at_mode() {
+        let times = [(9, 30)];
+        assert!(!should_fire_at("interval", &times, (9, 30), None));
+        assert!(should_fire_at("at", &times, (9, 30), None));
+        assert!(!should_fire_at("at", &times, (9, 30), Some((9, 30))));
+    }
+
+    #[test]
+    fn failed_at_enqueue_does_not_suppress_retry() {
+        let mut last_at_fired = None;
+        let mut last_swap = None;
+        assert!(!record_at_enqueue(
+            false,
+            (9, 30),
+            &mut last_at_fired,
+            &mut last_swap
+        ));
+        assert_eq!(last_at_fired, None);
+        assert_eq!(last_swap, None);
+
+        assert!(record_at_enqueue(
+            true,
+            (9, 30),
+            &mut last_at_fired,
+            &mut last_swap
+        ));
+        assert_eq!(last_at_fired, Some((9, 30)));
+        assert!(last_swap.is_some());
+    }
+
+    #[test]
+    fn idle_time_handles_tick_count_rollover() {
+        assert_eq!(idle_millis(500, u32::MAX - 499), 1_000);
+    }
+
+    #[test]
+    fn local_time_is_valid() {
+        let (hour, minute) = local_hour_minute();
+        assert!(hour < 24);
+        assert!(minute < 60);
+    }
+
+    #[test]
+    fn full_queue_coalesces_automatic_requests() {
+        let (scheduler, mut rx) = Scheduler::new(ScheduleConfig::default());
+        for _ in 0..SWAP_QUEUE_CAPACITY {
+            assert!(scheduler.try_enqueue_automatic(SwapRequest {
+                reason: SwapReason::Interval,
+                specific: None,
+            }));
+        }
+        assert!(!scheduler.try_enqueue_automatic(SwapRequest {
+            reason: SwapReason::WorkspaceChange,
+            specific: None,
+        }));
+
+        for _ in 0..SWAP_QUEUE_CAPACITY {
+            assert!(matches!(
+                rx.try_recv().unwrap().reason,
+                SwapReason::Interval
+            ));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
     // -----------------------------------------------------------------------
     // Scheduler firing
     // -----------------------------------------------------------------------
@@ -386,28 +391,5 @@ mod tests {
             "should have received a swap request within 3s"
         );
         assert!(result.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_scheduler_pause_blocks_fire() {
-        let config = ScheduleConfig {
-            interval_secs: 1,
-            mode: "interval".to_string(),
-            pause_when_fullscreen: false,
-            pause_when_idle_secs: 0,
-            ..Default::default()
-        };
-
-        let (scheduler, mut rx) = Scheduler::new(config);
-        // Pause before starting
-        scheduler.pause(None);
-
-        tokio::spawn(async move {
-            scheduler.run().await;
-        });
-
-        // After 2s, should have received nothing
-        let result = tokio::time::timeout(Duration::from_millis(2000), rx.recv()).await;
-        assert!(result.is_err(), "paused scheduler should not fire");
     }
 }

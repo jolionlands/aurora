@@ -10,9 +10,40 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use super::{scale_to_cover, DecodedImage, Rect, TransitionStyle};
+use super::{scale_to_cover, Rect, TransitionStyle};
+use crate::decode::DecodedImage;
 
 const FRAME_INTERVAL_MS: u64 = 17; // ~60 fps
+
+#[cfg(target_os = "windows")]
+struct TransitionWindow(windows::Win32::Foundation::HWND);
+
+#[cfg(target_os = "windows")]
+impl Drop for TransitionWindow {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0).ok();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn transition_window_ex_style() -> windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    };
+
+    WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn initialize_layered_overlay(hwnd: windows::Win32::Foundation::HWND) -> Result<()> {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{SetLayeredWindowAttributes, LWA_ALPHA};
+
+    SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
+        .context("SetLayeredWindowAttributes failed for D2D transition")
+}
 
 /// Returns true if GPU (Direct2D) is likely available on this system.
 pub fn is_available() -> bool {
@@ -60,7 +91,7 @@ fn run_d2d(
     duration_ms: u32,
 ) -> Result<()> {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
         D2D_RECT_F, D2D_SIZE_U,
@@ -75,9 +106,9 @@ fn run_d2d(
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassExW,
-        TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, WNDCLASSEXW, WS_EX_LAYERED,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DispatchMessageW, PeekMessageW, RegisterClassExW, ShowWindow,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, SW_SHOWNOACTIVATE, WNDCLASSEXW,
+        WS_POPUP,
     };
 
     unsafe {
@@ -103,21 +134,25 @@ fn run_d2d(
         };
         let _ = RegisterClassExW(&wnd_class); // ignore already-registered
 
-        let hwnd: HWND = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR::null(),
-            WS_POPUP,
-            monitor_bounds.x,
-            monitor_bounds.y,
-            monitor_bounds.width as i32,
-            monitor_bounds.height as i32,
-            None,
-            None,
-            instance,
-            None,
-        )
-        .context("CreateWindowExW failed for D2D transition")?;
+        let window = TransitionWindow(
+            CreateWindowExW(
+                transition_window_ex_style(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                monitor_bounds.x,
+                monitor_bounds.y,
+                monitor_bounds.width as i32,
+                monitor_bounds.height as i32,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .context("CreateWindowExW failed for D2D transition")?,
+        );
+        let hwnd = window.0;
+        initialize_layered_overlay(hwnd)?;
 
         // ----------------------------------------------------------------
         // Create HwndRenderTarget
@@ -151,14 +186,14 @@ fn run_d2d(
         // Upload bitmaps
         // ----------------------------------------------------------------
         let old_scaled = scale_to_cover(
-            &old.data,
+            &old.bgra,
             old.width,
             old.height,
             monitor_bounds.width,
             monitor_bounds.height,
         );
         let new_scaled = scale_to_cover(
-            &new.data,
+            &new.bgra,
             new.width,
             new.height,
             monitor_bounds.width,
@@ -205,11 +240,18 @@ fn run_d2d(
         } else {
             Vec::new()
         };
+        let mut dissolve_frame = if *style == TransitionStyle::Dissolve {
+            vec![0; n_pixels * 4]
+        } else {
+            Vec::new()
+        };
 
         let start = Instant::now();
         let total = Duration::from_millis(duration_ms as u64);
         let w = monitor_bounds.width as f32;
         let h = monitor_bounds.height as f32;
+
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         loop {
             let elapsed = start.elapsed();
@@ -218,6 +260,19 @@ fn run_d2d(
             }
 
             let progress = (elapsed.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0);
+            if *style == TransitionStyle::Dissolve {
+                for (i, mask) in dissolve_mask.iter().enumerate().take(n_pixels) {
+                    let base = i * 4;
+                    if progress >= *mask {
+                        dissolve_frame[base..base + 4].copy_from_slice(&new_scaled[base..base + 4]);
+                    } else {
+                        dissolve_frame[base..base + 4].copy_from_slice(&old_scaled[base..base + 4]);
+                    }
+                }
+                bmp_new
+                    .CopyFromMemory(None, dissolve_frame.as_ptr() as *const _, pitch)
+                    .context("Direct2D dissolve upload failed")?;
+            }
 
             rt.BeginDraw();
             rt.Clear(Some(&D2D1_COLOR_F {
@@ -363,34 +418,13 @@ fn run_d2d(
                 }
 
                 TransitionStyle::Dissolve => {
-                    // CPU-blend the dissolve into a scratch bitmap per frame.
-                    // For GPU dissolve, we do it via a threshold on the random mask.
-                    // We CPU-blend and re-upload (acceptable for dissolve which is
-                    // already pixel-scattered).
-                    let mut frame_buf = vec![0u8; n_pixels * 4];
-                    for (i, mask) in dissolve_mask.iter().enumerate().take(n_pixels) {
-                        let base = i * 4;
-                        if progress >= *mask {
-                            frame_buf[base..base + 4].copy_from_slice(&new_scaled[base..base + 4]);
-                        } else {
-                            frame_buf[base..base + 4].copy_from_slice(&old_scaled[base..base + 4]);
-                        }
-                    }
-                    // Upload frame as a fresh bitmap
-                    if let Ok(bmp_frame) = rt.CreateBitmap(
-                        bmp_size,
-                        Some(frame_buf.as_ptr() as *const _),
-                        pitch,
-                        &bmp_props,
-                    ) {
-                        rt.DrawBitmap(
-                            &bmp_frame,
-                            Some(&full_rect),
-                            1.0,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            Some(&full_rect),
-                        );
-                    }
+                    rt.DrawBitmap(
+                        &bmp_new,
+                        Some(&full_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&full_rect),
+                    );
                 }
 
                 TransitionStyle::ZoomIn => {
@@ -458,7 +492,7 @@ fn run_d2d(
                 }
             }
 
-            let _ = rt.EndDraw(None, None);
+            rt.EndDraw(None, None).context("Direct2D EndDraw failed")?;
 
             // Pump messages
             let mut msg = MSG::default();
@@ -469,8 +503,6 @@ fn run_d2d(
 
             std::thread::sleep(Duration::from_millis(FRAME_INTERVAL_MS));
         }
-
-        DestroyWindow(hwnd).ok();
     }
 
     Ok(())
@@ -485,4 +517,137 @@ unsafe extern "system" fn d2d_wnd_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HINSTANCE, POINT};
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+    };
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+        D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_RENDER_TARGET_PROPERTIES,
+        D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, GetLayeredWindowAttributes, GetSystemMetrics, GetWindowLongPtrW,
+        IsWindowVisible, RegisterClassExW, ShowWindow, WindowFromPoint, CS_HREDRAW, CS_VREDRAW,
+        GWL_EXSTYLE, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+        WS_POPUP,
+    };
+
+    #[test]
+    fn layered_d2d_overlay_is_visible_and_skips_hit_testing() -> Result<()> {
+        unsafe {
+            let class_name: Vec<u16> = "AuroraTransitionD2DTest\0".encode_utf16().collect();
+            let instance = HINSTANCE::default();
+            let wnd_class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(d2d_wnd_proc),
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                hInstance: instance,
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassExW(&wnd_class), 0);
+
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN)
+                + (GetSystemMetrics(SM_CXVIRTUALSCREEN) / 2).max(1);
+            let y = GetSystemMetrics(SM_YVIRTUALSCREEN)
+                + (GetSystemMetrics(SM_CYVIRTUALSCREEN) / 2).max(1);
+            let underlying = TransitionWindow(
+                CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR::null(),
+                    WS_POPUP,
+                    x,
+                    y,
+                    2,
+                    2,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .context("CreateWindowExW failed for test target")?,
+            );
+            let overlay = TransitionWindow(
+                CreateWindowExW(
+                    transition_window_ex_style(),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR::null(),
+                    WS_POPUP,
+                    x,
+                    y,
+                    2,
+                    2,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .context("CreateWindowExW failed for test overlay")?,
+            );
+            initialize_layered_overlay(overlay.0)?;
+
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
+                .context("D2D1CreateFactory failed for overlay smoke test")?;
+            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 0.0,
+                dpiY: 0.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                hwnd: overlay.0,
+                pixelSize: D2D_SIZE_U {
+                    width: 2,
+                    height: 2,
+                },
+                presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+            };
+            let rt: ID2D1HwndRenderTarget = factory
+                .CreateHwndRenderTarget(&rt_props, &hwnd_props)
+                .context("layered HWND rejected a Direct2D render target")?;
+            rt.BeginDraw();
+            rt.Clear(Some(&D2D1_COLOR_F {
+                r: 0.25,
+                g: 0.5,
+                b: 0.75,
+                a: 1.0,
+            }));
+            rt.EndDraw(None, None)
+                .context("Direct2D could not present to layered HWND")?;
+
+            let _ = ShowWindow(underlying.0, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(overlay.0, SW_SHOWNOACTIVATE);
+
+            assert!(IsWindowVisible(overlay.0).as_bool());
+            let required_style = transition_window_ex_style().0;
+            let actual_style = GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) as u32;
+            assert_eq!(actual_style & required_style, required_style);
+
+            let mut alpha = 0;
+            let mut flags = Default::default();
+            GetLayeredWindowAttributes(overlay.0, None, Some(&mut alpha), Some(&mut flags))?;
+            assert_eq!(alpha, 255);
+            assert_eq!(flags.0 & LWA_ALPHA.0, LWA_ALPHA.0);
+
+            assert_eq!(WindowFromPoint(POINT { x, y }), underlying.0);
+        }
+
+        Ok(())
+    }
 }

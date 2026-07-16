@@ -18,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$exe = Join-Path $AuroraDir 'aurora.exe'
+$exe = [IO.Path]::GetFullPath((Join-Path $AuroraDir 'aurora.exe'))
 $ctl = Join-Path $AuroraDir 'aurora-ctl.exe'
 if (-not (Test-Path $exe)) { throw "aurora.exe not found: $exe" }
 if (-not (Test-Path $ctl)) { throw "aurora-ctl.exe not found: $ctl" }
@@ -31,7 +31,15 @@ if ($admin) { throw "Refusing to run elevated. Relaunch aurora from a normal she
 Write-Host "Stopping aurora..."
 try { & $ctl quit 2>$null | Out-Null } catch {}
 Start-Sleep -Seconds 2
-$leftover = @(Get-Process aurora -ErrorAction SilentlyContinue)
+$currentSessionId = (Get-Process -Id $PID).SessionId
+$leftover = @(Get-Process aurora -ErrorAction SilentlyContinue | Where-Object {
+    try {
+        $_.SessionId -eq $currentSessionId -and
+            [String]::Equals([IO.Path]::GetFullPath($_.Path), $exe, [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        $false
+    }
+})
 foreach ($p in $leftover) {
     Write-Host ("  killing leftover aurora PID {0}" -f $p.Id)
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

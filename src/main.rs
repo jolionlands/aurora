@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::future::Future;
 use std::sync::Arc;
+use tokio::sync::oneshot;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -44,19 +47,12 @@ async fn main() -> Result<()> {
     enable_dpi_awareness();
 
     // ---------------------------------------------------------------------------
-    // 1. Tracing / logging
-    // ---------------------------------------------------------------------------
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(EnvFilter::from_default_env())
-        .init();
-
-    info!("aurora 0.1.0 starting");
-
-    // ---------------------------------------------------------------------------
-    // 1a. Autostart flags — handle BEFORE single-instance check or IPC startup
+    // 1. CLI flags that do not start the daemon
     // ---------------------------------------------------------------------------
     let args = Args::parse();
+    if args.register_autostart || args.unregister_autostart {
+        init_logging("info")?;
+    }
 
     if args.register_autostart {
         let mgr = StartupManager::new();
@@ -92,39 +88,22 @@ async fn main() -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // 2. COM initialisation (required for WIC + IDesktopWallpaper)
+    // 2. Reserve this session's authoritative IPC endpoint before startup work.
     // ---------------------------------------------------------------------------
-    unsafe {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-        // S_FALSE (already initialised on this thread) is also acceptable.
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if hr.is_err() {
-            return Err(anyhow::anyhow!("CoInitializeEx failed: {:?}", hr));
-        }
-    }
+    let _singleton = aurora::ipc::SingletonGuard::acquire()?;
+    let ipc = Arc::new(IpcServer::bind()?);
 
     // ---------------------------------------------------------------------------
-    // 3. Single-instance check
-    //    Try to open the pipe as a CLIENT. If it succeeds, another aurora is
-    //    already running.
+    // 3. COM initialisation (required for WIC + IDesktopWallpaper)
     // ---------------------------------------------------------------------------
-    {
-        use tokio::net::windows::named_pipe::ClientOptions;
-        if ClientOptions::new().open(aurora::ipc::PIPE_PATH).is_ok() {
-            eprintln!(
-                "aurora: another instance is already running (pipe open at {})",
-                aurora::ipc::PIPE_PATH
-            );
-            std::process::exit(1);
-        }
-    }
+    let _com = ComApartment::initialize()?;
 
     // ---------------------------------------------------------------------------
     // 4. Load config — write default on first run
     // ---------------------------------------------------------------------------
     let config_path = default_config_path();
-    if !config_path.exists() {
-        info!("Writing default config to {}", config_path.display());
+    let wrote_default_config = !config_path.exists();
+    if wrote_default_config {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create config dir {}", parent.display()))?;
@@ -138,6 +117,11 @@ async fn main() -> Result<()> {
     let config = parse_kdl_config(&config_src)
         .with_context(|| format!("parse config {}", config_path.display()))?;
 
+    init_logging(&config.log_level)?;
+    info!("aurora 0.1.0 starting");
+    if wrote_default_config {
+        info!("Wrote default config to {}", config_path.display());
+    }
     info!("Config loaded from {}", config_path.display());
 
     // Log autostart status.
@@ -160,67 +144,28 @@ async fn main() -> Result<()> {
 
     let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
 
-    let mut runtime =
-        Runtime::new(&config, applier, Arc::clone(&metrics)).context("initialise Runtime")?;
+    let mut runtime = Runtime::new(&config, &config_path, applier, Arc::clone(&metrics))
+        .context("initialise Runtime")?;
 
     // ---------------------------------------------------------------------------
     // 6. Scheduler — owns the swap channel sender
     // ---------------------------------------------------------------------------
     let (scheduler, swap_rx) = Scheduler::new(config.schedule.clone());
+    let swap_tx = scheduler.sender();
     let scheduler = Arc::new(scheduler);
 
-    // Clone the sender so both wiri integration and the runtime share it.
-    // We derive a sender clone from a new unbounded channel that feeds into
-    // the same receiver as the scheduler's channel — instead, we expose
-    // the scheduler's channel sender via a thin wrapper.
-    //
-    // Actually: the scheduler owns swap_tx internally; wiri sends directly
-    // into it via on_workspace_change(), and we need the raw tx for RuntimeHandle.
-    // Re-create a separate channel so Runtime and wiri can also inject requests.
-    let (extra_tx, extra_rx) =
-        tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
-
-    // Merge: forward scheduler rx + extra rx into a single merged rx.
-    // Use a simple select loop in a spawned task.
-    let (merged_tx, merged_rx) =
-        tokio::sync::mpsc::unbounded_channel::<aurora::scheduler::SwapRequest>();
-
-    {
-        let mtx = merged_tx.clone();
-        tokio::spawn(async move {
-            let mut swap_rx = swap_rx;
-            while let Some(req) = swap_rx.recv().await {
-                if mtx.send(req).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    {
-        let mtx = merged_tx.clone();
-        tokio::spawn(async move {
-            let mut extra_rx = extra_rx;
-            while let Some(req) = extra_rx.recv().await {
-                if mtx.send(req).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     // Build shared snapshot state for IPC queries.
-    let snap_state = Arc::new(parking_lot::Mutex::new(RuntimeStateSnapshot {
-        paused: false,
-        current_path: std::collections::HashMap::new(),
-        history_len: 0,
-        history: std::collections::VecDeque::new(),
-    }));
+    let snap_state = Arc::new(parking_lot::Mutex::new(RuntimeStateSnapshot::default()));
 
     // Build RuntimeHandle (for IPC).
     let runtime_handle = RuntimeHandle::new(
-        extra_tx.clone(),
+        swap_tx.clone(),
         Arc::clone(&snap_state),
-        runtime.index_arc(),
+        (
+            runtime.index_arc(),
+            runtime.source_roots_arc(),
+            runtime.ban_gate(),
+        ),
         Arc::clone(&metrics),
         config_path.clone(),
         runtime.playlist_arc(),
@@ -233,7 +178,6 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     // 7. Start IPC server
     // ---------------------------------------------------------------------------
-    let ipc = Arc::new(IpcServer::new());
     ipc.set_runtime(runtime_handle.clone());
 
     // Wire IPC broadcast sender into Runtime so it can emit WallpaperChanged events.
@@ -244,18 +188,14 @@ async fn main() -> Result<()> {
     ipc.set_shutdown_sender(shutdown_tx);
 
     let ipc_server = Arc::clone(&ipc);
-    tokio::spawn(async move {
-        if let Err(e) = ipc_server.run().await {
-            tracing::error!("IPC server exited with error: {}", e);
-        }
-    });
+    let mut ipc_task = tokio::spawn(async move { ipc_server.run().await });
 
-    info!("aurora ready. IPC pipe: {}", aurora::ipc::PIPE_PATH);
+    info!("aurora ready. IPC pipe: {}", aurora::ipc::pipe_path()?);
 
     // ---------------------------------------------------------------------------
     // 8. Start scheduler
     // ---------------------------------------------------------------------------
-    tokio::spawn({
+    let mut scheduler_task = tokio::spawn({
         let s = Arc::clone(&scheduler);
         async move {
             s.run().await;
@@ -266,7 +206,7 @@ async fn main() -> Result<()> {
     // 9. Wiri integration (optional)
     // ---------------------------------------------------------------------------
     if config.schedule.on_workspace_change {
-        let tx = extra_tx.clone();
+        let tx = swap_tx;
         tokio::spawn(async move {
             let _ = subscribe_wiri_events(tx).await;
         });
@@ -288,17 +228,133 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     // 11. Runtime drain loop
     // ---------------------------------------------------------------------------
-    tokio::spawn(async move {
-        runtime.run(merged_rx, snap_state, pause_arc).await;
-    });
+    // Runtime owns apartment-bound COM interfaces, so poll it on the root
+    // thread where COM was initialized rather than on a Tokio worker.
+    let exit = wait_for_core_exit(
+        runtime.run(swap_rx, snap_state, pause_arc),
+        shutdown_rx,
+        &mut ipc_task,
+        &mut scheduler_task,
+    )
+    .await;
 
-    // ---------------------------------------------------------------------------
-    // 12. Main loop — wait for shutdown signal
-    // ---------------------------------------------------------------------------
-    let _ = shutdown_rx.await;
-    info!("Shutdown signal received — exiting");
+    let (ipc_done, scheduler_done, fatal) = match exit {
+        CoreExit::Shutdown(Ok(())) => {
+            info!("Shutdown signal received — exiting");
+            (false, false, None)
+        }
+        CoreExit::Shutdown(Err(e)) => (
+            false,
+            false,
+            Some(anyhow::anyhow!("shutdown channel closed unexpectedly: {e}")),
+        ),
+        CoreExit::Runtime => (
+            false,
+            false,
+            Some(anyhow::anyhow!("runtime exited unexpectedly")),
+        ),
+        CoreExit::Ipc(Ok(Ok(()))) => (
+            true,
+            false,
+            Some(anyhow::anyhow!("IPC server exited unexpectedly")),
+        ),
+        CoreExit::Ipc(Ok(Err(e))) => (
+            true,
+            false,
+            Some(anyhow::anyhow!("IPC server failed: {e:#}")),
+        ),
+        CoreExit::Ipc(Err(e)) => (
+            true,
+            false,
+            Some(anyhow::anyhow!("IPC server task failed: {e}")),
+        ),
+        CoreExit::Scheduler(Ok(())) => (
+            false,
+            true,
+            Some(anyhow::anyhow!("scheduler exited unexpectedly")),
+        ),
+        CoreExit::Scheduler(Err(e)) => (
+            false,
+            true,
+            Some(anyhow::anyhow!("scheduler task failed: {e}")),
+        ),
+    };
+
+    if !ipc_done {
+        abort_and_join(&mut ipc_task).await;
+    }
+    if !scheduler_done {
+        abort_and_join(&mut scheduler_task).await;
+    }
+
+    if let Some(error) = fatal {
+        return Err(error);
+    }
 
     Ok(())
+}
+
+fn init_logging(default_filter: &str) -> Result<()> {
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
+        Err(std::env::VarError::NotPresent) => EnvFilter::try_new(default_filter)
+            .with_context(|| format!("invalid config log-level {default_filter:?}"))?,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("RUST_LOG is not valid Unicode")
+        }
+    };
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(filter)
+        .try_init()
+        .context("initialize logging")
+}
+
+enum CoreExit {
+    Shutdown(std::result::Result<(), oneshot::error::RecvError>),
+    Runtime,
+    Ipc(std::result::Result<Result<()>, JoinError>),
+    Scheduler(std::result::Result<(), JoinError>),
+}
+
+async fn wait_for_core_exit(
+    runtime: impl Future<Output = ()>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    ipc_task: &mut JoinHandle<Result<()>>,
+    scheduler_task: &mut JoinHandle<()>,
+) -> CoreExit {
+    tokio::pin!(runtime);
+    tokio::select! {
+        result = &mut shutdown_rx => CoreExit::Shutdown(result),
+        _ = &mut runtime => CoreExit::Runtime,
+        result = &mut *ipc_task => CoreExit::Ipc(result),
+        result = &mut *scheduler_task => CoreExit::Scheduler(result),
+    }
+}
+
+async fn abort_and_join<T>(task: &mut JoinHandle<T>) {
+    task.abort();
+    let _ = task.await;
+}
+
+struct ComApartment;
+
+impl ComApartment {
+    fn initialize() -> Result<Self> {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_err() {
+            return Err(anyhow::anyhow!("CoInitializeEx failed: {:?}", hr));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -313,3 +369,67 @@ fn enable_dpi_awareness() {
 
 #[cfg(not(target_os = "windows"))]
 fn enable_dpi_awareness() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipc_exit_wakes_supervisor() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut ipc_task = tokio::spawn(async { Err(anyhow::anyhow!("pipe failed")) });
+        let mut scheduler_task = tokio::spawn(std::future::pending::<()>());
+
+        let exit = wait_for_core_exit(
+            std::future::pending(),
+            shutdown_rx,
+            &mut ipc_task,
+            &mut scheduler_task,
+        )
+        .await;
+
+        match exit {
+            CoreExit::Ipc(Ok(Err(error))) => assert_eq!(error.to_string(), "pipe failed"),
+            _ => panic!("IPC exit was not selected"),
+        }
+        abort_and_join(&mut scheduler_task).await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_exit_wakes_supervisor() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut ipc_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let mut scheduler_task = tokio::spawn(async {});
+
+        let exit = wait_for_core_exit(
+            std::future::pending(),
+            shutdown_rx,
+            &mut ipc_task,
+            &mut scheduler_task,
+        )
+        .await;
+
+        assert!(matches!(exit, CoreExit::Scheduler(Ok(()))));
+        abort_and_join(&mut ipc_task).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_exit_wakes_supervisor() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut ipc_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let mut scheduler_task = tokio::spawn(std::future::pending::<()>());
+
+        let exit =
+            wait_for_core_exit(async {}, shutdown_rx, &mut ipc_task, &mut scheduler_task).await;
+
+        assert!(matches!(exit, CoreExit::Runtime));
+        abort_and_join(&mut ipc_task).await;
+        abort_and_join(&mut scheduler_task).await;
+    }
+}

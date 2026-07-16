@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use serde_json::Value;
@@ -58,12 +58,6 @@ enum Command {
         path: String,
     },
 
-    /// Rate the currently displayed photo (1–5 stars).
-    Rate {
-        /// Star rating between 1 and 5.
-        stars: u8,
-    },
-
     /// Ban a photo by its content hash so it is never shown again.
     Ban {
         /// Full-file BLAKE3 hash of the image to ban.
@@ -80,10 +74,10 @@ enum Command {
         types: Vec<String>,
     },
 
-    /// Reload photo sources from disk (restart for schedule/transition changes).
+    /// Reload sources (restart for schedule/transition/monitor/cache/metrics/log changes).
     Reload,
 
-    /// Show which photo is currently displayed on each monitor.
+    /// Show the last successfully applied wallpaper snapshot for each monitor.
     CurrentWallpaper,
 
     /// Gracefully stop the aurora daemon.
@@ -100,9 +94,13 @@ enum Command {
         /// Absolute/relative image path, or "current".
         path: String,
 
-        /// Pylon/OpenAI-compatible HTTP base URL (HTTPS is not supported).
-        #[arg(long, default_value = "http://100.64.0.28:8088/v1")]
+        /// Required Pylon/OpenAI-compatible base URL. HTTPS is required unless --allow-http.
+        #[arg(long, value_name = "URL")]
         base_url: String,
+
+        /// Allow plaintext HTTP for an explicitly trusted endpoint.
+        #[arg(long)]
+        allow_http: bool,
 
         /// Vision model to use.
         #[arg(long, default_value = "pylon-vega-gemma4")]
@@ -112,26 +110,27 @@ enum Command {
         #[arg(long, default_value = "PYLON_KEY")]
         api_key_env: String,
 
-        /// API key value. Overrides --api-key-env when set.
+        /// User-protected file containing the API key. Overrides --api-key-env.
         #[arg(long)]
-        api_key: Option<String>,
+        api_key_file: Option<String>,
 
         /// Request timeout in seconds.
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
 
-        /// Persist returned tag groups to this playlist for the path.
+        /// Create or update this playlist with returned metadata for the path.
         #[arg(long)]
         apply_playlist: Option<String>,
     },
 
-    /// Tag many wallpapers with resume support.
+    /// Tag many wallpapers and append a JSONL audit trail.
     AutotagBatch {
-        /// Folder to scan when --manifest is not supplied.
-        root: String,
+        /// Folder to scan. Mutually exclusive with --manifest.
+        #[arg(required_unless_present = "manifest", conflicts_with = "manifest")]
+        root: Option<String>,
 
-        /// Optional scan manifest JSON from aurora wallpaper scan.
-        #[arg(long)]
+        /// JSON manifest containing a rows array. Mutually exclusive with ROOT.
+        #[arg(long, required_unless_present = "root", conflicts_with = "root")]
         manifest: Option<String>,
 
         /// Playlist to create/update with tags.
@@ -142,7 +141,7 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
 
-        /// Resume JSONL file. Defaults to %APPDATA%\aurora\autotag-batch.jsonl.
+        /// Append-only JSONL audit file. Defaults to %APPDATA%\aurora\autotag-batch.jsonl.
         #[arg(long)]
         resume_file: Option<String>,
 
@@ -150,17 +149,21 @@ enum Command {
         #[arg(long)]
         force: bool,
 
-        /// Include exact duplicate files from the scan manifest.
+        /// Include exact duplicate image files.
         #[arg(long)]
         include_duplicates: bool,
 
-        /// Include images below 640x360 from the scan manifest.
+        /// Include images below 640x360.
         #[arg(long)]
         include_small: bool,
 
-        /// Pylon/OpenAI-compatible HTTP base URL (HTTPS is not supported).
-        #[arg(long, default_value = "http://100.64.0.28:8088/v1")]
+        /// Required Pylon/OpenAI-compatible base URL. HTTPS is required unless --allow-http.
+        #[arg(long, value_name = "URL")]
         base_url: String,
+
+        /// Allow plaintext HTTP for an explicitly trusted endpoint.
+        #[arg(long)]
+        allow_http: bool,
 
         /// Vision model to use.
         #[arg(long, default_value = "pylon-vega-gemma4")]
@@ -170,9 +173,9 @@ enum Command {
         #[arg(long, default_value = "PYLON_KEY")]
         api_key_env: String,
 
-        /// API key value. Overrides --api-key-env when set.
+        /// User-protected file containing the API key. Overrides --api-key-env.
         #[arg(long)]
-        api_key: Option<String>,
+        api_key_file: Option<String>,
 
         /// Request timeout in seconds.
         #[arg(long, default_value_t = 120)]
@@ -184,6 +187,22 @@ enum Command {
 enum PlaylistCommand {
     /// Print all playlists and which one is active.
     List,
+
+    /// Show one page of paths and metadata from a playlist.
+    Show {
+        /// Name of the playlist.
+        name: String,
+        /// Zero-based path offset.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Number of paths to return (1-256).
+        #[arg(
+            long,
+            default_value_t = aurora::ipc::messages::DEFAULT_PLAYLIST_SHOW_LIMIT,
+            value_parser = parse_playlist_show_limit
+        )]
+        limit: usize,
+    },
 
     /// Create an empty playlist.
     Create {
@@ -208,10 +227,10 @@ enum PlaylistCommand {
         name: String,
         /// Relative or absolute path, or "current".
         path: String,
-        /// Tag category: general, theme, content, color, source, medium, safety, franchise, or character.
+        /// Built-in tag group, or any custom group name.
         #[arg(long, default_value = "general")]
         kind: String,
-        /// Tags to assign.
+        /// Tags to assign; omit all tags to clear this group for the path.
         tags: Vec<String>,
     },
 
@@ -235,15 +254,24 @@ enum PlaylistCommand {
         frequency: u32,
     },
 
+    /// Enable or disable shuffled selection for a playlist.
+    Shuffle {
+        /// Name of the playlist.
+        name: String,
+        /// Whether shuffled selection is enabled.
+        #[arg(action = clap::ArgAction::Set)]
+        shuffle: bool,
+    },
+
     /// Remove a path from a playlist.
     Remove {
         /// Name of the playlist.
         name: String,
-        /// Path to remove (must match exactly what was added).
+        /// Relative or absolute path, or "current".
         path: String,
     },
 
-    /// Set the active playlist and immediately apply one of its wallpapers.
+    /// Set the active playlist and request an immediate wallpaper swap.
     Activate {
         /// Name of the playlist to activate.
         name: String,
@@ -274,14 +302,18 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
             .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid hours: {}", val))?;
-        return Ok(h * 3600);
+        return h
+            .checked_mul(3600)
+            .ok_or_else(|| anyhow::anyhow!("duration is too large"));
     }
     if let Some(val) = s.strip_suffix('m') {
         let m: u64 = val
             .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid minutes: {}", val))?;
-        return Ok(m * 60);
+        return m
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("duration is too large"));
     }
     if let Some(val) = s.strip_suffix('s') {
         let sec: u64 = val
@@ -293,6 +325,47 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
     // Plain number = seconds
     s.parse::<u64>()
         .map_err(|_| anyhow::anyhow!("cannot parse duration {:?}", s))
+}
+
+fn parse_playlist_show_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid playlist page limit: {value}"))?;
+    if !(1..=aurora::ipc::messages::MAX_PLAYLIST_SHOW_LIMIT).contains(&limit) {
+        return Err(format!(
+            "playlist page limit must be between 1 and {}",
+            aurora::ipc::messages::MAX_PLAYLIST_SHOW_LIMIT
+        ));
+    }
+    Ok(limit)
+}
+
+fn ipc_path_from(path: &Path, current_dir: &Path) -> Result<String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        if !current_dir.is_absolute() {
+            bail!(
+                "cannot resolve relative path against non-absolute current directory {}",
+                current_dir.display()
+            );
+        }
+        current_dir.join(path)
+    };
+
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("path cannot be sent over IPC because it is not valid UTF-8"))
+}
+
+fn command_path_for_ipc(path: &str) -> Result<String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return ipc_path_from(path, Path::new(""));
+    }
+
+    let current_dir = std::env::current_dir().context("resolve path against current directory")?;
+    ipc_path_from(path, &current_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -337,20 +410,14 @@ async fn main() -> Result<()> {
         }
 
         Command::Set { path } => {
+            let path = command_path_for_ipc(&path)?;
             let resp = send_message(&IpcMessage::Set { path }).await?;
             print_response(&resp, cli.json)?;
         }
 
         Command::Folder { path } => {
+            let path = command_path_for_ipc(&path)?;
             let resp = send_message(&IpcMessage::SetFolder { path }).await?;
-            print_response(&resp, cli.json)?;
-        }
-
-        Command::Rate { stars } => {
-            if !(1..=5).contains(&stars) {
-                bail!("star rating must be between 1 and 5, got {}", stars);
-            }
-            let resp = send_message(&IpcMessage::Rate { stars }).await?;
             print_response(&resp, cli.json)?;
         }
 
@@ -386,23 +453,27 @@ async fn main() -> Result<()> {
                 let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
                 if success {
                     if let Some(result) = v.get("result").and_then(|r| r.as_object()) {
-                        let mut monitors: Vec<(&String, &serde_json::Value)> =
-                            result.iter().collect();
-                        monitors.sort_by_key(|(k, _)| k.as_str());
-                        for (monitor, path) in monitors {
-                            let path_str = path.as_str().unwrap_or("");
-                            println!("{:<30}  {}", monitor, path_str);
+                        if result.is_empty() {
+                            println!("(no successfully applied wallpaper data)");
+                        } else {
+                            println!("Last successfully applied wallpaper snapshot:");
+                            let mut monitors: Vec<(&String, &serde_json::Value)> =
+                                result.iter().collect();
+                            monitors.sort_by_key(|(k, _)| k.as_str());
+                            for (monitor, path) in monitors {
+                                let path_str = path.as_str().unwrap_or("");
+                                println!("{:<30}  {}", monitor, path_str);
+                            }
                         }
                     } else {
-                        println!("(no wallpaper data)");
+                        println!("(no successfully applied wallpaper data)");
                     }
                 } else {
                     let error = v
                         .get("error")
                         .and_then(|e| e.as_str())
                         .unwrap_or("unknown error");
-                    eprintln!("error: {}", error);
-                    std::process::exit(1);
+                    anyhow::bail!("{}", error);
                 }
             }
         }
@@ -419,25 +490,30 @@ async fn main() -> Result<()> {
         Command::Autotag {
             path,
             base_url,
+            allow_http,
             model,
             api_key_env,
-            api_key,
+            api_key_file,
             timeout_secs,
             apply_playlist,
         } => {
             let resolved_path = resolve_playlist_path(path).await?;
+            if let Some(playlist) = apply_playlist.as_deref() {
+                let _ = playlist_path_has_metadata(playlist, &resolved_path).await?;
+            }
             let result = autotag_image(AutoTagOptions {
                 path: resolved_path.clone(),
                 base_url,
+                allow_http,
                 model,
                 api_key_env,
-                api_key,
+                api_key_file,
                 timeout_secs,
             })
             .await?;
 
             if let Some(playlist) = apply_playlist {
-                apply_autotags_to_playlist(&playlist, &resolved_path, &result).await?;
+                apply_autotags_to_playlist(&playlist, &resolved_path, &result, true, true).await?;
             }
 
             if cli.json {
@@ -448,6 +524,12 @@ async fn main() -> Result<()> {
                     if !tags.is_empty() {
                         println!("{:<12} {}", kind, tags.join(", "));
                     }
+                }
+                if let Some(rating) = result.rating {
+                    println!("{:<12} {}", "rating", rating);
+                }
+                if let Some(frequency) = result.frequency {
+                    println!("{:<12} {}", "frequency", frequency);
                 }
                 if let Some(confidence) = result.confidence {
                     println!("{:<12} {:.2}", "confidence", confidence);
@@ -465,9 +547,10 @@ async fn main() -> Result<()> {
             include_duplicates,
             include_small,
             base_url,
+            allow_http,
             model,
             api_key_env,
-            api_key,
+            api_key_file,
             timeout_secs,
         } => {
             let summary = autotag_batch(BatchAutoTagOptions {
@@ -480,9 +563,10 @@ async fn main() -> Result<()> {
                 include_duplicates,
                 include_small,
                 base_url,
+                allow_http,
                 model,
                 api_key_env,
-                api_key,
+                api_key_file,
                 timeout_secs,
             })
             .await?;
@@ -495,7 +579,7 @@ async fn main() -> Result<()> {
                     summary["tagged"], summary["skipped"], summary["failed"]
                 );
                 if let Some(resume) = summary.get("resume_file").and_then(Value::as_str) {
-                    println!("resume {}", resume);
+                    println!("audit {}", resume);
                 }
             }
         }
@@ -536,32 +620,14 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                             let name = pl.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                             let shuffle =
                                 pl.get("shuffle").and_then(|s| s.as_bool()).unwrap_or(false);
-                            let count = pl
-                                .get("paths")
-                                .and_then(|p| p.as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0);
-                            let _weighted = pl
-                                .get("items")
-                                .and_then(|p| p.as_array())
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|item| {
-                                            item.get("frequency")
-                                                .and_then(|f| f.as_u64())
-                                                .unwrap_or(1)
-                                        })
-                                        .sum::<u64>()
-                                })
-                                .unwrap_or(count as u64);
+                            let count = pl.get("path_count").and_then(Value::as_u64).unwrap_or(0);
                             let marker = if active == Some(name) {
                                 " [active]"
                             } else {
                                 ""
                             };
                             println!(
-                                "{}{} — {} file(s), shuffle: {}",
+                                "{}{} - {} file(s), shuffle: {}",
                                 name, marker, count, shuffle
                             );
                         }
@@ -571,8 +637,83 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                         .get("error")
                         .and_then(|e| e.as_str())
                         .unwrap_or("unknown error");
-                    eprintln!("error: {}", error);
-                    std::process::exit(1);
+                    anyhow::bail!("{}", error);
+                }
+            }
+        }
+
+        PlaylistCommand::Show {
+            name,
+            offset,
+            limit,
+        } => {
+            let resp = send_message(&IpcMessage::PlaylistShow {
+                name,
+                offset,
+                limit,
+            })
+            .await?;
+            if as_json {
+                print_response(&resp, true)?;
+            } else {
+                ensure_success(&resp)?;
+                let response: Value = serde_json::from_slice(&resp)?;
+                let result = response
+                    .get("result")
+                    .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist page"))?;
+                let playlist = result
+                    .get("playlist")
+                    .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist summary"))?;
+                let playlist_name = playlist.get("name").and_then(Value::as_str).unwrap_or("?");
+                let marker = if playlist.get("active").and_then(Value::as_bool) == Some(true) {
+                    " [active]"
+                } else {
+                    ""
+                };
+                let shuffle = playlist
+                    .get("shuffle")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let total = result.get("total").and_then(Value::as_u64).unwrap_or(0);
+                let page_offset = result.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let items = result
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                println!(
+                    "{}{} - {} file(s), shuffle: {}",
+                    playlist_name, marker, total, shuffle
+                );
+                println!("offset {}: {} item(s)", page_offset, items.len());
+                for item in items {
+                    println!(
+                        "{}",
+                        item.get("path").and_then(Value::as_str).unwrap_or("?")
+                    );
+                    if let Some(groups) = item.get("tag_groups").and_then(Value::as_object) {
+                        for (kind, tags) in groups {
+                            let tags: Vec<&str> = tags
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .collect();
+                            if !tags.is_empty() {
+                                println!("  {}: {}", kind, tags.join(", "));
+                            }
+                        }
+                    }
+                    if let Some(rating) = item.get("rating").and_then(Value::as_u64) {
+                        println!("  rating: {}", rating);
+                    }
+                    if let Some(frequency) = item.get("frequency").and_then(Value::as_u64) {
+                        println!("  frequency: {}", frequency);
+                    }
+                }
+                if let Some(next_offset) = result.get("next_offset").and_then(Value::as_u64) {
+                    println!("next offset: {}", next_offset);
                 }
             }
         }
@@ -645,7 +786,13 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
             print_response(&resp, as_json)?;
         }
 
+        PlaylistCommand::Shuffle { name, shuffle } => {
+            let resp = send_message(&IpcMessage::PlaylistShuffle { name, shuffle }).await?;
+            print_response(&resp, as_json)?;
+        }
+
         PlaylistCommand::Remove { name, path } => {
+            let path = resolve_playlist_path(path).await?;
             let resp = send_message(&IpcMessage::PlaylistRemove { name, path }).await?;
             print_response(&resp, as_json)?;
         }
@@ -673,7 +820,7 @@ async fn resolve_playlist_path(path: String) -> anyhow::Result<String> {
     use aurora::ipc::{send_message, IpcMessage};
 
     if !path.eq_ignore_ascii_case("current") {
-        return Ok(path);
+        return absolute_playlist_path(&path);
     }
 
     let resp = send_message(&IpcMessage::GetCurrentWallpaper).await?;
@@ -684,16 +831,35 @@ async fn resolve_playlist_path(path: String) -> anyhow::Result<String> {
         let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
         anyhow::bail!("could not get current wallpaper: {}", err);
     }
-    v.get("result")
+    absolute_playlist_path(&current_wallpaper_path(&v)?)
+}
+
+fn absolute_playlist_path(path: &str) -> anyhow::Result<String> {
+    let path = std::path::absolute(path)
+        .with_context(|| format!("make playlist path absolute: {path:?}"))?;
+    ipc_path_from(&path, Path::new(""))
+}
+
+fn current_wallpaper_path(response: &Value) -> anyhow::Result<String> {
+    let mut paths = response
+        .get("result")
         .and_then(|r| r.as_object())
-        .and_then(|m| m.values().next())
-        .and_then(|p| p.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no current wallpaper reported by daemon"))
+        .into_iter()
+        .flat_map(|monitors| monitors.values())
+        .filter_map(Value::as_str);
+    let first = paths
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no current wallpaper reported by daemon"))?;
+    if paths.any(|path| path != first) {
+        anyhow::bail!(
+            "monitors have different current wallpapers; pass an explicit path instead of 'current'"
+        );
+    }
+    Ok(first.to_string())
 }
 
 struct BatchAutoTagOptions {
-    root: String,
+    root: Option<String>,
     manifest: Option<String>,
     playlist: String,
     limit: usize,
@@ -702,19 +868,30 @@ struct BatchAutoTagOptions {
     include_duplicates: bool,
     include_small: bool,
     base_url: String,
+    allow_http: bool,
     model: String,
     api_key_env: String,
-    api_key: Option<String>,
+    api_key_file: Option<String>,
     timeout_secs: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct BatchCandidate {
     path: String,
-    sha256: Option<String>,
+    content_hash: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
 }
+
+struct BatchAuditContext<'a> {
+    run_id: String,
+    playlist: &'a str,
+    model: &'a str,
+}
+
+const MAX_AUTOTAG_BATCH_CANDIDATES: usize = 100_000;
+const MAX_AUTOTAG_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_API_KEY_FILE_BYTES: u64 = 16 * 1024;
 
 async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
     let resume_path = opts
@@ -722,67 +899,117 @@ async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(default_autotag_resume_path);
-    let completed = load_batch_resume(&resume_path, !opts.force, opts.force)?;
-    let playlist_snapshot = ensure_batch_playlist(&opts.playlist).await?;
+    let audit = BatchAuditContext {
+        run_id: format!("{}-{}", current_unix_ms(), std::process::id()),
+        playlist: &opts.playlist,
+        model: &opts.model,
+    };
     let mut candidates = collect_batch_candidates(&opts)?;
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut tagged = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    let mut attempted = 0usize;
     let mut seen_hashes = HashSet::new();
     let mut touched = Vec::new();
 
     for candidate in candidates {
-        if tagged >= opts.limit {
-            break;
-        }
-        if completed.contains(&candidate.path) {
-            skipped += 1;
-            continue;
-        }
         if !opts.include_duplicates {
-            if let Some(hash) = &candidate.sha256 {
+            if let Some(hash) = &candidate.content_hash {
                 if !seen_hashes.insert(hash.clone()) {
-                    append_batch_resume(&resume_path, "skipped-duplicate", &candidate.path, None)?;
+                    append_batch_resume(
+                        &resume_path,
+                        &audit,
+                        "skipped-duplicate",
+                        &candidate.path,
+                        None,
+                    )?;
                     skipped += 1;
                     continue;
                 }
             }
         }
         if !opts.include_small && is_small_candidate(&candidate) {
-            append_batch_resume(&resume_path, "skipped-small", &candidate.path, None)?;
+            append_batch_resume(&resume_path, &audit, "skipped-small", &candidate.path, None)?;
             skipped += 1;
             continue;
         }
-        if !opts.force
-            && playlist_path_has_metadata(&playlist_snapshot, &opts.playlist, &candidate.path)
-        {
-            append_batch_resume(&resume_path, "skipped-tagged", &candidate.path, None)?;
+        if should_skip_tagged_candidate(
+            opts.force,
+            playlist_path_has_metadata(&opts.playlist, &candidate.path).await,
+        )? {
+            append_batch_resume(
+                &resume_path,
+                &audit,
+                "skipped-tagged",
+                &candidate.path,
+                None,
+            )?;
             skipped += 1;
             continue;
+        }
+        if !reserve_autotag_attempt(&mut attempted, opts.limit) {
+            break;
         }
 
         match autotag_image(AutoTagOptions {
             path: candidate.path.clone(),
             base_url: opts.base_url.clone(),
+            allow_http: opts.allow_http,
             model: opts.model.clone(),
             api_key_env: opts.api_key_env.clone(),
-            api_key: opts.api_key.clone(),
+            api_key_file: opts.api_key_file.clone(),
             timeout_secs: opts.timeout_secs,
         })
         .await
         {
             Ok(result) => {
-                ensure_playlist_path(&opts.playlist, &candidate.path, &playlist_snapshot).await?;
-                apply_autotags_to_playlist(&opts.playlist, &candidate.path, &result).await?;
+                let applied = match apply_autotags_to_playlist(
+                    &opts.playlist,
+                    &candidate.path,
+                    &result,
+                    true,
+                    opts.force,
+                )
+                .await
+                {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        append_batch_resume(
+                            &resume_path,
+                            &audit,
+                            "failed",
+                            &candidate.path,
+                            Some(json!({
+                                "stage": "playlist-apply",
+                                "error": error.to_string(),
+                            })),
+                        )?;
+                        eprintln!("failed {}: {}", candidate.path, error);
+                        failed += 1;
+                        continue;
+                    }
+                };
+                if !applied {
+                    append_batch_resume(
+                        &resume_path,
+                        &audit,
+                        "skipped-tagged",
+                        &candidate.path,
+                        None,
+                    )?;
+                    skipped += 1;
+                    continue;
+                }
                 append_batch_resume(
                     &resume_path,
+                    &audit,
                     "tagged",
                     &candidate.path,
                     Some(result.to_json()),
                 )?;
-                println!(
+                eprintln!(
                     "tagged {} ({}) [{} groups]",
                     candidate.path,
                     result.model,
@@ -794,6 +1021,7 @@ async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
             Err(e) => {
                 append_batch_resume(
                     &resume_path,
+                    &audit,
                     "failed",
                     &candidate.path,
                     Some(json!({
@@ -812,8 +1040,21 @@ async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
         "tagged": tagged,
         "skipped": skipped,
         "failed": failed,
+        "attempted": attempted,
         "touched": touched,
     }))
+}
+
+fn reserve_autotag_attempt(attempted: &mut usize, limit: usize) -> bool {
+    if *attempted >= limit {
+        return false;
+    }
+    *attempted += 1;
+    true
+}
+
+fn should_skip_tagged_candidate(force: bool, status: anyhow::Result<bool>) -> anyhow::Result<bool> {
+    Ok(status? && !force)
 }
 
 fn default_autotag_resume_path() -> PathBuf {
@@ -824,37 +1065,9 @@ fn default_autotag_resume_path() -> PathBuf {
         .join("autotag-batch.jsonl")
 }
 
-fn load_batch_resume(
-    path: &Path,
-    include_failed: bool,
-    include_tagged: bool,
-) -> anyhow::Result<HashSet<String>> {
-    let mut done = HashSet::new();
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Ok(done);
-    };
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let status = value.get("status").and_then(Value::as_str).unwrap_or("");
-        let is_done = match status {
-            "skipped-small" | "skipped-duplicate" => true,
-            "tagged" | "skipped-tagged" => !include_tagged,
-            "failed" => include_failed,
-            _ => false,
-        };
-        if is_done {
-            if let Some(path) = value.get("path").and_then(Value::as_str) {
-                done.insert(path.to_string());
-            }
-        }
-    }
-    Ok(done)
-}
-
 fn append_batch_resume(
     path: &Path,
+    audit: &BatchAuditContext<'_>,
     status: &str,
     image_path: &str,
     detail: Option<Value>,
@@ -869,6 +1082,9 @@ fn append_batch_resume(
         .open(path)?;
     let record = json!({
         "ts_ms": current_unix_ms(),
+        "run_id": audit.run_id,
+        "playlist": audit.playlist,
+        "model": audit.model,
         "status": status,
         "path": image_path,
         "detail": detail,
@@ -885,31 +1101,57 @@ fn current_unix_ms() -> u128 {
 }
 
 fn collect_batch_candidates(opts: &BatchAutoTagOptions) -> anyhow::Result<Vec<BatchCandidate>> {
-    if let Some(manifest) = &opts.manifest {
-        return collect_manifest_candidates(Path::new(manifest));
+    let mut candidates = match (opts.root.as_deref(), opts.manifest.as_deref()) {
+        (Some(root), None) => collect_folder_candidates(Path::new(root))?,
+        (None, Some(manifest)) => collect_manifest_candidates(Path::new(manifest))?,
+        (None, None) => anyhow::bail!("provide exactly one of ROOT or --manifest"),
+        (Some(_), Some(_)) => anyhow::bail!("ROOT and --manifest are mutually exclusive"),
+    };
+    for candidate in &mut candidates {
+        candidate.path = absolute_playlist_path(&candidate.path)?;
     }
-    let mut out = Vec::new();
-    collect_folder_candidates(Path::new(&opts.root), &mut out)?;
-    Ok(out)
+    Ok(candidates)
 }
 
 fn collect_manifest_candidates(path: &Path) -> anyhow::Result<Vec<BatchCandidate>> {
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("read manifest metadata {}", path.display()))?
+        .len();
+    enforce_manifest_byte_limit(size)?;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open autotag manifest {}", path.display()))?;
+    let bytes = read_at_most(file, MAX_AUTOTAG_MANIFEST_BYTES)
+        .with_context(|| format!("read autotag manifest {}", path.display()))?;
+    enforce_manifest_byte_limit(bytes.len() as u64)?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse autotag manifest JSON {}", path.display()))?;
     let rows = value
         .get("rows")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("manifest missing rows array: {}", path.display()))?;
+    enforce_manifest_row_limit(rows.len())?;
     let mut out = Vec::new();
-    for row in rows {
-        if row.get("status").and_then(Value::as_str) != Some("ok") {
+    for (index, row) in rows.iter().enumerate() {
+        let row = row
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("manifest row {index} must be a JSON object"))?;
+        let status = row
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("manifest row {index} is missing string status"))?;
+        if status != "ok" {
             continue;
         }
-        let Some(path) = row.get("absolute_path").and_then(Value::as_str) else {
-            continue;
-        };
+        let path = row
+            .get("absolute_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("manifest row {index} with status ok is missing absolute_path")
+            })?;
         out.push(BatchCandidate {
             path: path.to_string(),
-            sha256: row
+            content_hash: row
                 .get("sha256")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string()),
@@ -920,46 +1162,73 @@ fn collect_manifest_candidates(path: &Path) -> anyhow::Result<Vec<BatchCandidate
     Ok(out)
 }
 
-fn collect_folder_candidates(root: &Path, out: &mut Vec<BatchCandidate>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_folder_candidates(&path, out)?;
-        } else if is_supported_image_path(&path) {
-            let dimensions = image::image_dimensions(&path).ok();
-            out.push(BatchCandidate {
-                path: path.display().to_string(),
-                sha256: None,
-                width: dimensions.map(|(width, _)| width as u64),
-                height: dimensions.map(|(_, height)| height as u64),
-            });
-        }
+fn read_at_most(reader: impl std::io::Read, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn enforce_manifest_byte_limit(size: u64) -> anyhow::Result<()> {
+    if size > MAX_AUTOTAG_MANIFEST_BYTES {
+        anyhow::bail!(
+            "autotag manifest is {size} bytes; maximum is {MAX_AUTOTAG_MANIFEST_BYTES} bytes"
+        );
     }
     Ok(())
 }
 
-fn is_supported_image_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some(
-            "jpg"
-                | "jpeg"
-                | "png"
-                | "webp"
-                | "bmp"
-                | "gif"
-                | "ico"
-                | "avif"
-                | "tif"
-                | "tiff"
-                | "heic"
-                | "heif",
-        )
-    )
+fn enforce_manifest_row_limit(count: usize) -> anyhow::Result<()> {
+    if count > MAX_AUTOTAG_BATCH_CANDIDATES {
+        anyhow::bail!(
+            "manifest contains {count} rows; autotag-batch accepts at most {MAX_AUTOTAG_BATCH_CANDIDATES}; narrow the manifest"
+        );
+    }
+    Ok(())
+}
+
+fn collect_folder_candidates(root: &Path) -> anyhow::Result<Vec<BatchCandidate>> {
+    use aurora::config::types::DEFAULT_IMAGE_EXTENSIONS;
+    use aurora::index::PhotoIndex;
+
+    let metadata = std::fs::metadata(root)
+        .with_context(|| format!("read autotag folder metadata {}", root.display()))?;
+    if !metadata.is_dir() {
+        anyhow::bail!("autotag root is not a directory: {}", root.display());
+    }
+    std::fs::read_dir(root).with_context(|| format!("read autotag folder {}", root.display()))?;
+
+    let extensions: Vec<String> = DEFAULT_IMAGE_EXTENSIONS
+        .iter()
+        .map(|extension| (*extension).to_string())
+        .collect();
+    let _com = ComApartment::initialize()?;
+    let index = PhotoIndex::scan(&[root.to_path_buf()], &extensions, true)
+        .map_err(|error| anyhow::anyhow!("scan autotag folder {}: {error}", root.display()))?;
+    enforce_candidate_limit(index.photos.len())?;
+
+    Ok(index
+        .photos
+        .into_iter()
+        .map(|photo| BatchCandidate {
+            path: photo.path.display().to_string(),
+            content_hash: Some(photo.hash),
+            width: photo.width.map(u64::from),
+            height: photo.height.map(u64::from),
+        })
+        .collect())
+}
+
+fn enforce_candidate_limit(count: usize) -> anyhow::Result<()> {
+    if count > MAX_AUTOTAG_BATCH_CANDIDATES {
+        anyhow::bail!(
+            "folder scan found {count} eligible images; autotag-batch accepts at most {MAX_AUTOTAG_BATCH_CANDIDATES}; narrow --root"
+        );
+    }
+    Ok(())
 }
 
 fn is_small_candidate(candidate: &BatchCandidate) -> bool {
@@ -969,89 +1238,29 @@ fn is_small_candidate(candidate: &BatchCandidate) -> bool {
     )
 }
 
-async fn ensure_batch_playlist(name: &str) -> anyhow::Result<Value> {
+async fn playlist_path_has_metadata(playlist: &str, path: &str) -> anyhow::Result<bool> {
     use aurora::ipc::{send_message, IpcMessage};
 
-    let resp = send_message(&IpcMessage::PlaylistList).await?;
-    ensure_success(&resp)?;
-    let snapshot: Value = serde_json::from_slice(&resp)?;
-    if playlist_exists(&snapshot, name) {
-        return Ok(snapshot);
-    }
-    let create_resp = send_message(&IpcMessage::PlaylistCreate {
-        name: name.to_string(),
-    })
-    .await?;
-    ensure_success(&create_resp)?;
-    let resp = send_message(&IpcMessage::PlaylistList).await?;
-    ensure_success(&resp)?;
-    Ok(serde_json::from_slice(&resp)?)
-}
-
-fn playlist_exists(snapshot: &Value, name: &str) -> bool {
-    snapshot
-        .pointer("/result/playlists")
-        .and_then(Value::as_array)
-        .map(|playlists| {
-            playlists
-                .iter()
-                .any(|pl| pl.get("name").and_then(Value::as_str) == Some(name))
-        })
-        .unwrap_or(false)
-}
-
-fn playlist_path_has_metadata(snapshot: &Value, playlist: &str, path: &str) -> bool {
-    let Some(item) = playlist_item(snapshot, playlist, path) else {
-        return false;
-    };
-    if item.get("rating").is_some_and(|rating| !rating.is_null()) {
-        return true;
-    }
-    item.get("tag_groups")
-        .and_then(Value::as_object)
-        .map(|groups| {
-            groups.values().any(|tags| {
-                tags.as_array()
-                    .map(|items| !items.is_empty())
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn playlist_item<'a>(snapshot: &'a Value, playlist: &str, path: &str) -> Option<&'a Value> {
-    snapshot
-        .pointer("/result/playlists")?
-        .as_array()?
-        .iter()
-        .find(|pl| pl.get("name").and_then(Value::as_str) == Some(playlist))?
-        .get("items")?
-        .as_array()?
-        .iter()
-        .find(|item| item.get("path").and_then(Value::as_str) == Some(path))
-}
-
-async fn ensure_playlist_path(playlist: &str, path: &str, snapshot: &Value) -> anyhow::Result<()> {
-    use aurora::ipc::{send_message, IpcMessage};
-
-    if playlist_item(snapshot, playlist, path).is_some() {
-        return Ok(());
-    }
-    let resp = send_message(&IpcMessage::PlaylistAdd {
+    let resp = send_message(&IpcMessage::PlaylistAutotagStatus {
         name: playlist.to_string(),
         path: path.to_string(),
     })
     .await?;
     ensure_success(&resp)?;
-    Ok(())
+    let response: Value = serde_json::from_slice(&resp)?;
+    response
+        .pointer("/result/has_metadata")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist autotag status"))
 }
 
 struct AutoTagOptions {
     path: String,
     base_url: String,
+    allow_http: bool,
     model: String,
     api_key_env: String,
-    api_key: Option<String>,
+    api_key_file: Option<String>,
     timeout_secs: u64,
 }
 
@@ -1080,46 +1289,27 @@ impl AutoTagResult {
 }
 
 async fn autotag_image(opts: AutoTagOptions) -> anyhow::Result<AutoTagResult> {
-    use base64::Engine;
-
+    let api_key = load_api_key(
+        &opts.api_key_env,
+        opts.api_key_file.as_deref().map(Path::new),
+    )?;
+    let request_url = format!("{}/chat/completions", opts.base_url.trim_end_matches('/'));
+    parse_http_url(&request_url, opts.allow_http)?;
     let path = std::path::PathBuf::from(&opts.path);
-    aurora::decode::validate_image_file(&path)
-        .map_err(|e| anyhow::anyhow!("rejecting image {}: {e}", path.display()))?;
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow::anyhow!("read image {}: {}", path.display(), e))?;
-    let mime = mime_for_path(&path);
-    let data_uri = format!(
-        "data:{};base64,{}",
-        mime,
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
-    );
-
-    let api_key = opts
-        .api_key
-        .or_else(|| load_api_key(&opts.api_key_env))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing API key; set {}, pass --api-key, or keep it in lattice-chat/.env.local",
-                opts.api_key_env
-            )
-        })?;
+    let (data_uri, palette) = prepare_autotag_image(&path)?;
 
     let identity = run_autotag_pass(
         "identity",
-        &opts.base_url,
-        &opts.model,
+        &opts,
         &api_key,
-        opts.timeout_secs,
         autotag_identity_prompt(),
         &data_uri,
     )
     .or_else(|e| {
         run_autotag_pass(
             "identity-fallback",
-            &opts.base_url,
-            &opts.model,
+            &opts,
             &api_key,
-            opts.timeout_secs,
             autotag_fallback_prompt(),
             &data_uri,
         )
@@ -1127,20 +1317,16 @@ async fn autotag_image(opts: AutoTagOptions) -> anyhow::Result<AutoTagResult> {
     })?;
     let aesthetic = run_autotag_pass(
         "aesthetic",
-        &opts.base_url,
-        &opts.model,
+        &opts,
         &api_key,
-        opts.timeout_secs,
         autotag_aesthetic_prompt(),
         &data_uri,
     )
     .or_else(|e| {
         run_autotag_pass(
             "aesthetic-fallback",
-            &opts.base_url,
-            &opts.model,
+            &opts,
             &api_key,
-            opts.timeout_secs,
             autotag_fallback_prompt(),
             &data_uri,
         )
@@ -1150,7 +1336,6 @@ async fn autotag_image(opts: AutoTagOptions) -> anyhow::Result<AutoTagResult> {
     let (identity_groups, _, _, identity_confidence) = normalize_autotag_json(&identity.raw);
     let (aesthetic_groups, rating, frequency, aesthetic_confidence) =
         normalize_autotag_json(&aesthetic.raw);
-    let palette = analyze_color_palette(&bytes)?;
     let groups = merge_tag_groups(
         merge_tag_groups(identity_groups, aesthetic_groups),
         palette.groups,
@@ -1196,9 +1381,77 @@ struct ColorBucket {
     b_sum: u64,
 }
 
-fn analyze_color_palette(bytes: &[u8]) -> anyhow::Result<PaletteResult> {
-    let image = image::load_from_memory(bytes)
-        .map_err(|e| anyhow::anyhow!("decode image for color palette: {e}"))?;
+fn prepare_autotag_image(path: &Path) -> anyhow::Result<(String, PaletteResult)> {
+    use base64::Engine;
+
+    const MAX_EDGE: u32 = 1600;
+    const MAX_JPEG_BYTES: usize = 12 * 1024 * 1024;
+    let decoded = {
+        let _com = ComApartment::initialize()?;
+        aurora::decode::decode_image(path, MAX_EDGE, MAX_EDGE).map_err(|error| {
+            anyhow::anyhow!("decode image {} for autotag: {error}", path.display())
+        })?
+    };
+    let rgba = bgra_to_rgba(decoded.width, decoded.height, decoded.bgra)?;
+    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, rgba)
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or_else(|| anyhow::anyhow!("decoded autotag image has invalid dimensions"))?;
+    let palette = analyze_color_palette(&image);
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85)
+        .encode_image(&image)
+        .map_err(|e| anyhow::anyhow!("encode autotag thumbnail: {e}"))?;
+    if jpeg.len() > MAX_JPEG_BYTES {
+        anyhow::bail!("autotag thumbnail exceeds {MAX_JPEG_BYTES} byte limit");
+    }
+    Ok((
+        format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(jpeg)
+        ),
+        palette,
+    ))
+}
+
+fn bgra_to_rgba(width: u32, height: u32, mut pixels: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| anyhow::anyhow!("decoded image dimensions overflow memory size"))?;
+    if pixels.len() != expected {
+        anyhow::bail!(
+            "decoded BGRA buffer has {} bytes; expected {expected} for {width}x{height}",
+            pixels.len()
+        );
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(pixels)
+}
+
+struct ComApartment;
+
+impl ComApartment {
+    fn initialize() -> anyhow::Result<Self> {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if result.is_err() {
+            anyhow::bail!("CoInitializeEx failed before image decode: {result:?}");
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+fn analyze_color_palette(image: &image::DynamicImage) -> PaletteResult {
     let thumb = image.thumbnail(96, 96).to_rgba8();
     let mut buckets: HashMap<(u8, u8, u8), ColorBucket> = HashMap::new();
 
@@ -1285,13 +1538,13 @@ fn analyze_color_palette(bytes: &[u8]) -> anyhow::Result<PaletteResult> {
         })
         .collect();
 
-    Ok(PaletteResult {
+    PaletteResult {
         groups,
         raw: json!({
             "palette": palette_json,
             "method": "local-quantized-thumbnail",
         }),
-    })
+    }
 }
 
 fn color_distance_sq(a: (u8, u8, u8), b: (u8, u8, u8)) -> i32 {
@@ -1353,14 +1606,12 @@ fn named_color_tag(r: u8, g: u8, b: u8) -> String {
 
 fn run_autotag_pass(
     label: &str,
-    base_url: &str,
-    model: &str,
+    opts: &AutoTagOptions,
     api_key: &str,
-    timeout_secs: u64,
     prompt: &str,
     data_uri: &str,
 ) -> anyhow::Result<AutoTagPassResult> {
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", opts.base_url.trim_end_matches('/'));
     let mut last_error = None;
 
     for attempt in 0..2 {
@@ -1370,7 +1621,7 @@ fn run_autotag_pass(
             format!("{prompt}\nReturn the JSON object now. No prose, no markdown.")
         };
         let body = json!({
-            "model": model,
+            "model": opts.model,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -1383,7 +1634,7 @@ fn run_autotag_pass(
             "stream": false
         });
 
-        let response = http_post_json(&url, api_key, &body, timeout_secs)?;
+        let response = http_post_json(&url, api_key, &body, opts.timeout_secs, opts.allow_http)?;
         let returned_model = response
             .get("model")
             .and_then(Value::as_str)
@@ -1510,10 +1761,10 @@ fn normalize_autotag_json(
         let kind = normalize_group_key(key);
         match kind.as_str() {
             "rating" => {
-                rating = value.as_u64().map(|v| (v as u8).min(5));
+                rating = value.as_u64().map(|v| v.min(5) as u8);
             }
             "frequency" => {
-                frequency = value.as_u64().map(|v| (v as u32).max(1));
+                frequency = value.as_u64().map(|v| v.clamp(1, u32::MAX as u64) as u32);
             }
             "confidence" => {
                 confidence = value.as_f64();
@@ -1604,51 +1855,35 @@ fn slug(s: &str) -> String {
         .join("-")
 }
 
-fn mime_for_path(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        Some("ico") => "image/x-icon",
-        Some("avif") => "image/avif",
-        Some("tif") | Some("tiff") => "image/tiff",
-        Some("heic") | Some("heif") => "image/heic",
-        _ => "image/png",
-    }
-}
-
-fn load_api_key(env_name: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(env_name) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+fn load_api_key(env_name: &str, file: Option<&Path>) -> anyhow::Result<String> {
+    let (value, source) = if let Some(path) = file {
+        let source = format!("API key file {}", path.display());
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("open API key file {}", path.display()))?;
+        let bytes = read_at_most(file, MAX_API_KEY_FILE_BYTES)
+            .with_context(|| format!("read API key file {}", path.display()))?;
+        if bytes.len() as u64 > MAX_API_KEY_FILE_BYTES {
+            anyhow::bail!("{source} exceeds {MAX_API_KEY_FILE_BYTES}-byte limit");
         }
+        let value =
+            String::from_utf8(bytes).with_context(|| format!("{source} is not valid UTF-8"))?;
+        (value, source)
+    } else {
+        (
+            std::env::var(env_name).map_err(|_| {
+                anyhow::anyhow!("missing API key; set {env_name} or use --api-key-file")
+            })?,
+            format!("environment variable {env_name}"),
+        )
+    };
+    let key = value.trim();
+    if key.is_empty() {
+        anyhow::bail!("{source} is empty");
     }
-
-    let env_path = std::path::Path::new(r"C:\Users\kalli\Development\lattice-chat\.env.local");
-    let content = std::fs::read_to_string(env_path).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == env_name {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
+    if key.chars().any(char::is_control) {
+        anyhow::bail!("{source} contains a control character");
     }
-    None
+    Ok(key.to_string())
 }
 
 fn http_post_json(
@@ -1656,220 +1891,260 @@ fn http_post_json(
     bearer: &str,
     body: &Value,
     timeout_secs: u64,
+    allow_http: bool,
 ) -> anyhow::Result<Value> {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-
-    let parsed = parse_http_url(url)?;
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let addr = format!("{}:{}", parsed.host, parsed.port);
-    // `connect` has no timeout and can hang forever on an unreachable gateway.
-    // Keep connection establishment under the same bound as request I/O.
-    let mut stream = addr
-        .to_socket_addrs()?
-        .find_map(|socket_addr| TcpStream::connect_timeout(&socket_addr, timeout).ok())
-        .ok_or_else(|| anyhow::anyhow!("could not connect to model gateway {addr}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    if bearer.bytes().any(|b| b.is_ascii_control()) {
-        anyhow::bail!("API key contains an HTTP header control character");
-    }
-    let body = serde_json::to_vec(body)?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        parsed.path,
-        parsed.host_header(),
-        bearer,
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
-
-    const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-    let mut raw = Vec::new();
-    stream
-        .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut raw)?;
-    if raw.len() > MAX_HTTP_RESPONSE_BYTES {
-        anyhow::bail!(
-            "model gateway response exceeds {} byte limit",
-            MAX_HTTP_RESPONSE_BYTES
-        );
-    }
-    let (status, headers, response_body) = split_http_response(&raw)?;
-    if !(200..300).contains(&status) {
-        let text = String::from_utf8_lossy(&response_body);
-        anyhow::bail!("HTTP {} from model gateway: {}", status, text);
-    }
-    let body = if headers
-        .get("transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
-    {
-        decode_chunked(&response_body)?
-    } else {
-        response_body
+    use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Networking::WinHttp::{
+        WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
+        WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+        WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
     };
-    serde_json::from_slice(&body).map_err(|e| anyhow::anyhow!("parse gateway JSON: {}", e))
+
+    let parsed = parse_http_url(url, allow_http)?;
+    let body = serde_json::to_vec(body)?;
+    let body_len =
+        u32::try_from(body.len()).map_err(|_| anyhow::anyhow!("request body too large"))?;
+    let headers: Vec<u16> = format!(
+        "Authorization: Bearer {bearer}\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+    )
+    .encode_utf16()
+    .collect();
+    let agent = wide("aurora-ctl/0.1");
+    let host = wide(&parsed.host);
+    let path = wide(&parsed.path);
+    let timeout_ms = timeout_secs.saturating_mul(1000).clamp(1, i32::MAX as u64) as i32;
+
+    unsafe {
+        let session = WinHttpHandle::new(
+            WinHttpOpen(
+                PCWSTR(agent.as_ptr()),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                0,
+            ),
+            "open WinHTTP session",
+        )?;
+        WinHttpSetTimeouts(session.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms)?;
+        let connection = WinHttpHandle::new(
+            WinHttpConnect(session.0, PCWSTR(host.as_ptr()), parsed.port, 0),
+            "connect to model gateway",
+        )?;
+        let flags = if parsed.secure {
+            WINHTTP_FLAG_SECURE
+        } else {
+            WINHTTP_OPEN_REQUEST_FLAGS(0)
+        };
+        let request = WinHttpHandle::new(
+            WinHttpOpenRequest(
+                connection.0,
+                windows::core::w!("POST"),
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                std::ptr::null(),
+                flags,
+            ),
+            "open model request",
+        )?;
+        WinHttpSetOption(
+            Some(request.0 as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(&WINHTTP_OPTION_REDIRECT_POLICY_NEVER.to_ne_bytes()),
+        )?;
+        WinHttpSendRequest(
+            request.0,
+            Some(&headers),
+            Some(body.as_ptr().cast()),
+            body_len,
+            body_len,
+            0,
+        )?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
+
+        let mut status = 0u32;
+        let mut status_size = std::mem::size_of::<u32>() as u32;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some((&mut status as *mut u32).cast()),
+            &mut status_size,
+            std::ptr::null_mut(),
+        )?;
+
+        const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let mut read = 0u32;
+            WinHttpReadData(
+                request.0,
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                &mut read,
+            )?;
+            if read == 0 {
+                break;
+            }
+            if response.len() + read as usize > MAX_RESPONSE_BYTES {
+                anyhow::bail!("model gateway response exceeds {MAX_RESPONSE_BYTES} byte limit");
+            }
+            response.extend_from_slice(&chunk[..read as usize]);
+        }
+        if !(200..300).contains(&status) {
+            let text: String = String::from_utf8_lossy(&response)
+                .chars()
+                .take(1024)
+                .collect();
+            anyhow::bail!("HTTP {status} from model gateway: {text}");
+        }
+        serde_json::from_slice(&response).map_err(|e| anyhow::anyhow!("parse gateway JSON: {e}"))
+    }
 }
 
 struct ParsedHttpUrl {
+    secure: bool,
     host: String,
     port: u16,
     path: String,
 }
 
-impl ParsedHttpUrl {
-    fn host_header(&self) -> String {
-        if self.port == 80 {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+struct WinHttpHandle(*mut std::ffi::c_void);
+
+impl WinHttpHandle {
+    fn new(raw: *mut std::ffi::c_void, operation: &str) -> anyhow::Result<Self> {
+        if raw.is_null() {
+            anyhow::bail!("{operation}: {}", windows::core::Error::from_win32());
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl Drop for WinHttpHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0);
         }
     }
 }
 
-fn parse_http_url(url: &str) -> anyhow::Result<ParsedHttpUrl> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow::anyhow!("only http:// model endpoints are supported: {}", url))?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{}", path)),
-        None => (rest, "/".to_string()),
+fn parse_http_url(url: &str, allow_http: bool) -> anyhow::Result<ParsedHttpUrl> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("model endpoint must be an https:// URL"))?;
+    let (secure, default_port) = if scheme.eq_ignore_ascii_case("https") {
+        (true, 443)
+    } else if scheme.eq_ignore_ascii_case("http") {
+        if !allow_http {
+            anyhow::bail!(
+                "plaintext HTTP is disabled; use HTTPS or pass --allow-http for a trusted endpoint"
+            );
+        }
+        (false, 80)
+    } else {
+        anyhow::bail!("unsupported model endpoint scheme {scheme:?}; use https://");
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host.to_string(), port.parse::<u16>()?),
-        None => (authority.to_string(), 80),
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..split];
+    let path = match rest.get(split..) {
+        Some(query) if query.starts_with('?') => format!("/{query}"),
+        Some(path) if !path.is_empty() => path.to_string(),
+        _ => "/".to_string(),
     };
-    if host.is_empty()
+    if authority.is_empty()
         || authority
-            .bytes()
-            .any(|b| matches!(b, b'@' | b'?' | b'#' | b'\\'))
-        || host.bytes().any(|b| b.is_ascii_control() || b == b' ')
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '@' | '#' | '?' | '\\'))
         || path
-            .bytes()
-            .any(|b| b.is_ascii_control() || b == b' ' || b == b'#')
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '#' | '\\'))
     {
-        anyhow::bail!("missing host in {}", url);
+        anyhow::bail!("invalid model endpoint URL");
     }
-    Ok(ParsedHttpUrl { host, port, path })
-}
-
-fn split_http_response(raw: &[u8]) -> anyhow::Result<(u16, BTreeMap<String, String>, Vec<u8>)> {
-    let header_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response: missing header terminator"))?;
-    let header = String::from_utf8_lossy(&raw[..header_end]);
-    let mut lines = header.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response: missing status line"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP response: bad status line"))?
-        .parse::<u16>()?;
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let end = ipv6
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 model endpoint"))?;
+        let host = &ipv6[..end];
+        let suffix = &ipv6[end + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 model endpoint"))?
+                .parse::<u16>()?
+        };
+        (host.to_string(), port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            anyhow::bail!("IPv6 model endpoints must use brackets");
         }
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.parse::<u16>()?),
+            None => (authority.to_string(), default_port),
+        }
+    };
+    if host.is_empty() {
+        anyhow::bail!("model endpoint is missing a host");
     }
-    Ok((status, headers, raw[header_end + 4..].to_vec()))
-}
-
-fn decode_chunked(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    loop {
-        if pos >= raw.len() {
-            anyhow::bail!("invalid chunked response: missing chunk size");
-        }
-        let line_end = raw[pos..]
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or_else(|| anyhow::anyhow!("invalid chunked response"))?
-            + pos;
-        let line = String::from_utf8_lossy(&raw[pos..line_end]);
-        let size_hex = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16)?;
-        pos = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        let data_end = pos
-            .checked_add(size)
-            .ok_or_else(|| anyhow::anyhow!("invalid chunked response: chunk size overflow"))?;
-        if data_end > raw.len() {
-            anyhow::bail!("invalid chunked response: chunk exceeds body");
-        }
-        out.extend_from_slice(&raw[pos..data_end]);
-        let next = data_end.checked_add(2).ok_or_else(|| {
-            anyhow::anyhow!("invalid chunked response: chunk terminator overflow")
-        })?;
-        if next > raw.len() || &raw[data_end..next] != b"\r\n" {
-            anyhow::bail!("invalid chunked response: missing chunk terminator");
-        }
-        pos = next;
-    }
-    Ok(out)
+    Ok(ParsedHttpUrl {
+        secure,
+        host,
+        port,
+        path,
+    })
 }
 
 async fn apply_autotags_to_playlist(
     playlist: &str,
     path: &str,
     result: &AutoTagResult,
-) -> anyhow::Result<()> {
-    use aurora::ipc::{send_message, IpcMessage};
+    create_playlist: bool,
+    overwrite_existing: bool,
+) -> anyhow::Result<bool> {
+    use aurora::ipc::send_message;
 
-    // Tag/rating/frequency operations require an existing playlist item. Make
-    // the one-shot command behave like batch mode without duplicating entries.
-    let snapshot_response = send_message(&IpcMessage::PlaylistList).await?;
-    ensure_success(&snapshot_response)?;
-    let snapshot: Value = serde_json::from_slice(&snapshot_response)?;
-    if !playlist_exists(&snapshot, playlist) {
-        anyhow::bail!("playlist '{}' not found", playlist);
+    let response = send_message(&autotag_upsert_message(
+        playlist,
+        path,
+        result,
+        create_playlist,
+        overwrite_existing,
+    ))
+    .await?;
+    ensure_success(&response)?;
+    let response: Value = serde_json::from_slice(&response)?;
+    response
+        .pointer("/result/applied")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist autotag result"))
+}
+
+fn autotag_upsert_message(
+    playlist: &str,
+    path: &str,
+    result: &AutoTagResult,
+    create_playlist: bool,
+    overwrite_existing: bool,
+) -> aurora::ipc::IpcMessage {
+    aurora::ipc::IpcMessage::PlaylistAutotagUpsert {
+        name: playlist.to_string(),
+        path: path.to_string(),
+        groups: result.groups.clone(),
+        rating: result.rating,
+        frequency: result.frequency,
+        create_playlist,
+        overwrite_existing,
     }
-    ensure_playlist_path(playlist, path, &snapshot).await?;
-
-    for (kind, tags) in &result.groups {
-        if tags.is_empty() {
-            continue;
-        }
-        let resp = send_message(&IpcMessage::PlaylistTag {
-            name: playlist.to_string(),
-            path: path.to_string(),
-            kind: kind.clone(),
-            tags: tags.clone(),
-        })
-        .await?;
-        ensure_success(&resp)?;
-    }
-
-    if let Some(rating) = result.rating {
-        let resp = send_message(&IpcMessage::PlaylistRate {
-            name: playlist.to_string(),
-            path: path.to_string(),
-            rating,
-        })
-        .await?;
-        ensure_success(&resp)?;
-    }
-
-    if let Some(frequency) = result.frequency {
-        let resp = send_message(&IpcMessage::PlaylistFrequency {
-            name: playlist.to_string(),
-            path: path.to_string(),
-            frequency,
-        })
-        .await?;
-        ensure_success(&resp)?;
-    }
-
-    Ok(())
 }
 
 fn ensure_success(resp: &[u8]) -> anyhow::Result<()> {
@@ -1907,7 +2182,15 @@ fn print_response(bytes: &[u8], as_json: bool) -> Result<()> {
         // Pretty-print the raw JSON
         let v: Value = serde_json::from_slice(bytes)?;
         println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
+        if v.get("success").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{}",
+            v.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        );
     }
 
     // Human-readable mode: inspect success field and result/error.
@@ -1931,8 +2214,7 @@ fn print_response(bytes: &[u8], as_json: bool) -> Result<()> {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
-        eprintln!("error: {}", error);
-        std::process::exit(1);
+        anyhow::bail!("{}", error);
     }
 
     Ok(())
@@ -1940,18 +2222,22 @@ fn print_response(bytes: &[u8], as_json: bool) -> Result<()> {
 
 /// Keep the pipe open and print each event as a JSON line.
 async fn stream_events(types: Vec<String>) -> Result<()> {
-    use aurora::ipc::{read_frame, write_frame, IpcMessage, PIPE_PATH};
+    use aurora::ipc::{
+        pipe_path, read_frame, read_frame_with_timeout, write_frame_with_timeout, IpcMessage,
+        FRAME_IO_TIMEOUT,
+    };
     use tokio::net::windows::named_pipe::ClientOptions;
 
+    let path = pipe_path()?;
     let mut client = ClientOptions::new()
-        .open(PIPE_PATH)
+        .open(&path)
         .map_err(|e| anyhow::anyhow!("Cannot connect to aurora daemon: {}", e))?;
 
     let msg = IpcMessage::SubscribeEvents { types };
-    write_frame(&mut client, &serde_json::to_vec(&msg)?).await?;
+    write_frame_with_timeout(&mut client, &serde_json::to_vec(&msg)?, FRAME_IO_TIMEOUT).await?;
 
     // First message: subscription acknowledgement
-    let ack = read_frame(&mut client)
+    let ack = read_frame_with_timeout(&mut client, FRAME_IO_TIMEOUT)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Daemon disconnected immediately"))?;
     let ack: Value = serde_json::from_slice(&ack)?;
@@ -1980,40 +2266,590 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunked_decoder_rejects_truncated_chunks_without_panicking() {
-        assert!(decode_chunked(b"4\r\nabc").is_err());
-        assert!(decode_chunked(b"ffffffffffffffff\r\n").is_err());
+    fn playlist_shuffle_cli_parses_bool() {
+        let cli =
+            Cli::try_parse_from(["aurora-ctl", "playlist", "shuffle", "focus", "true"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Playlist {
+                action: PlaylistCommand::Shuffle {
+                    name,
+                    shuffle: true
+                }
+            } if name == "focus"
+        ));
+    }
+
+    #[test]
+    fn playlist_show_cli_parses_and_bounds_pagination() {
+        let defaults = Cli::try_parse_from(["aurora-ctl", "playlist", "show", "focus"]).unwrap();
+        assert!(matches!(
+            defaults.command,
+            Command::Playlist {
+                action: PlaylistCommand::Show {
+                    name,
+                    offset: 0,
+                    limit: aurora::ipc::messages::DEFAULT_PLAYLIST_SHOW_LIMIT,
+                }
+            } if name == "focus"
+        ));
+
+        let explicit = Cli::try_parse_from([
+            "aurora-ctl",
+            "playlist",
+            "show",
+            "focus",
+            "--offset",
+            "12",
+            "--limit",
+            "256",
+        ])
+        .unwrap();
+        assert!(matches!(
+            explicit.command,
+            Command::Playlist {
+                action: PlaylistCommand::Show {
+                    offset: 12,
+                    limit: 256,
+                    ..
+                }
+            }
+        ));
+
+        for limit in ["0", "257"] {
+            let error =
+                Cli::try_parse_from(["aurora-ctl", "playlist", "show", "focus", "--limit", limit])
+                    .err()
+                    .expect("out-of-range page limit must fail");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn failed_json_response_returns_error() {
+        let error =
+            print_response(br#"{"success":false,"error":"playlist missing"}"#, true).unwrap_err();
+        assert_eq!(error.to_string(), "playlist missing");
+    }
+
+    fn write_test_bmp(path: &Path, color: [u8; 3]) {
+        use image::{ImageBuffer, Rgb};
+
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(8, 8, Rgb(color));
+        image.save(path).unwrap();
+    }
+
+    #[test]
+    fn duration_multiplication_rejects_overflow() {
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("3m").unwrap(), 180);
+        assert!(parse_duration_secs(&format!("{}h", u64::MAX)).is_err());
+        assert!(parse_duration_secs(&format!("{}m", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn ipc_paths_resolve_relative_to_the_callers_directory_without_fs_lookup() {
+        let current_dir = Path::new(r"C:\Users\test\wallpapers");
+        let relative = Path::new(r"missing\future.jpg");
+
         assert_eq!(
-            decode_chunked(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(),
-            b"Wikipedia"
+            ipc_path_from(relative, current_dir).unwrap(),
+            current_dir.join(relative).to_str().unwrap()
         );
     }
 
     #[test]
-    fn http_url_rejects_header_injection_bytes() {
-        assert!(parse_http_url("http://example.test/ok\r\nX-Evil: yes").is_err());
-        assert!(parse_http_url("http://example.test:8080/v1").is_ok());
-        assert!(parse_http_url("http://user@example.test/v1").is_err());
-        assert!(parse_http_url("http://example.test/v1 bad").is_err());
+    fn ipc_paths_preserve_absolute_paths() {
+        let absolute = Path::new(r"D:\wallpapers\photo.jpg");
+
+        assert_eq!(
+            ipc_path_from(absolute, Path::new("not-absolute")).unwrap(),
+            absolute.to_str().unwrap()
+        );
     }
 
     #[test]
-    fn force_resume_only_reprocesses_tagged_entries() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
-            "{\"status\":\"tagged\",\"path\":\"a.jpg\"}\n{\"status\":\"skipped-small\",\"path\":\"b.jpg\"}\n{\"status\":\"failed\",\"path\":\"c.jpg\"}\n",
-        )
+    fn ipc_paths_reject_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(OsString::from_wide(&[0xD800]));
+        let error = ipc_path_from(&invalid, Path::new(r"C:\wallpapers"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn current_wallpaper_path_rejects_an_empty_result() {
+        let error = current_wallpaper_path(&json!({ "result": {} }))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "no current wallpaper reported by daemon");
+    }
+
+    #[test]
+    fn current_wallpaper_path_accepts_one_monitor() {
+        assert_eq!(
+            current_wallpaper_path(&json!({ "result": { "DISPLAY1": "a.jpg" } })).unwrap(),
+            "a.jpg"
+        );
+    }
+
+    #[test]
+    fn current_wallpaper_path_accepts_the_same_path_on_two_monitors() {
+        assert_eq!(
+            current_wallpaper_path(&json!({
+                "result": { "DISPLAY1": "same.jpg", "DISPLAY2": "same.jpg" }
+            }))
+            .unwrap(),
+            "same.jpg"
+        );
+    }
+
+    #[test]
+    fn current_wallpaper_path_rejects_different_monitor_paths() {
+        let error = current_wallpaper_path(&json!({
+            "result": { "DISPLAY1": "a.jpg", "DISPLAY2": "b.jpg" }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("monitors have different current wallpapers"));
+        assert!(error.contains("pass an explicit path"));
+    }
+
+    #[test]
+    fn playlist_paths_are_absolute_before_ipc() {
+        let path = absolute_playlist_path("relative-wallpaper.jpg").unwrap();
+        assert!(Path::new(&path).is_absolute());
+        assert!(Path::new(&path).ends_with("relative-wallpaper.jpg"));
+    }
+
+    #[test]
+    fn model_url_requires_https_or_explicit_http_opt_in() {
+        let https = parse_http_url("https://example.test:8443/v1?q=1", false).unwrap();
+        assert!(https.secure);
+        assert_eq!(https.port, 8443);
+        assert_eq!(https.path, "/v1?q=1");
+        assert!(parse_http_url("http://127.0.0.1:8080/v1", false).is_err());
+        assert!(
+            !parse_http_url("http://127.0.0.1:8080/v1", true)
+                .unwrap()
+                .secure
+        );
+        assert!(parse_http_url("http://example.test/ok\r\nX-Evil: yes", true).is_err());
+        assert!(parse_http_url("https://user@example.test/v1", false).is_err());
+        assert!(parse_http_url("https://example.test/v1 bad", false).is_err());
+    }
+
+    #[test]
+    fn autotag_commands_require_an_explicit_base_url() {
+        for args in [
+            ["aurora-ctl", "autotag", "wallpaper.jpg"],
+            ["aurora-ctl", "autotag-batch", "wallpapers"],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("missing --base-url must fail");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("--base-url <URL>"));
+        }
+
+        assert!(Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag",
+            "wallpaper.jpg",
+            "--base-url",
+            "https://model.example/v1",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag-batch",
+            "wallpapers",
+            "--base-url",
+            "https://model.example/v1",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn autotag_batch_accepts_a_root_without_a_manifest() {
+        let cli = Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag-batch",
+            "wallpapers",
+            "--base-url",
+            "https://model.example/v1",
+        ])
         .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::AutotagBatch {
+                root: Some(root),
+                manifest: None,
+                ..
+            } if root == "wallpapers"
+        ));
+    }
 
-        let normal = load_batch_resume(file.path(), true, false).unwrap();
-        assert!(normal.contains("a.jpg"));
-        assert!(normal.contains("b.jpg"));
-        assert!(normal.contains("c.jpg"));
+    #[test]
+    fn autotag_batch_accepts_a_manifest_without_a_root() {
+        let cli = Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag-batch",
+            "--manifest",
+            "scan.json",
+            "--base-url",
+            "https://model.example/v1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::AutotagBatch {
+                root: None,
+                manifest: Some(manifest),
+                ..
+            } if manifest == "scan.json"
+        ));
+    }
 
-        let force = load_batch_resume(file.path(), false, true).unwrap();
-        assert!(!force.contains("a.jpg"));
-        assert!(force.contains("b.jpg"));
-        assert!(!force.contains("c.jpg"));
+    #[test]
+    fn autotag_batch_rejects_a_missing_input_source() {
+        let error = Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag-batch",
+            "--base-url",
+            "https://model.example/v1",
+        ])
+        .err()
+        .expect("missing ROOT and --manifest must fail");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn autotag_batch_rejects_root_and_manifest_together() {
+        let error = Cli::try_parse_from([
+            "aurora-ctl",
+            "autotag-batch",
+            "wallpapers",
+            "--manifest",
+            "scan.json",
+            "--base-url",
+            "https://model.example/v1",
+        ])
+        .err()
+        .expect("ROOT and --manifest together must fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn model_metadata_clamps_before_narrowing_integer_types() {
+        let (_, rating, frequency, _) = normalize_autotag_json(&json!({
+            "rating": u64::MAX,
+            "frequency": u64::MAX,
+        }));
+
+        assert_eq!(rating, Some(5));
+        assert_eq!(frequency, Some(u32::MAX));
+    }
+
+    #[test]
+    fn api_key_file_is_trimmed_and_rejects_header_controls() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "  secret-value\r\n").unwrap();
+        assert_eq!(
+            load_api_key("IGNORED", Some(file.path())).unwrap(),
+            "secret-value"
+        );
+        std::fs::write(file.path(), "secret\nvalue").unwrap();
+        assert!(load_api_key("IGNORED", Some(file.path())).is_err());
+
+        std::fs::write(file.path(), "k".repeat(MAX_API_KEY_FILE_BYTES as usize)).unwrap();
+        assert_eq!(
+            load_api_key("IGNORED", Some(file.path())).unwrap().len(),
+            MAX_API_KEY_FILE_BYTES as usize
+        );
+        file.as_file().set_len(MAX_API_KEY_FILE_BYTES + 1).unwrap();
+        let error = load_api_key("IGNORED", Some(file.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds 16384-byte limit"));
+    }
+
+    #[test]
+    fn autotag_payload_is_a_bounded_jpeg_thumbnail() {
+        use base64::Engine;
+
+        let source = image::DynamicImage::new_rgb8(1700, 100);
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut encoded)
+            .encode_image(&source)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jpg");
+        std::fs::write(&path, encoded).unwrap();
+
+        let (uri, _) = prepare_autotag_image(&path).unwrap();
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .decode(uri.strip_prefix("data:image/jpeg;base64,").unwrap())
+            .unwrap();
+        let thumbnail = image::load_from_memory(&jpeg).unwrap();
+        assert!(thumbnail.width() <= 1600 && thumbnail.height() <= 1600);
+        assert!(jpeg.len() <= 12 * 1024 * 1024);
+    }
+
+    #[test]
+    fn converts_bgra_to_rgba_without_swapping_alpha() {
+        assert_eq!(
+            bgra_to_rgba(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            vec![3, 2, 1, 4, 7, 6, 5, 8]
+        );
+        assert!(bgra_to_rgba(2, 1, vec![0; 4]).is_err());
+        assert!(bgra_to_rgba(u32::MAX, u32::MAX, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn autotag_decode_keeps_file_and_pixel_limits() {
+        let oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized
+            .as_file()
+            .set_len(aurora::decode::MAX_IMAGE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(prepare_autotag_image(oversized.path())
+            .err()
+            .expect("oversized file must fail")
+            .to_string()
+            .contains("maximum"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.bmp");
+        let mut bmp = vec![0u8; 54];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&54u32.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&20_000i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&10_000i32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        std::fs::write(&path, bmp).unwrap();
+        assert!(prepare_autotag_image(&path)
+            .err()
+            .expect("oversized pixel count must fail")
+            .to_string()
+            .contains("pixels"));
+    }
+
+    #[test]
+    fn batch_uses_bundled_default_extension_policy() {
+        use aurora::config::types::DEFAULT_IMAGE_EXTENSIONS;
+
+        for extension in [
+            "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "ico",
+        ] {
+            assert!(DEFAULT_IMAGE_EXTENSIONS.contains(&extension));
+        }
+        for extension in ["avif", "heic", "heif"] {
+            assert!(!DEFAULT_IMAGE_EXTENSIONS.contains(&extension));
+        }
+    }
+
+    #[test]
+    fn folder_scan_deduplicates_aliases_and_cycles_when_available() {
+        use std::os::windows::fs::symlink_dir;
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        write_test_bmp(&actual.join("wallpaper.bmp"), [255, 0, 0]);
+
+        let alias_created = symlink_dir(&actual, directory.path().join("alias")).is_ok();
+        let cycle_created = symlink_dir(directory.path(), actual.join("cycle")).is_ok();
+        if !alias_created && !cycle_created {
+            return;
+        }
+
+        let candidates = collect_folder_candidates(directory.path()).unwrap();
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn folder_scan_skips_malformed_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.bmp");
+        write_test_bmp(&valid, [255, 0, 0]);
+        std::fs::write(directory.path().join("malformed.jpg"), b"not an image").unwrap();
+        std::fs::File::create(directory.path().join("oversized.png"))
+            .unwrap()
+            .set_len(aurora::decode::MAX_IMAGE_FILE_BYTES + 1)
+            .unwrap();
+
+        let candidates = collect_folder_candidates(directory.path()).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, valid.display().to_string());
+        assert_eq!(
+            (candidates[0].width, candidates[0].height),
+            (Some(8), Some(8))
+        );
+        assert!(candidates[0].content_hash.is_some());
+    }
+
+    #[test]
+    fn folder_scan_rejects_missing_and_non_directory_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let error = collect_folder_candidates(&missing).unwrap_err().to_string();
+        assert!(error.contains("read autotag folder metadata"));
+        assert!(error.contains("missing"));
+
+        let file = directory.path().join("file.txt");
+        std::fs::write(&file, "not a directory").unwrap();
+        let error = collect_folder_candidates(&file).unwrap_err().to_string();
+        assert!(error.contains("autotag root is not a directory"));
+    }
+
+    #[test]
+    fn folder_duplicates_supply_hashes_for_suppression() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.bmp");
+        let second = directory.path().join("second.bmp");
+        write_test_bmp(&first, [0, 0, 255]);
+        std::fs::copy(&first, &second).unwrap();
+
+        let candidates = collect_folder_candidates(directory.path()).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].content_hash, candidates[1].content_hash);
+        assert!(candidates[0].content_hash.is_some());
+
+        let mut seen = HashSet::new();
+        let duplicates = candidates
+            .iter()
+            .filter(|candidate| !seen.insert(candidate.content_hash.clone().unwrap()))
+            .count();
+        assert_eq!(duplicates, 1);
+    }
+
+    #[test]
+    fn folder_candidate_cap_fails_before_conversion() {
+        assert!(enforce_candidate_limit(MAX_AUTOTAG_BATCH_CANDIDATES).is_ok());
+        let error = enforce_candidate_limit(MAX_AUTOTAG_BATCH_CANDIDATES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most 100000"));
+        assert!(error.contains("narrow --root"));
+    }
+
+    #[test]
+    fn manifest_byte_and_row_limits_fail_before_candidate_conversion() {
+        let oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized
+            .as_file()
+            .set_len(MAX_AUTOTAG_MANIFEST_BYTES + 1)
+            .unwrap();
+        let error = collect_manifest_candidates(oversized.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum is 67108864 bytes"));
+
+        let too_many_rows = tempfile::NamedTempFile::new().unwrap();
+        let rows = std::iter::repeat_n(r#"{"status":"error"}"#, MAX_AUTOTAG_BATCH_CANDIDATES + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(too_many_rows.path(), format!(r#"{{"rows":[{rows}]}}"#)).unwrap();
+        let error = collect_manifest_candidates(too_many_rows.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest contains 100001 rows"));
+        assert!(error.contains("at most 100000"));
+    }
+
+    #[test]
+    fn manifest_reader_stops_after_the_limit_sentinel_byte() {
+        let bytes = read_at_most(std::io::Cursor::new(vec![0; 32]), 8).unwrap();
+        assert_eq!(bytes.len(), 9);
+    }
+
+    #[test]
+    fn malformed_manifest_rows_report_the_row() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"rows":[null]}"#).unwrap();
+        let error = collect_manifest_candidates(file.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest row 0 must be a JSON object"));
+    }
+
+    #[test]
+    fn autotag_playlist_update_uses_one_targeted_message() {
+        let result = AutoTagResult {
+            path: "photo.jpg".to_string(),
+            model: "model".to_string(),
+            groups: BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+            rating: Some(4),
+            frequency: Some(2),
+            confidence: None,
+            raw: Value::Null,
+        };
+        let message = autotag_upsert_message("auto", "photo.jpg", &result, true, false);
+        assert!(matches!(
+            message,
+            aurora::ipc::IpcMessage::PlaylistAutotagUpsert { .. }
+        ));
+        let wire = serde_json::to_string(&message).unwrap();
+        assert!(wire.contains("playlist_autotag_upsert"));
+        assert!(!wire.contains("playlist_list"));
+    }
+
+    #[test]
+    fn failed_attempts_consume_the_batch_limit() {
+        let mut attempted = 0;
+        assert!(reserve_autotag_attempt(&mut attempted, 2));
+        // The first model call may fail; the second is still the final budget slot.
+        assert!(reserve_autotag_attempt(&mut attempted, 2));
+        assert!(!reserve_autotag_attempt(&mut attempted, 2));
+        assert_eq!(attempted, 2);
+    }
+
+    #[test]
+    fn forced_batch_still_requires_status_but_does_not_skip_tagged_paths() {
+        assert!(should_skip_tagged_candidate(false, Ok(true)).unwrap());
+        assert!(!should_skip_tagged_candidate(true, Ok(true)).unwrap());
+
+        for force in [false, true] {
+            let error = should_skip_tagged_candidate(
+                force,
+                Err(anyhow::anyhow!("playlist status unavailable")),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "playlist status unavailable");
+        }
+    }
+
+    #[test]
+    fn batch_audit_records_include_run_attribution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = BatchAuditContext {
+            run_id: "1234-56".to_string(),
+            playlist: "focus",
+            model: "vision-model",
+        };
+
+        append_batch_resume(&path, &audit, "skipped-small", "photo.jpg", None).unwrap();
+
+        let record: Value =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(record["run_id"], "1234-56");
+        assert_eq!(record["playlist"], "focus");
+        assert_eq!(record["model"], "vision-model");
     }
 }

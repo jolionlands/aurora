@@ -1,6 +1,9 @@
 use super::types::*;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::PathBuf;
+
+use crate::apply::WallpaperFit;
+use crate::transition::{Backend, TransitionStyle};
 
 // ---------------------------------------------------------------------------
 // Tiny hand-rolled KDL parser
@@ -22,14 +25,32 @@ enum Line<'a> {
     Bare { token: String },
 }
 
-fn strip_comment(s: &str) -> &str {
-    // Strip `//` that is NOT inside a string literal (good enough for our
-    // config format where strings don't contain `//`).
-    if let Some(pos) = s.find("//") {
-        s[..pos].trim_end()
-    } else {
-        s
+fn strip_comment(s: &str) -> Result<&str> {
+    let mut chars = s.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+
+    while let Some((index, ch)) = chars.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+            return Ok(s[..index].trim_end());
+        }
     }
+
+    if quote.is_some() {
+        bail!("unterminated quoted string");
+    }
+
+    Ok(s)
 }
 
 /// Pull out a quoted string starting from byte `start`, returning
@@ -39,141 +60,151 @@ fn parse_quoted(s: &str, start: usize) -> Option<(String, usize)> {
     if bytes.get(start) != Some(&b'"') && bytes.get(start) != Some(&b'\'') {
         return None;
     }
-    let quote = bytes[start];
+    let quote = bytes[start] as char;
     let mut i = start + 1;
     let mut out = String::new();
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+        let ch = s[i..].chars().next()?;
+        if ch == '\\' && i + 1 < bytes.len() {
             i += 1;
-            match bytes[i] {
-                b'n' => out.push('\n'),
-                b't' => out.push('\t'),
-                b'\\' => out.push('\\'),
-                b'"' => out.push('"'),
-                b'\'' => out.push('\''),
-                c => {
+            let escaped = s[i..].chars().next()?;
+            match escaped {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                other => {
                     out.push('\\');
-                    out.push(c as char);
+                    out.push(other);
                 }
             }
-        } else if bytes[i] == quote {
-            return Some((out, i + 1));
+            i += escaped.len_utf8();
+        } else if ch == quote {
+            return Some((out, i + ch.len_utf8()));
         } else {
-            out.push(bytes[i] as char);
+            out.push(ch);
+            i += ch.len_utf8();
         }
-        i += 1;
     }
-    None // unterminated string — treat as None; caller handles gracefully
+    None // strip_comment rejects unterminated strings before tokenization
 }
 
-fn parse_value_tokens(mut s: &str) -> Vec<String> {
+fn parse_value_tokens(mut s: &str) -> Result<Vec<String>> {
     let mut values = Vec::new();
 
     loop {
-        s = s.trim_start();
+        s = s.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ',');
         if s.is_empty() {
             break;
         }
 
         if s.starts_with('"') || s.starts_with('\'') {
-            if let Some((value, end)) = parse_quoted(s, 0) {
-                values.push(value);
-                s = &s[end..];
-                continue;
+            let (value, end) =
+                parse_quoted(s, 0).ok_or_else(|| anyhow::anyhow!("unterminated quoted string"))?;
+            if s[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_whitespace() && ch != ',')
+            {
+                bail!("unexpected text after quoted value");
             }
+            values.push(value);
+            s = &s[end..];
+            continue;
         }
 
-        let end = s.find(char::is_whitespace).unwrap_or(s.len());
-        let value = s[..end].trim_matches(|c: char| c == '"' || c == '\'');
-        if !value.is_empty() {
-            values.push(value.to_string());
+        let end = s
+            .find(|ch: char| ch.is_whitespace() || ch == ',')
+            .unwrap_or(s.len());
+        let value = &s[..end];
+        if value.contains(['"', '\'']) {
+            bail!("malformed quoted value");
         }
+        values.push(value.to_string());
         s = &s[end..];
     }
 
-    values
+    Ok(values)
 }
 
 /// Parse a single non-blank, non-comment line into a `Line` token.
-fn lex_line(raw: &str) -> Option<Line<'_>> {
-    let s = strip_comment(raw).trim();
+fn lex_line(raw: &str) -> Result<Option<Line<'_>>> {
+    let s = strip_comment(raw)?.trim();
     if s.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Closing brace
-    if s.starts_with('}') {
-        return Some(Line::SectionClose);
+    if s == "}" {
+        return Ok(Some(Line::SectionClose));
     }
 
     // Check for section open: ends with `{` (possibly after a quoted arg).
     // Pattern: `name {` or `name "arg" {`
     if let Some(body) = s.strip_suffix('{') {
         let body = body.trim();
-        // Does it have a quoted arg?
-        if let Some(q_start) = body.find(['"', '\'']) {
-            let name = body[..q_start].trim();
-            if let Some((arg, _)) = parse_quoted(body, q_start) {
-                return Some(Line::SectionOpen {
-                    name,
-                    arg: Some(arg),
-                });
-            }
+        let name_end = body.find(char::is_whitespace).unwrap_or(body.len());
+        let name = &body[..name_end];
+        if name.is_empty() || name.contains(['"', '\'', '=', '{', '}']) {
+            bail!("invalid section declaration");
         }
-        // No quoted arg
-        let name = body.trim();
-        return Some(Line::SectionOpen { name, arg: None });
+        let rest = body[name_end..].trim();
+        let arg = if rest.is_empty() {
+            None
+        } else {
+            let (arg, end) = parse_quoted(rest, 0)
+                .ok_or_else(|| anyhow::anyhow!("expected quoted section argument"))?;
+            if !rest[end..].trim().is_empty() {
+                bail!("unexpected text after section argument");
+            }
+            Some(arg)
+        };
+        return Ok(Some(Line::SectionOpen { name, arg }));
     }
 
     // Key-value: `key = "value"`, `key = value`, `key "value"`, `key value`
     // Also handles `key=value` (no spaces around =).
-    let s_eq = s.replace('=', " = ");
-    let mut tokens = s_eq.split_whitespace();
-    let key = match tokens.next() {
-        Some(k) => k.trim_matches('=').to_string(),
-        None => return None,
-    };
-
-    // Swallow any bare `=` token
-    let mut rest_iter = tokens.peekable();
-    if rest_iter.peek().map(|t| *t == "=").unwrap_or(false) {
-        rest_iter.next();
+    let key_end = s
+        .find(|ch: char| ch.is_whitespace() || ch == '=')
+        .unwrap_or(s.len());
+    let key = &s[..key_end];
+    if key.is_empty() || key.contains(['"', '\'', '{', '}']) {
+        bail!("invalid key");
     }
 
     // Try to get the value — could be a quoted string or bare token
-    let value_start = {
-        // Find position of second non-whitespace run in original `s` after the key
-        let after_key = s.trim_start();
-        // skip the key itself
-        let after_key = &after_key[key.len()..];
-        let after_key = after_key.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
-        after_key
-    };
+    let mut value_start = s[key_end..].trim_start();
+    if let Some(rest) = value_start.strip_prefix('=') {
+        value_start = rest.trim_start();
+    }
 
     if key == "extensions" {
-        let values = parse_value_tokens(value_start);
+        let values = parse_value_tokens(value_start)?;
         if !values.is_empty() {
-            return Some(Line::KeyValue {
-                key,
+            return Ok(Some(Line::KeyValue {
+                key: key.to_string(),
                 value: values.join(","),
-            });
+            }));
         }
     }
 
-    if value_start.starts_with('"') || value_start.starts_with('\'') {
-        if let Some((v, _)) = parse_quoted(value_start, 0) {
-            return Some(Line::KeyValue { key, value: v });
-        }
+    let values = parse_value_tokens(value_start)?;
+    if values.len() > 1 {
+        bail!("expected one value for key {:?}", key);
     }
 
-    // Bare token value
-    if let Some(v) = rest_iter.next() {
-        let v = v.trim_matches(|c: char| c == '"' || c == '\'').to_string();
-        return Some(Line::KeyValue { key, value: v });
+    if let Some(value) = values.into_iter().next() {
+        return Ok(Some(Line::KeyValue {
+            key: key.to_string(),
+            value,
+        }));
     }
 
     // No value — bare token / flag
-    Some(Line::Bare { token: key })
+    Ok(Some(Line::Bare {
+        token: key.to_string(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +226,9 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
     let mut cur_monitor: Option<MonitorOverride> = None;
 
     for (lineno, raw) in input.lines().enumerate() {
-        let token = match lex_line(raw) {
+        let token = match lex_line(raw)
+            .map_err(|error| anyhow::anyhow!("line {}: {}", lineno + 1, error))?
+        {
             Some(t) => t,
             None => continue,
         };
@@ -204,6 +237,36 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
 
         match token {
             Line::SectionOpen { name, arg } => {
+                let known = matches!(
+                    (section.as_str(), name),
+                    (
+                        "",
+                        "source"
+                            | "monitor"
+                            | "schedule"
+                            | "transitions"
+                            | "transition"
+                            | "metrics"
+                            | "cache"
+                    ) | ("source", "extensions")
+                );
+                if !known {
+                    let name = if section.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{section}.{name}")
+                    };
+                    bail!("line {}: unknown section {:?}", lineno + 1, name);
+                }
+                if arg.is_some() && !matches!((section.as_str(), name), ("", "source" | "monitor"))
+                {
+                    bail!(
+                        "line {}: section {:?} does not accept an argument",
+                        lineno + 1,
+                        name
+                    );
+                }
+
                 // Start accumulator for known sections
                 match (section.as_str(), name) {
                     ("", "source") => {
@@ -226,7 +289,9 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             }
 
             Line::SectionClose => {
-                let closed = section_stack.pop().unwrap_or_default();
+                let closed = section_stack.pop().ok_or_else(|| {
+                    anyhow::anyhow!("line {}: unmatched closing brace", lineno + 1)
+                })?;
                 let parent = section_stack.join(".");
                 match (parent.as_str(), closed.as_str()) {
                     ("", "source") => {
@@ -256,23 +321,57 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
             }
 
             Line::Bare { token } => {
-                // Bare tokens inside `source.extensions` or similar treated as
-                // list items. Otherwise ignored with a best-effort interpretation.
                 if section == "source.extensions" {
                     if let Some(ref mut s) = cur_source {
-                        s.extensions.push(token);
+                        s.extensions.push(token.to_lowercase());
                     }
+                } else {
+                    apply_kv(
+                        &mut config,
+                        &mut cur_source,
+                        &mut cur_monitor,
+                        &section,
+                        &token,
+                        "true",
+                    )
+                    .map_err(|error| anyhow::anyhow!("line {}: {}", lineno + 1, error))?;
                 }
-                // Bare flags at other levels: ignore gracefully.
             }
         }
     }
 
+    if !section_stack.is_empty() {
+        bail!("unclosed section {:?}", section_stack.join("."));
+    }
+
+    validate_schedule(&mut config.schedule)?;
     Ok(config)
 }
 
-fn parse_bool(v: &str) -> bool {
-    matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+fn validate_schedule(schedule: &mut ScheduleConfig) -> Result<()> {
+    schedule.mode = schedule.mode.trim().to_ascii_lowercase();
+    match schedule.mode.as_str() {
+        "interval" | "at" => {}
+        "random" => bail!("schedule mode \"random\" is not supported; use \"interval\" or \"at\""),
+        mode => bail!("unsupported schedule mode {mode:?}; expected \"interval\" or \"at\""),
+    }
+
+    for at in &schedule.at_times {
+        crate::scheduler::parse_hhmm(at)
+            .map_err(|error| anyhow::anyhow!("invalid schedule time {at:?}: {error}"))?;
+    }
+    if schedule.mode == "at" && schedule.at_times.is_empty() {
+        bail!("schedule mode \"at\" requires at least one `at \"HH:MM\"` entry");
+    }
+    Ok(())
+}
+
+fn parse_bool(v: &str) -> Result<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => bail!("expected boolean, got {:?}", v),
+    }
 }
 
 fn parse_u32(v: &str) -> Result<u32> {
@@ -295,6 +394,31 @@ fn parse_usize(v: &str) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("expected usize, got {:?}", v))
 }
 
+fn validate_wallpaper_fit(value: &str) -> Result<()> {
+    if matches!(WallpaperFit::parse(value), WallpaperFit::Fill)
+        && !value.eq_ignore_ascii_case("fill")
+    {
+        bail!("unsupported wallpaper fit {value:?}");
+    }
+    Ok(())
+}
+
+fn validate_transition_style(value: &str) -> Result<()> {
+    if matches!(TransitionStyle::parse(value), TransitionStyle::None)
+        && !value.eq_ignore_ascii_case("none")
+    {
+        bail!("unsupported transition style {value:?}");
+    }
+    Ok(())
+}
+
+fn validate_transition_renderer(value: &str) -> Result<()> {
+    if matches!(Backend::parse(value), Backend::Auto) && !value.eq_ignore_ascii_case("auto") {
+        bail!("unsupported transition renderer {value:?}");
+    }
+    Ok(())
+}
+
 fn apply_kv(
     config: &mut Config,
     cur_source: &mut Option<SourceConfig>,
@@ -307,27 +431,28 @@ fn apply_kv(
         // ---- Top-level scalars ----
         "" => match key {
             "log-level" | "log_level" => config.log_level = value.to_string(),
-            _ => {} // forward-compatible: silently ignore unknown top-level keys
+            _ => bail!("unknown top-level key {:?}", key),
         },
 
         // ---- source block ----
         "source" => {
-            if let Some(ref mut s) = cur_source {
-                match key {
-                    "path" => s.path = PathBuf::from(value),
-                    "recursive" => s.recursive = parse_bool(value),
-                    "min-width" | "min_width" => s.min_width = parse_u32(value)?,
-                    "min-height" | "min_height" => s.min_height = parse_u32(value)?,
-                    "extensions" => {
-                        // Comma-separated or space-separated list on one line
-                        s.extensions = value
-                            .split([',', ' '])
-                            .map(|t| t.trim().to_lowercase())
-                            .filter(|t| !t.is_empty())
-                            .collect();
-                    }
-                    _ => {}
+            let s = cur_source
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("source key outside source block"))?;
+            match key {
+                "path" => s.path = PathBuf::from(value),
+                "recursive" => s.recursive = parse_bool(value)?,
+                "min-width" | "min_width" => s.min_width = parse_u32(value)?,
+                "min-height" | "min_height" => s.min_height = parse_u32(value)?,
+                "extensions" => {
+                    // Comma-separated or space-separated list on one line
+                    s.extensions = value
+                        .split([',', ' '])
+                        .map(|t| t.trim().to_lowercase())
+                        .filter(|t| !t.is_empty())
+                        .collect();
                 }
+                _ => bail!("unknown key {:?} in source", key),
             }
         }
 
@@ -341,10 +466,10 @@ fn apply_kv(
                 config.schedule.at_times.push(value.to_string());
             }
             "on-workspace-change" | "on_workspace_change" => {
-                config.schedule.on_workspace_change = parse_bool(value);
+                config.schedule.on_workspace_change = parse_bool(value)?;
             }
             "pause-when-fullscreen" | "pause_when_fullscreen" => {
-                config.schedule.pause_when_fullscreen = parse_bool(value);
+                config.schedule.pause_when_fullscreen = parse_bool(value)?;
             }
             "pause-when-idle-secs" | "pause_when_idle_secs" => {
                 config.schedule.pause_when_idle_secs = parse_u32(value)?;
@@ -352,69 +477,64 @@ fn apply_kv(
             "min-repeat-window" | "min_repeat_window" => {
                 config.schedule.min_repeat_window = parse_usize(value)?;
             }
-            _ => {}
+            _ => bail!("unknown key {:?} in schedule", key),
         },
 
         // ---- monitor block ----
         "monitor" => {
-            if let Some(ref mut m) = cur_monitor {
-                match key {
-                    "name" => m.name = value.to_string(),
-                    "fit" => m.fit = value.to_string(),
-                    "tint" => m.tint = value.to_string(),
-                    _ => {}
+            let m = cur_monitor
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("monitor key outside monitor block"))?;
+            match key {
+                "name" => m.name = value.to_string(),
+                "fit" => {
+                    validate_wallpaper_fit(value)?;
+                    m.fit = value.to_string();
                 }
+                _ => bail!("unknown key {:?} in monitor", key),
             }
         }
 
         // ---- transitions block ----
         "transitions" | "transition" => match key {
-            "enabled" => config.transitions.enabled = parse_bool(value),
+            "enabled" => config.transitions.enabled = parse_bool(value)?,
             "duration-ms" | "duration_ms" | "duration" => {
-                config.transitions.duration_ms = parse_u32(value)?;
+                let duration_ms = parse_u32(value)?;
+                if duration_ms > MAX_TRANSITION_DURATION_MS {
+                    bail!(
+                        "transition duration {duration_ms} ms exceeds the {MAX_TRANSITION_DURATION_MS} ms maximum"
+                    );
+                }
+                config.transitions.duration_ms = duration_ms;
             }
-            "style" => config.transitions.style = value.to_string(),
-            "renderer" => config.transitions.renderer = value.to_string(),
-            _ => {}
+            "style" => {
+                validate_transition_style(value)?;
+                config.transitions.style = value.to_string();
+            }
+            "renderer" => {
+                validate_transition_renderer(value)?;
+                config.transitions.renderer = value.to_string();
+            }
+            _ => bail!("unknown key {:?} in transitions", key),
         },
-
-        // ---- triggers block ----
-        "triggers" => match key {
-            "on-startup" | "on_startup" => {
-                config.triggers.on_startup.push(value.to_string());
-            }
-            _ => {}
-        },
-
-        // ---- triggers.wiri-workspace entries ----
-        "triggers.wiri-workspace" | "triggers.wiri_workspace" => {
-            // key is the workspace id (as string), value is the command/folder
-            if let Ok(id) = key.parse::<i32>() {
-                config
-                    .triggers
-                    .on_wiri_workspace
-                    .push((id, value.to_string()));
-            }
-        }
 
         // ---- metrics block ----
         "metrics" => match key {
-            "enabled" => config.metrics.enabled = parse_bool(value),
+            "enabled" => config.metrics.enabled = parse_bool(value)?,
             "port" => config.metrics.port = parse_u16(value)?,
-            _ => {}
+            _ => bail!("unknown key {:?} in metrics", key),
         },
 
         // ---- cache block ----
         "cache" => match key {
             "decoded-mb" | "decoded_mb" => config.cache.decoded_mb = parse_u32(value)?,
             "prefetch-count" | "prefetch_count" => {
-                config.cache.prefetch_count = parse_usize(value)?;
+                config.cache.deprecated_prefetch_count = Some(parse_usize(value)?);
             }
-            _ => {}
+            _ => bail!("unknown key {:?} in cache", key),
         },
 
-        // Unknown sections: silently forward-compatible
-        _ => {}
+        _ => bail!("unknown section {:?}", section),
     }
     Ok(())
 }
@@ -451,8 +571,85 @@ mod tests {
         let src = include_str!("../../resources/default_config.kdl");
         let cfg = parse_kdl_config(src).expect("default_config.kdl should parse without error");
         assert!(!cfg.sources.is_empty(), "should have at least one source");
+        assert_eq!(
+            cfg.sources[0].extensions,
+            DEFAULT_IMAGE_EXTENSIONS
+                .iter()
+                .map(|extension| (*extension).to_string())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(cfg.schedule.mode, "interval");
-        assert!(cfg.transitions.enabled);
+        assert!(!cfg.transitions.enabled);
+        assert!(cfg.cache.deprecated_prefetch_count.is_none());
+        tracing_subscriber::EnvFilter::try_new(&cfg.log_level)
+            .expect("default log-level must be a valid filter");
+
+        for stale_claim in [
+            "watches this file",
+            "\"random\"",
+            "prefetch-count",
+            "tint ",
+            "triggers {",
+        ] {
+            assert!(
+                !src.contains(stale_claim),
+                "stale default claim: {stale_claim}"
+            );
+        }
+
+        let readme = include_str!("../../README.md");
+        for stale_claim in ["docs/PLAN.md", "on-idle", "prefetch"] {
+            assert!(
+                !readme.contains(stale_claim),
+                "stale README claim: {stale_claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_schedule_modes_and_times() {
+        for mode in ["random", "on-idle", "unknown"] {
+            let input = format!("schedule {{\nmode \"{mode}\"\n}}");
+            assert!(
+                parse_kdl_config(&input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("schedule mode"),
+                "mode {mode:?} did not fail clearly"
+            );
+        }
+
+        assert!(parse_kdl_config("schedule {\nmode \"at\"\n}")
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one"));
+        assert!(parse_kdl_config("schedule {\nmode \"at\"\nat \"25:00\"\n}")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid schedule time"));
+        assert_eq!(
+            parse_kdl_config("schedule {\nmode \"AT\"\nat \"09:30\"\n}")
+                .unwrap()
+                .schedule
+                .mode,
+            "at"
+        );
+    }
+
+    #[test]
+    fn accepts_deprecated_prefetch_but_rejects_dead_config() {
+        let config = parse_kdl_config("cache {\nprefetch-count 2\n}").unwrap();
+        assert_eq!(config.cache.deprecated_prefetch_count, Some(2));
+
+        for input in [
+            "monitor {\ntint \"none\"\n}",
+            "triggers {\non-startup \"script.cmd\"\n}",
+        ] {
+            assert!(
+                parse_kdl_config(input).is_err(),
+                "accepted dead config {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -491,5 +688,92 @@ source "C:\Users\kalli\Documents\custom_wallpapers" {
             cfg.sources[0].extensions,
             vec!["jpg", "jpeg", "png", "heic", "webp"]
         );
+    }
+
+    #[test]
+    fn test_preserves_unicode_and_quoted_slashes() {
+        let cfg = parse_kdl_config(
+            r#"
+source "//server/share/壁紙" { // quoted slashes are not a comment
+    recursive true
+}
+"#,
+        )
+        .expect("quoted slashes and Unicode should parse");
+
+        assert_eq!(cfg.sources[0].path, PathBuf::from("//server/share/壁紙"));
+    }
+
+    #[test]
+    fn test_rejects_invalid_boolean() {
+        let error = parse_kdl_config("source {\nrecursive maybe\n}")
+            .expect_err("invalid boolean should fail");
+        assert!(error.to_string().contains("expected boolean"));
+    }
+
+    #[test]
+    fn test_rejects_unknown_keys_and_sections() {
+        for input in ["schedule {\nunknown-key 1\n}", "unknown-section {\n}"] {
+            assert!(parse_kdl_config(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_unclosed_blocks() {
+        for input in ["source {\npath \"C:/wallpapers\"", "monitor {\nfit fill"] {
+            assert!(parse_kdl_config(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_rejects_unmatched_braces_and_unterminated_strings() {
+        for input in ["}", r#"source "unterminated {"#] {
+            assert!(parse_kdl_config(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn validates_transition_duration_boundaries() {
+        for duration_ms in [0, MAX_TRANSITION_DURATION_MS] {
+            let input = format!("transitions {{\nduration-ms {duration_ms}\n}}");
+            assert_eq!(
+                parse_kdl_config(&input).unwrap().transitions.duration_ms,
+                duration_ms
+            );
+        }
+
+        let input = format!(
+            "transitions {{\nduration-ms {}\n}}",
+            MAX_TRANSITION_DURATION_MS + 1
+        );
+        let error = parse_kdl_config(&input).unwrap_err().to_string();
+        assert!(error.contains("60000 ms maximum"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_enum_values() {
+        for (input, expected) in [
+            ("monitor {\nfit crop\n}", "wallpaper fit"),
+            ("transitions {\nstyle spin\n}", "transition style"),
+            (
+                "transitions {\nrenderer software-ish\n}",
+                "transition renderer",
+            ),
+        ] {
+            let error = parse_kdl_config(input).unwrap_err().to_string();
+            assert!(error.contains(expected), "{input:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepts_existing_runtime_enum_aliases_case_insensitively() {
+        let config = parse_kdl_config(
+            "monitor {\nfit CENTRE\n}\ntransitions {\nstyle SLIDE_LEFT\nrenderer GPU\n}",
+        )
+        .unwrap();
+
+        assert_eq!(config.monitors[0].fit, "CENTRE");
+        assert_eq!(config.transitions.style, "SLIDE_LEFT");
+        assert_eq!(config.transitions.renderer, "GPU");
     }
 }

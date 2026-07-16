@@ -1,30 +1,63 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use super::messages::{IpcEvent, IpcMessage};
-use super::{read_frame, write_frame, PIPE_PATH};
+use super::{
+    pipe_path, read_frame_with_timeout, write_frame_with_timeout, FRAME_IO_TIMEOUT, MAX_FRAME_SIZE,
+};
 use crate::runtime::RuntimeHandle;
+
+const MAX_CONCURRENT_HANDLERS: usize = 32;
+const MAX_EVENT_SUBSCRIBERS: usize = 16;
+
+const EVENT_SWAPPED: &str = "swapped";
+const EVENT_PAUSED: &str = "paused";
+const EVENT_RESUMED: &str = "resumed";
+const EVENT_CONFIG_RELOADED: &str = "config_reloaded";
+const EVENT_WALLPAPER_CHANGED: &str = "wallpaper_changed";
+const VALID_EVENT_TYPES: &[&str] = &[
+    EVENT_SWAPPED,
+    EVENT_PAUSED,
+    EVENT_RESUMED,
+    EVENT_CONFIG_RELOADED,
+    EVENT_WALLPAPER_CHANGED,
+];
 
 // ---------------------------------------------------------------------------
 // IpcServer
 // ---------------------------------------------------------------------------
 
 pub struct IpcServer {
+    pipe_path: String,
+    initial_pipe: parking_lot::Mutex<Option<tokio::net::windows::named_pipe::NamedPipeServer>>,
     event_tx: broadcast::Sender<IpcEvent>,
-    shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     runtime: parking_lot::Mutex<Option<RuntimeHandle>>,
+    handler_slots: Arc<Semaphore>,
+    subscriber_slots: Arc<Semaphore>,
 }
 
 impl IpcServer {
-    pub fn new() -> Self {
+    /// Reserve the session's authoritative endpoint before daemon startup work.
+    pub fn bind() -> Result<Self> {
+        let pipe_path = pipe_path()?;
+        let initial_pipe = create_pipe_with_sa(&pipe_path, true).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot reserve IPC endpoint {pipe_path}; another instance may already be running: {e}"
+            )
+        })?;
         let (event_tx, _) = broadcast::channel(64);
-        Self {
+        Ok(Self {
+            pipe_path,
+            initial_pipe: parking_lot::Mutex::new(Some(initial_pipe)),
             event_tx,
             shutdown_tx: parking_lot::Mutex::new(None),
             runtime: parking_lot::Mutex::new(None),
-        }
+            handler_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
+            subscriber_slots: Arc::new(Semaphore::new(MAX_EVENT_SUBSCRIBERS)),
+        })
     }
 
     /// Wire a RuntimeHandle so IPC commands can drive the runtime.
@@ -32,15 +65,11 @@ impl IpcServer {
         *self.runtime.lock() = Some(handle);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<IpcEvent> {
-        self.event_tx.subscribe()
-    }
-
     pub fn broadcast_event(&self, event: IpcEvent) {
         let _ = self.event_tx.send(event);
     }
 
-    pub fn set_shutdown_sender(&self, tx: tokio::sync::oneshot::Sender<()>) {
+    pub fn set_shutdown_sender(&self, tx: oneshot::Sender<()>) {
         *self.shutdown_tx.lock() = Some(tx);
     }
 
@@ -53,59 +82,43 @@ impl IpcServer {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!(
             "IPC server starting on {} (ACL: Admins+Owner only)",
-            PIPE_PATH
+            self.pipe_path
         );
 
         const MAX_RETRIES: u32 = 5;
         let mut retry_count = 0u32;
-        let mut first_instance = true;
+        let mut initial_pipe = Some(
+            self.initial_pipe
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("IPC server already started"))?,
+        );
 
         loop {
-            let create_result = create_pipe_with_sa(first_instance);
-            let server = match create_result {
-                Ok(s) => {
-                    retry_count = 0;
-                    first_instance = false;
-                    s
-                }
-                Err(e) if first_instance => match create_pipe_with_sa(false) {
+            let server = if let Some(server) = initial_pipe.take() {
+                server
+            } else {
+                match create_pipe_with_sa(&self.pipe_path, false) {
                     Ok(s) => {
                         retry_count = 0;
-                        first_instance = false;
                         s
                     }
-                    Err(e2) => {
+                    Err(e) => {
                         retry_count += 1;
                         warn!(
-                            "Pipe create failed ({}/{}): {} / {}",
-                            retry_count, MAX_RETRIES, e, e2
+                            "Pipe create failed ({}/{}): {}",
+                            retry_count, MAX_RETRIES, e
                         );
                         if retry_count >= MAX_RETRIES {
                             error!(
                                 "IPC pipe creation failed {} times — giving up.",
                                 MAX_RETRIES
                             );
-                            return Err(anyhow::anyhow!("Cannot create IPC pipe: {} / {}", e, e2));
+                            return Err(anyhow::anyhow!("Cannot create IPC pipe: {}", e));
                         }
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
-                },
-                Err(e) => {
-                    retry_count += 1;
-                    warn!(
-                        "Pipe create failed ({}/{}): {}",
-                        retry_count, MAX_RETRIES, e
-                    );
-                    if retry_count >= MAX_RETRIES {
-                        error!(
-                            "IPC pipe creation failed {} times — giving up.",
-                            MAX_RETRIES
-                        );
-                        return Err(anyhow::anyhow!("Cannot create IPC pipe: {}", e));
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue;
                 }
             };
 
@@ -116,9 +129,13 @@ impl IpcServer {
             }
 
             info!("IPC client connected");
+            let permit = Arc::clone(&self.handler_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("IPC handler semaphore closed"))?;
             let ipc = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = ipc.handle_client(server).await {
+                if let Err(e) = ipc.handle_client(server, permit).await {
                     debug!("IPC client handler error: {}", e);
                 }
             });
@@ -128,10 +145,11 @@ impl IpcServer {
     async fn handle_client(
         &self,
         mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+        _permit: OwnedSemaphorePermit,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        let payload = match read_frame(&mut pipe).await? {
+        let payload = match read_frame_with_timeout(&mut pipe, FRAME_IO_TIMEOUT).await? {
             Some(payload) => payload,
             None => {
                 info!("IPC client disconnected");
@@ -148,58 +166,64 @@ impl IpcServer {
                     "error": format!("Invalid message: {}", e)
                 });
                 let bytes = serde_json::to_vec(&err)?;
-                let _ = write_frame(&mut pipe, &bytes).await;
+                let _ = write_frame_with_timeout(&mut pipe, &bytes, FRAME_IO_TIMEOUT).await;
                 let _ = pipe.shutdown().await;
                 return Ok(());
             }
         };
 
         debug!("IPC received: {:?}", message);
+        let is_playlist_list = matches!(&message, IpcMessage::PlaylistList);
 
-        // SubscribeEvents: ack, then stream events until client disconnects.
+        // SubscribeEvents: reserve and subscribe before ACK, then stream until disconnect.
         if let IpcMessage::SubscribeEvents { ref types } = message {
             info!("IPC: SubscribeEvents {:?}", types);
-            let type_filter = types.clone();
-            let ack =
-                serde_json::to_vec(&serde_json::json!({"success": true, "subscription_id": 1}))?;
-            write_frame(&mut pipe, &ack).await?;
-
-            let mut rx = self.event_tx.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        if !type_filter.is_empty()
-                            && !type_filter.iter().any(|wanted| wanted == event_type(&ev))
-                        {
-                            continue;
-                        }
-                        let bytes = match serde_json::to_vec(&ev) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("IPC: serialize event: {}", e);
-                                continue;
-                            }
-                        };
-                        if write_frame(&mut pipe, &bytes).await.is_err() {
-                            debug!("IPC event subscriber disconnected");
-                            return Ok(());
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("IPC event subscriber lagged by {} events", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        debug!("IPC event broadcast channel closed");
-                        return Ok(());
-                    }
+            let subscriber_permit = match validate_event_filter(types)
+                .and_then(|()| acquire_subscriber_slot(&self.subscriber_slots))
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let response = serde_json::to_vec(&serde_json::json!({
+                        "success": false,
+                        "error": error.to_string(),
+                    }))?;
+                    write_frame_with_timeout(&mut pipe, &response, FRAME_IO_TIMEOUT).await?;
+                    return Ok(());
                 }
-            }
+            };
+            let type_filter = types.clone();
+            let rx = acknowledge_subscription(
+                &mut pipe,
+                _permit,
+                self.event_tx.clone(),
+                FRAME_IO_TIMEOUT,
+            )
+            .await?;
+            return stream_subscription(pipe, rx, type_filter, subscriber_permit).await;
         }
 
-        let response = self.process_message(message);
-        let bytes = serde_json::to_vec(&response)?;
-        write_frame(&mut pipe, &bytes).await?;
+        let (response, shutdown_tx) = match message {
+            IpcMessage::Quit => {
+                info!("IPC: Quit requested");
+                match self.shutdown_tx.lock().take() {
+                    Some(tx) => (serde_json::json!({ "success": true }), Some(tx)),
+                    None => (
+                        serde_json::json!({
+                            "success": false,
+                            "error": "shutdown already requested or unavailable"
+                        }),
+                        None,
+                    ),
+                }
+            }
+            message => (self.process_message(message), None),
+        };
+        let bytes = bounded_response_bytes(&response, is_playlist_list)?;
+        write_frame_with_timeout(&mut pipe, &bytes, FRAME_IO_TIMEOUT).await?;
         let _ = pipe.shutdown().await;
+        if let Some(tx) = shutdown_tx {
+            let _ = tx.send(());
+        }
         Ok(())
     }
 
@@ -230,8 +254,8 @@ impl IpcServer {
 
             IpcMessage::Stats => {
                 let result = match self.runtime.lock().clone() {
-                    Some(h) => h.status(),
-                    None => serde_json::json!({ "running": true }),
+                    Some(h) => h.stats(),
+                    None => serde_json::json!({}),
                 };
                 serde_json::json!({ "success": true, "result": result })
             }
@@ -246,7 +270,7 @@ impl IpcServer {
                                 "success": true,
                                 "result": {
                                     "index_reloaded": true,
-                                    "restart_required": ["schedule", "transitions", "monitors", "cache"]
+                                    "restart_required": ["schedule", "transitions", "monitors", "cache", "metrics", "log-level"]
                                 }
                             })
                         }
@@ -258,20 +282,15 @@ impl IpcServer {
             }
 
             IpcMessage::Quit => {
-                info!("IPC: Quit requested");
-                if let Some(tx) = self.shutdown_tx.lock().take() {
-                    let _ = tx.send(());
-                } else {
-                    warn!("IPC Quit: no shutdown channel — calling process::exit");
-                    std::process::exit(0);
-                }
-                serde_json::json!({ "success": true })
+                serde_json::json!({ "success": false, "error": "quit requires an IPC connection" })
             }
 
             IpcMessage::Next => {
                 let h = runtime!();
-                h.skip_next();
-                serde_json::json!({ "success": true })
+                match h.skip_next() {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
             }
 
             IpcMessage::Prev => {
@@ -316,14 +335,12 @@ impl IpcServer {
                 }
             }
 
-            IpcMessage::Rate { stars } => {
-                let h = runtime!();
-                h.rate(stars)
-            }
-
             IpcMessage::Ban { hash } => {
                 let h = runtime!();
-                h.ban(&hash)
+                match h.ban(&hash) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
             }
 
             IpcMessage::SubscribeEvents { .. } => {
@@ -351,6 +368,18 @@ impl IpcServer {
                 let h = runtime!();
                 let result = h.playlist_list();
                 serde_json::json!({ "success": true, "result": result })
+            }
+
+            IpcMessage::PlaylistShow {
+                name,
+                offset,
+                limit,
+            } => {
+                let h = runtime!();
+                match h.playlist_show(&name, offset, limit) {
+                    Ok(result) => serde_json::json!({ "success": true, "result": result }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
             }
 
             IpcMessage::PlaylistCreate { name } => {
@@ -402,6 +431,52 @@ impl IpcServer {
                 }
             }
 
+            IpcMessage::PlaylistShuffle { name, shuffle } => {
+                let h = runtime!();
+                match h.playlist_shuffle(&name, shuffle) {
+                    Ok(()) => serde_json::json!({ "success": true }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistAutotagStatus { name, path } => {
+                let h = runtime!();
+                match h.playlist_autotag_status(&name, &path) {
+                    Ok(has_metadata) => serde_json::json!({
+                        "success": true,
+                        "result": { "has_metadata": has_metadata },
+                    }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
+            IpcMessage::PlaylistAutotagUpsert {
+                name,
+                path,
+                groups,
+                rating,
+                frequency,
+                create_playlist,
+                overwrite_existing,
+            } => {
+                let h = runtime!();
+                match h.playlist_autotag_upsert(
+                    &name,
+                    &path,
+                    groups,
+                    rating,
+                    frequency,
+                    create_playlist,
+                    overwrite_existing,
+                ) {
+                    Ok(applied) => serde_json::json!({
+                        "success": true,
+                        "result": { "applied": applied },
+                    }),
+                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                }
+            }
+
             IpcMessage::PlaylistRemove { name, path } => {
                 let h = runtime!();
                 match h.playlist_remove(&name, &path) {
@@ -437,19 +512,129 @@ impl IpcServer {
     }
 }
 
-fn event_type(event: &IpcEvent) -> &'static str {
-    match event {
-        IpcEvent::Swapped { .. } => "swapped",
-        IpcEvent::Paused => "paused",
-        IpcEvent::Resumed => "resumed",
-        IpcEvent::ConfigReloaded => "config_reloaded",
-        IpcEvent::WallpaperChanged { .. } => "wallpaper_changed",
+fn bounded_response_bytes(response: &serde_json::Value, is_playlist_list: bool) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(response)?;
+    if bytes.len() <= MAX_FRAME_SIZE {
+        return Ok(bytes);
+    }
+    let error = if is_playlist_list {
+        format!(
+            "playlist_list response exceeds the {MAX_FRAME_SIZE}-byte IPC limit; use targeted playlist commands"
+        )
+    } else {
+        format!("IPC response exceeds the {MAX_FRAME_SIZE}-byte limit")
+    };
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "success": false,
+        "error": error,
+    }))?)
+}
+
+async fn acknowledge_subscription<W>(
+    writer: &mut W,
+    permit: OwnedSemaphorePermit,
+    event_tx: broadcast::Sender<IpcEvent>,
+    timeout: std::time::Duration,
+) -> Result<broadcast::Receiver<IpcEvent>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let rx = event_tx.subscribe();
+    let ack = serde_json::to_vec(&serde_json::json!({"success": true, "subscription_id": 1}))?;
+    write_frame_with_timeout(writer, &ack, timeout).await?;
+    drop(permit);
+    Ok(rx)
+}
+
+async fn stream_subscription<P>(
+    mut pipe: P,
+    mut rx: broadcast::Receiver<IpcEvent>,
+    type_filter: Vec<String>,
+    _subscriber_permit: OwnedSemaphorePermit,
+) -> Result<()>
+where
+    P: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    loop {
+        let mut probe = [0u8; 1];
+        let event = tokio::select! {
+            biased;
+            read = pipe.read(&mut probe) => {
+                match read {
+                    Ok(0) => debug!("IPC event subscriber disconnected"),
+                    Ok(_) => debug!("IPC event subscriber sent unexpected data"),
+                    Err(error) => debug!("IPC event subscriber read ended: {}", error),
+                }
+                return Ok(());
+            }
+            event = rx.recv() => event,
+        };
+
+        match event {
+            Ok(event) => {
+                if !type_filter.is_empty()
+                    && !type_filter
+                        .iter()
+                        .any(|wanted| wanted == event_type(&event))
+                {
+                    continue;
+                }
+                let bytes = match serde_json::to_vec(&event) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!("IPC: serialize event: {}", error);
+                        continue;
+                    }
+                };
+                if let Err(error) =
+                    write_frame_with_timeout(&mut pipe, &bytes, FRAME_IO_TIMEOUT).await
+                {
+                    debug!("IPC event subscriber disconnected: {}", error);
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(count)) => {
+                warn!("IPC event subscriber lagged by {} events", count);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                debug!("IPC event broadcast channel closed");
+                return Ok(());
+            }
+        }
     }
 }
 
-impl Default for IpcServer {
-    fn default() -> Self {
-        Self::new()
+fn validate_event_filter(types: &[String]) -> Result<()> {
+    let invalid: Vec<_> = types
+        .iter()
+        .map(String::as_str)
+        .filter(|event_type| !VALID_EVENT_TYPES.contains(event_type))
+        .collect();
+    if !invalid.is_empty() {
+        anyhow::bail!(
+            "invalid event type(s): {}; valid event types: {}",
+            invalid.join(", "),
+            VALID_EVENT_TYPES.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn acquire_subscriber_slot(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit> {
+    Arc::clone(slots).try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("event subscriber limit reached (maximum {MAX_EVENT_SUBSCRIBERS})")
+    })
+}
+
+fn event_type(event: &IpcEvent) -> &'static str {
+    match event {
+        IpcEvent::Swapped { .. } => EVENT_SWAPPED,
+        IpcEvent::Paused => EVENT_PAUSED,
+        IpcEvent::Resumed => EVENT_RESUMED,
+        IpcEvent::ConfigReloaded => EVENT_CONFIG_RELOADED,
+        IpcEvent::WallpaperChanged { .. } => EVENT_WALLPAPER_CHANGED,
     }
 }
 
@@ -462,6 +647,7 @@ impl Default for IpcServer {
 // ---------------------------------------------------------------------------
 
 fn create_pipe_with_sa(
+    path: &str,
     first_instance: bool,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -477,7 +663,7 @@ fn create_pipe_with_sa(
     Ok(unsafe {
         ServerOptions::new()
             .first_pipe_instance(first_instance)
-            .create_with_security_attributes_raw(PIPE_PATH, sa_ptr)?
+            .create_with_security_attributes_raw(path, sa_ptr)?
     })
 }
 
@@ -535,23 +721,310 @@ fn build_pipe_security_attributes() -> Result<OwnedPipeSecurityAttributes, anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::{read_frame, write_frame};
+
+    fn server_with_swap_sender(
+        tx: tokio::sync::mpsc::Sender<crate::scheduler::SwapRequest>,
+    ) -> IpcServer {
+        let runtime = RuntimeHandle::new(
+            tx,
+            Arc::new(parking_lot::Mutex::new(
+                crate::runtime::RuntimeStateSnapshot::default(),
+            )),
+            (
+                Arc::new(parking_lot::RwLock::new(crate::index::PhotoIndex::default())),
+                Arc::new(parking_lot::RwLock::new(Vec::new())),
+                crate::runtime::BanGate::default(),
+            ),
+            crate::metrics::Metrics::new(),
+            "config.kdl".into(),
+            Arc::new(parking_lot::Mutex::new(
+                crate::playlist::PlaylistStore::default(),
+            )),
+            "playlists.kdl".into(),
+        );
+        let (event_tx, _) = broadcast::channel(1);
+        let server = IpcServer {
+            pipe_path: String::new(),
+            initial_pipe: parking_lot::Mutex::new(None),
+            event_tx,
+            shutdown_tx: parking_lot::Mutex::new(None),
+            runtime: parking_lot::Mutex::new(None),
+            handler_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
+            subscriber_slots: Arc::new(Semaphore::new(MAX_EVENT_SUBSCRIBERS)),
+        };
+        server.set_runtime(runtime);
+        server
+    }
 
     #[test]
     fn event_type_matches_wire_names() {
-        assert_eq!(event_type(&IpcEvent::Paused), "paused");
-        assert_eq!(
-            event_type(&IpcEvent::WallpaperChanged {
+        let events = [
+            IpcEvent::Swapped {
+                monitor: "m".into(),
+                path: "p".into(),
+                ts_ms: 1,
+            },
+            IpcEvent::Paused,
+            IpcEvent::Resumed,
+            IpcEvent::ConfigReloaded,
+            IpcEvent::WallpaperChanged {
                 monitor_id: "m".into(),
                 path: "p".into(),
-            }),
-            "wallpaper_changed"
+            },
+        ];
+        let wire_types = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wire_types,
+            VALID_EVENT_TYPES
+                .iter()
+                .map(|event_type| (*event_type).to_string())
+                .collect::<Vec<_>>()
         );
+        assert_eq!(events.map(|event| event_type(&event)), VALID_EVENT_TYPES);
+    }
+
+    #[test]
+    fn event_filters_accept_only_wire_names() {
+        let valid = VALID_EVENT_TYPES
+            .iter()
+            .map(|event_type| (*event_type).to_string())
+            .collect::<Vec<_>>();
+        assert!(validate_event_filter(&[]).is_ok());
+        assert!(validate_event_filter(&valid).is_ok());
+
+        let error = validate_event_filter(&["paused".into(), "not-an-event".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid event type(s): not-an-event"));
+        assert!(error.contains("valid event types: swapped, paused, resumed"));
+    }
+
+    #[test]
+    fn event_subscriber_count_is_bounded() {
+        let slots = Arc::new(Semaphore::new(MAX_EVENT_SUBSCRIBERS));
+        let all_slots = Arc::clone(&slots)
+            .try_acquire_many_owned(MAX_EVENT_SUBSCRIBERS as u32)
+            .unwrap();
+        let error = acquire_subscriber_slot(&slots).unwrap_err().to_string();
+        assert!(error.contains(&format!("maximum {MAX_EVENT_SUBSCRIBERS}")));
+        drop(all_slots);
+        assert!(acquire_subscriber_slot(&slots).is_ok());
+    }
+
+    #[test]
+    fn oversized_playlist_list_becomes_a_bounded_error_response() {
+        let response = serde_json::json!({
+            "success": true,
+            "result": "x".repeat(MAX_FRAME_SIZE),
+        });
+        let bytes = bounded_response_bytes(&response, true).unwrap();
+        assert!(bytes.len() <= MAX_FRAME_SIZE);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["success"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("playlist_list response exceeds"));
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("targeted playlist commands"));
     }
 
     #[test]
     fn pipe_security_attributes_build_and_drop() {
         let attrs = build_pipe_security_attributes().expect("build pipe ACL");
         assert!(!attrs.raw.lpSecurityDescriptor.is_null());
+    }
+
+    #[tokio::test]
+    async fn first_instance_cannot_be_recreated() {
+        let path = format!(r"\\.\pipe\aurora-test-first-{}", std::process::id());
+        let _owner = create_pipe_with_sa(&path, true).expect("reserve first pipe instance");
+        assert!(create_pipe_with_sa(&path, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn quit_ack_survives_supervisor_shutdown() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!(r"\\.\pipe\aurora-test-quit-{suffix}");
+        let pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path)
+            .expect("create quit test pipe");
+        let (event_tx, _) = broadcast::channel(1);
+        let server = Arc::new(IpcServer {
+            pipe_path: path.clone(),
+            initial_pipe: parking_lot::Mutex::new(None),
+            event_tx,
+            shutdown_tx: parking_lot::Mutex::new(None),
+            runtime: parking_lot::Mutex::new(None),
+            handler_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
+            subscriber_slots: Arc::new(Semaphore::new(MAX_EVENT_SUBSCRIBERS)),
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        server.set_shutdown_sender(shutdown_tx);
+
+        let handler = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                pipe.connect().await.expect("connect quit test pipe");
+                let permit = Arc::clone(&server.handler_slots)
+                    .acquire_owned()
+                    .await
+                    .unwrap();
+                server.handle_client(pipe, permit).await
+            }
+        });
+        let handler_abort = handler.abort_handle();
+        let supervisor = tokio::spawn(async move {
+            shutdown_rx.await.expect("quit signal");
+            handler_abort.abort();
+        });
+
+        tokio::task::yield_now().await;
+        let mut client = ClientOptions::new()
+            .open(&path)
+            .expect("open quit test pipe");
+        write_frame(&mut client, &serde_json::to_vec(&IpcMessage::Quit).unwrap())
+            .await
+            .expect("write quit request");
+
+        let payload =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut client))
+                .await
+                .expect("quit response timeout")
+                .expect("read quit response")
+                .expect("quit response frame");
+        let response: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(response["success"], serde_json::json!(true));
+
+        supervisor.await.expect("supervisor task");
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn subscription_receiver_precedes_ack_and_releases_handler_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let (mut server_pipe, mut client_pipe) = tokio::io::duplex(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let ack_events = event_tx.clone();
+
+        let ack_task = tokio::spawn(async move {
+            acknowledge_subscription(
+                &mut server_pipe,
+                permit,
+                ack_events,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(event_tx.receiver_count(), 1);
+        event_tx.send(IpcEvent::Paused).unwrap();
+
+        let payload = read_frame_with_timeout(&mut client_pipe, std::time::Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(ack["success"], serde_json::json!(true));
+        let mut rx = ack_task.await.unwrap().unwrap();
+        assert!(matches!(rx.try_recv(), Ok(IpcEvent::Paused)));
+        assert_eq!(slots.available_permits(), 1);
+
+        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let (mut stalled_pipe, _client_pipe) = tokio::io::duplex(1);
+        let (stalled_events, _) = broadcast::channel(1);
+        let error = acknowledge_subscription(
+            &mut stalled_pipe,
+            permit,
+            stalled_events.clone(),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out writing IPC frame"));
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(stalled_events.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_stream_filters_and_releases_on_idle_disconnect() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let (event_tx, rx) = broadcast::channel(2);
+        let (server_pipe, mut client_pipe) = tokio::io::duplex(64);
+
+        let stream = tokio::spawn(stream_subscription(
+            server_pipe,
+            rx,
+            vec![EVENT_PAUSED.into()],
+            permit,
+        ));
+        event_tx.send(IpcEvent::Resumed).unwrap();
+        event_tx.send(IpcEvent::Paused).unwrap();
+
+        let payload =
+            read_frame_with_timeout(&mut client_pipe, std::time::Duration::from_millis(100))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<IpcEvent>(&payload).unwrap(),
+            IpcEvent::Paused
+        ));
+
+        drop(client_pipe);
+        tokio::time::timeout(std::time::Duration::from_millis(100), stream)
+            .await
+            .expect("idle disconnect must stop subscription")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event_tx.receiver_count(), 0);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn next_reports_closed_runtime_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let server = server_with_swap_sender(tx);
+
+        let response = server.process_message(IpcMessage::Next);
+        assert_eq!(response["success"], serde_json::json!(false));
+        assert_eq!(response["error"], "runtime swap channel is closed");
+    }
+
+    #[test]
+    fn next_reports_busy_runtime_queue() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(crate::scheduler::SwapRequest {
+            reason: crate::scheduler::SwapReason::Interval,
+            specific: None,
+        })
+        .unwrap();
+        let server = server_with_swap_sender(tx);
+
+        let response = server.process_message(IpcMessage::Next);
+        assert_eq!(response["success"], serde_json::json!(false));
+        assert_eq!(response["error"], "runtime swap queue is busy");
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::core::PCWSTR;
@@ -16,8 +17,6 @@ use windows::Win32::UI::Shell::{
 pub struct MonitorInfo {
     /// Device path string, e.g. `\\.\DISPLAY1\Monitor0`.
     pub id: String,
-    /// 0-based display index as returned by the shell API.
-    pub index: u32,
     /// Physical monitor origin in virtual-screen coordinates.
     pub x: i32,
     /// Physical monitor origin in virtual-screen coordinates.
@@ -71,10 +70,6 @@ pub struct WallpaperApplier {
     desktop: IDesktopWallpaper,
 }
 
-// SAFETY: see comment in decode/mod.rs — COM MTA proxy makes this safe for
-// our single-owner pattern.
-unsafe impl Send for WallpaperApplier {}
-
 impl WallpaperApplier {
     pub fn new() -> Result<Self> {
         let desktop: IDesktopWallpaper = unsafe {
@@ -122,7 +117,6 @@ impl WallpaperApplier {
             }
             monitors.push(MonitorInfo {
                 id,
-                index: i,
                 x: rect.left,
                 y: rect.top,
                 width: width as u32,
@@ -134,13 +128,13 @@ impl WallpaperApplier {
 
     /// Set the wallpaper on a specific monitor.
     pub fn set_for_monitor(&self, monitor_id: &str, path: &Path) -> Result<()> {
-        let path_str = path.to_string_lossy();
         let monitor_wide: Vec<u16> = monitor_id
             .encode_utf16()
             .chain(std::iter::once(0u16))
             .collect();
-        let path_wide: Vec<u16> = path_str
-            .encode_utf16()
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
             .chain(std::iter::once(0u16))
             .collect();
 
@@ -153,70 +147,22 @@ impl WallpaperApplier {
                 .with_context(|| {
                     format!(
                         "IDesktopWallpaper::SetWallpaper(monitor={}, path={})",
-                        monitor_id, path_str
+                        monitor_id,
+                        path.display()
                     )
                 })
         }
     }
 
-    /// Set the same wallpaper on all monitors.
-    pub fn set_for_all(&self, path: &Path) -> Result<()> {
-        let path_str = path.to_string_lossy();
-        let path_wide: Vec<u16> = path_str
-            .encode_utf16()
-            .chain(std::iter::once(0u16))
-            .collect();
-
-        unsafe {
-            // PCWSTR::null() for the monitor ID applies the wallpaper to all monitors.
-            self.desktop
-                .SetWallpaper(PCWSTR::null(), PCWSTR::from_raw(path_wide.as_ptr()))
-                .with_context(|| format!("IDesktopWallpaper::SetWallpaper(all, path={})", path_str))
-        }
-    }
-
-    /// Get the current wallpaper path for a specific monitor.
-    pub fn get_current(&self, monitor_id: &str) -> Result<Option<std::path::PathBuf>> {
-        use windows::Win32::System::Com::CoTaskMemFree;
-
-        let monitor_wide: Vec<u16> = monitor_id
-            .encode_utf16()
-            .chain(std::iter::once(0u16))
-            .collect();
-
-        let pwstr = unsafe {
-            match self
-                .desktop
-                .GetWallpaper(PCWSTR::from_raw(monitor_wide.as_ptr()))
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    // E_INVALIDARG (0x80070057) when the monitor has no wallpaper set
-                    if e.code().0 == 0x80070057u32 as i32 {
-                        return Ok(None);
-                    }
-                    return Err(e).context("IDesktopWallpaper::GetWallpaper");
-                }
-            }
-        };
-
-        let s = unsafe {
-            let s = pwstr.to_string().unwrap_or_default();
-            CoTaskMemFree(Some(pwstr.0.cast()));
-            s
-        };
-        if s.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(std::path::PathBuf::from(s)))
-        }
-    }
-
     /// Set the fit/position mode for all monitors.
     pub fn set_fit(&self, fit: WallpaperFit) -> Result<()> {
+        let position = fit.to_dwpos();
         unsafe {
+            if self.desktop.GetPosition().ok() == Some(position) {
+                return Ok(());
+            }
             self.desktop
-                .SetPosition(fit.to_dwpos())
+                .SetPosition(position)
                 .context("IDesktopWallpaper::SetPosition")
         }
     }

@@ -1,6 +1,6 @@
 // aurora default configuration
 // Written to %APPDATA%\aurora\config.kdl on first run.
-// Edit freely — aurora watches this file for changes.
+// Restart aurora after changing runtime settings.
 
 log-level "info"
 
@@ -10,7 +10,7 @@ log-level "info"
 source {
     path "C:/Users/Public/Pictures"
     recursive true
-    extensions "jpg,jpeg,png,webp,avif,tiff,bmp"
+    extensions "jpg,jpeg,png,gif,webp,bmp,tif,tiff,ico"
     min-width 1280
     min-height 720
 }
@@ -19,7 +19,7 @@ source {
 // Schedule
 // ---------------------------------------------------------------------------
 schedule {
-    mode "interval"          // "interval" | "at" | "random"
+    mode "interval"          // "interval" | "at"
     interval-secs 1800       // 30 minutes
     // at "09:00"            // uncomment to use mode=at with fixed times
     // at "17:00"
@@ -33,7 +33,7 @@ schedule {
 // Transitions
 // ---------------------------------------------------------------------------
 transitions {
-    enabled true
+    enabled false
     duration-ms 800
     style "crossfade"        // crossfade | slide-left | slide-right | wipe-left
                              // wipe-right | dissolve | zoom-in | zoom-out | none
@@ -45,14 +45,6 @@ transitions {
 // ---------------------------------------------------------------------------
 // monitor "\\.\DISPLAY1\Monitor0" {
 //     fit "fill"            // fill | contain | tile | center | stretch
-//     tint "none"
-// }
-
-// ---------------------------------------------------------------------------
-// Triggers
-// ---------------------------------------------------------------------------
-// triggers {
-//     on-startup "C:/path/to/script.bat"
 // }
 
 // ---------------------------------------------------------------------------
@@ -68,5 +60,4 @@ metrics {
 // ---------------------------------------------------------------------------
 cache {
     decoded-mb 256
-    prefetch-count 3
 }

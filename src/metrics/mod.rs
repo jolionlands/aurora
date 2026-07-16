@@ -2,11 +2,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+const MAX_CONNECTIONS: usize = 32;
+const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const DECODE_MS_BUCKET_BOUNDS: [u64; 7] = [10, 50, 100, 250, 500, 1000, 2000];
+
+fn decode_ms_bucket_index(ms: u64) -> usize {
+    DECODE_MS_BUCKET_BOUNDS.partition_point(|bound| *bound < ms)
+}
 
 // ---------------------------------------------------------------------------
 // Metrics store
@@ -17,8 +29,8 @@ pub struct Metrics {
     /// Total wallpaper swaps since daemon start.
     pub swaps_total: AtomicU64,
 
-    /// Decode latency histogram buckets (ms): [<10, <50, <100, <200, <500, <1000, >=1000]
-    pub decode_ms_buckets: [AtomicU64; 7],
+    /// Non-cumulative decode latency buckets, one per finite bound plus +Inf.
+    pub decode_ms_buckets: [AtomicU64; DECODE_MS_BUCKET_BOUNDS.len() + 1],
     pub decode_ms_sum: AtomicU64,
     pub decode_ms_count: AtomicU64,
 
@@ -37,15 +49,7 @@ impl Metrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             swaps_total: AtomicU64::new(0),
-            decode_ms_buckets: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            decode_ms_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             decode_ms_sum: AtomicU64::new(0),
             decode_ms_count: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -60,15 +64,7 @@ impl Metrics {
     }
 
     pub fn record_decode_ms(&self, ms: u64) {
-        let bucket = match ms {
-            0..=9 => 0,
-            10..=49 => 1,
-            50..=99 => 2,
-            100..=199 => 3,
-            200..=499 => 4,
-            500..=999 => 5,
-            _ => 6,
-        };
+        let bucket = decode_ms_bucket_index(ms);
         self.decode_ms_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         self.decode_ms_sum.fetch_add(ms, Ordering::Relaxed);
         self.decode_ms_count.fetch_add(1, Ordering::Relaxed);
@@ -96,7 +92,7 @@ impl Metrics {
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
         if total == 0 {
-            1.0
+            0.0
         } else {
             hits as f64 / total as f64
         }
@@ -130,21 +126,17 @@ impl Metrics {
         // decode_ms histogram
         let count = self.decode_ms_count.load(Ordering::Relaxed);
         let sum = self.decode_ms_sum.load(Ordering::Relaxed);
-        out.push_str("# HELP aurora_decode_ms_bucket Decode latency histogram in milliseconds\n");
-        out.push_str("# TYPE aurora_decode_ms_bucket histogram\n");
-        let bounds = [10u64, 50, 100, 200, 500, 1000];
+        out.push_str("# HELP aurora_decode_ms Decode latency histogram in milliseconds\n");
+        out.push_str("# TYPE aurora_decode_ms histogram\n");
         let mut cumulative = 0u64;
-        for (i, le) in bounds.iter().enumerate() {
+        for (i, le) in DECODE_MS_BUCKET_BOUNDS.iter().enumerate() {
             cumulative += self.decode_ms_buckets[i].load(Ordering::Relaxed);
             out.push_str(&format!(
-                "aurora_decode_ms_bucket{{le=\"{le}\"}} {cumulative}\n"
+                "aurora_decode_ms_bucket{{le=\"{le}\"}} {}\n",
+                cumulative.min(count)
             ));
         }
-        // +Inf bucket
-        cumulative += self.decode_ms_buckets[6].load(Ordering::Relaxed);
-        out.push_str(&format!(
-            "aurora_decode_ms_bucket{{le=\"+Inf\"}} {cumulative}\n"
-        ));
+        out.push_str(&format!("aurora_decode_ms_bucket{{le=\"+Inf\"}} {count}\n"));
         out.push_str(&format!("aurora_decode_ms_sum {sum}\n"));
         out.push_str(&format!("aurora_decode_ms_count {count}\n"));
 
@@ -156,15 +148,29 @@ impl Metrics {
             );
             out.push_str("# TYPE aurora_current_photo gauge\n");
             for (monitor, path) in photos.iter() {
-                let path_str = path.to_string_lossy().replace('\\', "/");
+                let monitor = escape_label_value(monitor);
+                let path = escape_label_value(&path.to_string_lossy());
                 out.push_str(&format!(
-                    "aurora_current_photo{{monitor=\"{monitor}\",path=\"{path_str}\"}} 1\n"
+                    "aurora_current_photo{{monitor=\"{monitor}\",path=\"{path}\"}} 1\n"
                 ));
             }
         }
 
         out
     }
+}
+
+fn escape_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 impl Default for Metrics {
@@ -183,8 +189,10 @@ pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("metrics server listening on http://{addr}/metrics");
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
+        let permit = Arc::clone(&slots).acquire_owned().await?;
         let (mut stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -195,6 +203,7 @@ pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>) -> Result<()> {
 
         let m = Arc::clone(&metrics);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_request(&mut stream, &m).await {
                 tracing::debug!("metrics request from {peer} error: {e}");
             }
@@ -204,25 +213,12 @@ pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>) -> Result<()> {
 
 async fn handle_request(stream: &mut tokio::net::TcpStream, metrics: &Arc<Metrics>) -> Result<()> {
     let (reader, mut writer) = stream.split();
-    let mut buf_reader = BufReader::new(reader);
-
-    // Read request line
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
-
-    // Drain remaining headers
-    loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
-        if line == "\r\n" || line.is_empty() {
-            break;
-        }
-    }
-
-    let request_line = request_line.trim();
+    let request_line = timeout(REQUEST_READ_TIMEOUT, read_request_head(reader))
+        .await
+        .context("metrics request timed out")??;
 
     // Route
-    if request_line.starts_with("GET /metrics") {
+    if get_request_path(&request_line) == Some("/metrics") {
         let body = metrics.render_prometheus();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -230,7 +226,7 @@ async fn handle_request(stream: &mut tokio::net::TcpStream, metrics: &Arc<Metric
             body
         );
         writer.write_all(response.as_bytes()).await?;
-    } else if request_line.starts_with("GET /healthz") {
+    } else if get_request_path(&request_line) == Some("/healthz") {
         let body = "ok\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -249,4 +245,138 @@ async fn handle_request(stream: &mut tokio::net::TcpStream, metrics: &Arc<Metric
     }
 
     Ok(())
+}
+
+fn get_request_path(request_line: &str) -> Option<&str> {
+    let mut parts = request_line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("GET"), Some(path), Some("HTTP/1.0" | "HTTP/1.1"), None) => Some(path),
+        _ => None,
+    }
+}
+
+async fn read_request_head<R: AsyncRead + Unpin>(reader: R) -> Result<String> {
+    let mut reader = BufReader::new(reader).take((MAX_REQUEST_HEAD_BYTES + 1) as u64);
+    let mut request_line = Vec::new();
+    let mut total = reader.read_until(b'\n', &mut request_line).await?;
+    if total == 0 {
+        bail!("empty HTTP request");
+    }
+    if total > MAX_REQUEST_HEAD_BYTES {
+        bail!("HTTP request headers exceed {MAX_REQUEST_HEAD_BYTES} bytes");
+    }
+
+    loop {
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line).await?;
+        if read == 0 {
+            bail!("incomplete HTTP request headers");
+        }
+        total += read;
+        if total > MAX_REQUEST_HEAD_BYTES {
+            bail!("HTTP request headers exceed {MAX_REQUEST_HEAD_BYTES} bytes");
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+    }
+
+    Ok(std::str::from_utf8(&request_line)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn cache_hit_ratio_starts_at_zero_and_tracks_observations() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.cache_hit_ratio(), 0.0);
+
+        metrics.record_cache_miss();
+        metrics.record_cache_hit();
+        assert_eq!(metrics.cache_hit_ratio(), 0.5);
+    }
+
+    #[test]
+    fn decode_histogram_boundaries_and_exposition_follow_prometheus_semantics() {
+        let metrics = Metrics::new();
+        for (index, bound) in DECODE_MS_BUCKET_BOUNDS.iter().copied().enumerate() {
+            assert_eq!(decode_ms_bucket_index(bound), index);
+            metrics.record_decode_ms(bound);
+        }
+        metrics.record_decode_ms(2001);
+
+        let buckets = std::array::from_fn::<_, 8, _>(|index| {
+            metrics.decode_ms_buckets[index].load(Ordering::Relaxed)
+        });
+        assert_eq!(buckets, [1; 8]);
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("# HELP aurora_decode_ms Decode latency histogram in milliseconds\n")
+        );
+        assert!(rendered.contains("# TYPE aurora_decode_ms histogram\n"));
+        assert!(!rendered.contains("# TYPE aurora_decode_ms_bucket histogram"));
+        for (index, bound) in DECODE_MS_BUCKET_BOUNDS.iter().enumerate() {
+            assert!(rendered.lines().any(|line| {
+                line == format!("aurora_decode_ms_bucket{{le=\"{bound}\"}} {}", index + 1)
+            }));
+        }
+        assert!(rendered
+            .lines()
+            .any(|line| line == "aurora_decode_ms_bucket{le=\"+Inf\"} 8"));
+        assert!(rendered
+            .lines()
+            .any(|line| line == "aurora_decode_ms_count 8"));
+        assert!(rendered
+            .lines()
+            .any(|line| line == "aurora_decode_ms_sum 5911"));
+    }
+
+    #[test]
+    fn prometheus_label_values_are_escaped() {
+        let metrics = Metrics::new();
+        metrics.set_current_photo(
+            "display\\one\"two\nthree",
+            PathBuf::from("C:\\pics\\one\"two\nthree.jpg"),
+        );
+
+        assert_eq!(
+            escape_label_value("display\\one\"two\nthree"),
+            r#"display\\one\"two\nthree"#
+        );
+        assert!(metrics.render_prometheus().contains(
+            r#"aurora_current_photo{monitor="display\\one\"two\nthree",path="C:\\pics\\one\"two\nthree.jpg"} 1"#
+        ));
+    }
+
+    #[test]
+    fn metrics_routes_require_an_exact_get_path() {
+        assert_eq!(get_request_path("GET /metrics HTTP/1.1"), Some("/metrics"));
+        assert_eq!(get_request_path("GET /healthz HTTP/1.0"), Some("/healthz"));
+        assert_ne!(
+            get_request_path("GET /metrics-anything HTTP/1.1"),
+            Some("/metrics")
+        );
+        assert_ne!(
+            get_request_path("GET /metrics?query HTTP/1.1"),
+            Some("/metrics")
+        );
+        assert_eq!(get_request_path("POST /metrics HTTP/1.1"), None);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_headers_are_rejected() {
+        let request = format!(
+            "GET /metrics HTTP/1.1\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(MAX_REQUEST_HEAD_BYTES)
+        );
+        let error = read_request_head(Cursor::new(request.into_bytes()))
+            .await
+            .expect_err("oversized headers should fail");
+
+        assert!(error.to_string().contains("exceed"));
+    }
 }

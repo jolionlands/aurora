@@ -1,10 +1,8 @@
-use anyhow::{Context, Result};
-use std::collections::{HashMap, VecDeque};
+use anyhow::{bail, Context, Result};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use crate::config::types::SourceConfig;
-use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::Rng;
 
 // ---------------------------------------------------------------------------
@@ -14,14 +12,9 @@ use rand::Rng;
 #[derive(Debug, Clone)]
 pub struct PhotoEntry {
     pub path: PathBuf,
-    pub size_bytes: u64,
-    pub mtime: SystemTime,
-    pub exif_date: Option<SystemTime>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Star rating 0–5, read from XMP sidecar (<basename>.xmp)
-    pub rating: Option<u8>,
-    /// Blake3 hash of first 8 KB — hex string
+    /// Blake3 hash of the entire file — hex string
     pub hash: String,
     pub banned: bool,
 }
@@ -39,67 +32,60 @@ pub struct PhotoIndex {
 
 impl PhotoIndex {
     /// Scan one or more root directories and build the index.
+    /// WIC-only formats require COM to be initialized on the current thread.
     pub fn scan(roots: &[PathBuf], extensions: &[String], recursive: bool) -> Result<Self> {
         let mut index = PhotoIndex::default();
         let exts: Vec<String> = extensions.iter().map(|e| e.to_lowercase()).collect();
+        let mut visited_dirs = HashSet::new();
+        let mut admitted_files = HashSet::new();
 
         for root in roots {
-            collect_files(root, &exts, recursive, 0, 0, &mut index)?;
+            collect_files(
+                root,
+                &exts,
+                recursive,
+                (0, 0),
+                &mut visited_dirs,
+                &mut admitted_files,
+                &mut index,
+            );
         }
 
         Ok(index)
     }
 
     /// Scan configured sources, preserving each source's extension, recursion,
-    /// and minimum-dimension rules.
+    /// and minimum-dimension rules. WIC-only formats require COM to be
+    /// initialized on the current thread.
     pub fn scan_sources(sources: &[SourceConfig]) -> Result<Self> {
         let mut index = PhotoIndex::default();
+        let mut admitted_files = HashSet::new();
+        let mut accessible_roots = 0usize;
 
         for source in sources {
+            let mut visited_dirs = HashSet::new();
             let exts: Vec<String> = source.extensions.iter().map(|e| e.to_lowercase()).collect();
-            collect_files(
+            if collect_files(
                 &source.path,
                 &exts,
                 source.recursive,
-                source.min_width,
-                source.min_height,
+                (source.min_width, source.min_height),
+                &mut visited_dirs,
+                &mut admitted_files,
                 &mut index,
-            )?;
+            ) {
+                accessible_roots += 1;
+            }
+        }
+
+        if !sources.is_empty() && accessible_roots == 0 {
+            bail!(
+                "none of the {} configured photo source roots could be read",
+                sources.len()
+            );
         }
 
         Ok(index)
-    }
-
-    /// Attach a file-system watcher.  The caller handles events via the channel
-    /// returned by `notify`.  Pass a channel sender compatible with `notify`'s
-    /// `EventHandler` trait (e.g. `std::sync::mpsc::Sender<notify::Result<notify::Event>>`).
-    pub fn watch(&mut self) -> Result<RecommendedWatcher> {
-        // We return a watcher that the caller must keep alive.
-        // The caller is responsible for re-scanning when events arrive.
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let watcher = RecommendedWatcher::new(tx, NotifyConfig::default())
-            .context("failed to create filesystem watcher")?;
-        Ok(watcher)
-    }
-
-    /// Watch a specific list of root paths.
-    pub fn watch_roots(
-        &mut self,
-        roots: &[PathBuf],
-    ) -> Result<(
-        RecommendedWatcher,
-        std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
-    )> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())
-            .context("failed to create filesystem watcher")?;
-        for root in roots {
-            let mode = RecursiveMode::Recursive;
-            watcher
-                .watch(root, mode)
-                .with_context(|| format!("failed to watch {:?}", root))?;
-        }
-        Ok((watcher, rx))
     }
 
     // -----------------------------------------------------------------------
@@ -149,92 +135,6 @@ impl PhotoIndex {
         Some(&self.photos[idx])
     }
 
-    /// Pick the next photo after `current_idx` (wrapping), skipping banned ones.
-    pub fn pick_next_sequential(&self, current_idx: usize) -> Option<&PhotoEntry> {
-        let len = self.photos.len();
-        if len == 0 {
-            return None;
-        }
-        let start = (current_idx + 1) % len;
-        for offset in 0..len {
-            let i = (start + offset) % len;
-            if !self.photos[i].banned {
-                return Some(&self.photos[i]);
-            }
-        }
-        None
-    }
-
-    /// Pick a random photo weighted by star rating.  Unrated photos get weight 1,
-    /// rated photos get weight `rating + 1` (so 5 stars → 6×).
-    pub fn pick_weighted_by_rating(
-        &self,
-        recent_window: usize,
-        recent_paths: &VecDeque<PathBuf>,
-    ) -> Option<&PhotoEntry> {
-        let effective_window = recent_window.min(self.photos.len().saturating_sub(1));
-        let recent_path_set: std::collections::HashSet<&PathBuf> =
-            recent_paths.iter().rev().take(effective_window).collect();
-        let recent_hashes = self.recent_hashes(&recent_path_set);
-
-        let candidates: Vec<(usize, u32)> = self
-            .photos
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                !e.banned && !recent_path_set.contains(&e.path) && !recent_hashes.contains(&e.hash)
-            })
-            .map(|(i, e)| {
-                let w = e.rating.map(|r| r as u32 + 1).unwrap_or(1);
-                (i, w)
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            // Fall back to all non-banned photos.
-            let all: Vec<(usize, u32)> = self
-                .photos
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| !e.banned)
-                .map(|(i, e)| {
-                    let w = e.rating.map(|r| r as u32 + 1).unwrap_or(1);
-                    (i, w)
-                })
-                .collect();
-            if all.is_empty() {
-                return None;
-            }
-            let total: u64 = all
-                .iter()
-                .map(|(_, w)| u64::from(*w))
-                .fold(0, u64::saturating_add);
-            let mut pick = rand::thread_rng().gen_range(0..total);
-            for (idx, w) in &all {
-                let weight = u64::from(*w);
-                if pick < weight {
-                    return Some(&self.photos[*idx]);
-                }
-                pick -= weight;
-            }
-            return Some(&self.photos[all.last().unwrap().0]);
-        }
-
-        let total: u64 = candidates
-            .iter()
-            .map(|(_, w)| u64::from(*w))
-            .fold(0, u64::saturating_add);
-        let mut pick = rand::thread_rng().gen_range(0..total);
-        for (idx, w) in &candidates {
-            let weight = u64::from(*w);
-            if pick < weight {
-                return Some(&self.photos[*idx]);
-            }
-            pick -= weight;
-        }
-        Some(&self.photos[candidates.last().unwrap().0])
-    }
-
     // -----------------------------------------------------------------------
     // Mutations
     // -----------------------------------------------------------------------
@@ -250,10 +150,13 @@ impl PhotoIndex {
         found
     }
 
-    pub fn rate(&mut self, idx: usize, stars: u8) {
-        if let Some(entry) = self.photos.get_mut(idx) {
-            entry.rating = Some(stars.min(5));
+    pub fn apply_bans(&mut self, hashes: &HashSet<String>) -> usize {
+        let mut applied = 0;
+        for entry in &mut self.photos {
+            entry.banned = hashes.contains(&entry.hash);
+            applied += usize::from(entry.banned);
         }
+        applied
     }
 
     pub fn len(&self) -> usize {
@@ -284,21 +187,62 @@ fn collect_files(
     dir: &Path,
     extensions: &[String],
     recursive: bool,
-    min_width: u32,
-    min_height: u32,
+    min_dimensions: (u32, u32),
+    visited_dirs: &mut HashSet<PathBuf>,
+    admitted_files: &mut HashSet<PathBuf>,
     index: &mut PhotoIndex,
-) -> Result<()> {
-    let read_dir =
-        std::fs::read_dir(dir).with_context(|| format!("cannot read directory {:?}", dir))?;
+) -> bool {
+    let canonical_dir = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!("skipping unreadable directory {}: {}", dir.display(), error);
+            return false;
+        }
+    };
+    if !visited_dirs.insert(canonical_dir) {
+        return true;
+    }
+
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!("skipping unreadable directory {}: {}", dir.display(), error);
+            return false;
+        }
+    };
 
     for entry in read_dir {
-        let entry = entry.context("error reading directory entry")?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    "skipping unreadable directory entry in {}: {}",
+                    dir.display(),
+                    error
+                );
+                continue;
+            }
+        };
         let path = entry.path();
-        let meta = entry.metadata().context("metadata error")?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!("skipping unreadable path {}: {}", path.display(), error);
+                continue;
+            }
+        };
 
         if meta.is_dir() {
             if recursive {
-                collect_files(&path, extensions, true, min_width, min_height, index)?;
+                collect_files(
+                    &path,
+                    extensions,
+                    true,
+                    min_dimensions,
+                    visited_dirs,
+                    admitted_files,
+                    index,
+                );
             }
             continue;
         }
@@ -317,11 +261,23 @@ fn collect_files(
             continue;
         }
 
-        match build_entry(&path, &meta, min_width, min_height) {
+        let canonical_file = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!("skipping unreadable file {}: {}", path.display(), error);
+                continue;
+            }
+        };
+        if admitted_files.contains(&canonical_file) {
+            continue;
+        }
+
+        match build_entry(&path, &meta, min_dimensions.0, min_dimensions.1) {
             Ok(Some(photo)) => {
                 let hash = photo.hash.clone();
                 let idx = index.photos.len();
                 index.photos.push(photo);
+                admitted_files.insert(canonical_file);
                 index.by_hash.entry(hash).or_insert(idx);
             }
             Ok(None) => {}
@@ -331,7 +287,7 @@ fn collect_files(
         }
     }
 
-    Ok(())
+    true
 }
 
 fn build_entry(
@@ -341,34 +297,33 @@ fn build_entry(
     min_height: u32,
 ) -> Result<Option<PhotoEntry>> {
     let size_bytes = meta.len();
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let (verified_width, verified_height) = validate_image_dimensions(path)
+    if size_bytes > crate::decode::MAX_IMAGE_FILE_BYTES {
+        tracing::warn!(
+            "skipping oversized image {}: {} bytes exceeds {} byte limit",
+            path.display(),
+            size_bytes,
+            crate::decode::MAX_IMAGE_FILE_BYTES
+        );
+        return Ok(None);
+    }
+    let (verified_width, verified_height) = crate::decode::validate_image_file(path)
         .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
     if verified_width < min_width || verified_height < min_height {
         return Ok(None);
     }
 
     let hash = hash_file(path)?;
-    let (exif_date, exif_width, exif_height) = read_exif_dims(path);
-    let width = exif_width.or(Some(verified_width));
-    let height = exif_height.or(Some(verified_height));
-    let rating = read_xmp_rating(path);
-
     Ok(Some(PhotoEntry {
         path: path.to_path_buf(),
-        size_bytes,
-        mtime,
-        exif_date,
-        width,
-        height,
-        rating,
+        width: Some(verified_width),
+        height: Some(verified_height),
         hash,
         banned: false,
     }))
 }
 
-/// Blake3 hash of first 8 KB — returned as lowercase hex.
-fn hash_file(path: &Path) -> Result<String> {
+/// Blake3 hash of the entire file, returned as lowercase hex.
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {:?} for hashing", path))?;
@@ -384,95 +339,6 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn validate_image_dimensions(path: &Path) -> Result<(u32, u32)> {
-    match image::image_dimensions(path) {
-        Ok(dims) => Ok(dims),
-        Err(e) => {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
-            if ext == "heic" || ext == "heif" {
-                Ok((u32::MAX, u32::MAX))
-            } else {
-                Err(e.into())
-            }
-        }
-    }
-}
-
-/// Read EXIF DateTimeOriginal and image dimensions.
-/// Returns (exif_date, width, height); any or all can be None on failure.
-fn read_exif_dims(path: &Path) -> (Option<SystemTime>, Option<u32>, Option<u32>) {
-    use std::io::BufReader;
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (None, None, None),
-    };
-    let mut bufreader = BufReader::new(file);
-    let exif_reader = exif::Reader::new();
-    let exif_data = match exif_reader.read_from_container(&mut bufreader) {
-        Ok(e) => e,
-        Err(_) => return (None, None, None),
-    };
-
-    // DateTimeOriginal
-    let exif_date = exif_data
-        .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
-        .and_then(|f| {
-            if let exif::Value::Ascii(ref v) = f.value {
-                v.first().and_then(|s| parse_exif_datetime(s))
-            } else {
-                None
-            }
-        });
-
-    // PixelXDimension / PixelYDimension (EXIF active area dims)
-    let width = exif_data
-        .get_field(exif::Tag::PixelXDimension, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0));
-    let height = exif_data
-        .get_field(exif::Tag::PixelYDimension, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0));
-
-    (exif_date, width, height)
-}
-
-/// Parse "YYYY:MM:DD HH:MM:SS" → SystemTime.
-fn parse_exif_datetime(s: &[u8]) -> Option<SystemTime> {
-    let s = std::str::from_utf8(s).ok()?;
-    // format: "2023:07:04 14:30:00"
-    if s.len() < 19 {
-        return None;
-    }
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: u32 = s[5..7].parse().ok()?;
-    let day: u32 = s[8..10].parse().ok()?;
-    let hour: u32 = s[11..13].parse().ok()?;
-    let min: u32 = s[14..16].parse().ok()?;
-    let sec: u32 = s[17..19].parse().ok()?;
-
-    use chrono::{TimeZone, Utc};
-    let dt = Utc
-        .with_ymd_and_hms(year, month, day, hour, min, sec)
-        .single()?;
-    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64))
-}
-
-/// Read XMP sidecar (<basename>.xmp) and extract xmp:Rating.
-fn read_xmp_rating(path: &Path) -> Option<u8> {
-    let xmp_path = path.with_extension("xmp");
-    let content = std::fs::read_to_string(&xmp_path).ok()?;
-    // Simple substring search — avoid pulling in an XML parser.
-    let tag = "xmp:Rating>";
-    let start = content.find(tag)? + tag.len();
-    let end = content[start..].find('<')? + start;
-    let rating: u8 = content[start..end].trim().parse().ok()?;
-    Some(rating.min(5))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -482,12 +348,66 @@ mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb};
 
+    fn make_temp_image(dir: &std::path::Path, name: &str, width: u32, height: u32) -> PathBuf {
+        let path = dir.join(name);
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(width, height, |_, _| Rgb([255u8, 0, 0]));
+        image.save(&path).unwrap();
+        path
+    }
+
     fn make_temp_jpg(dir: &std::path::Path, name: &str) -> PathBuf {
-        let p = dir.join(name);
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(16, 16, |_, _| Rgb([255u8, 0, 0]));
-        img.save(&p).unwrap();
-        p
+        make_temp_image(dir, name, 16, 16)
+    }
+
+    fn source(
+        path: PathBuf,
+        recursive: bool,
+        extensions: &[&str],
+        min_width: u32,
+        min_height: u32,
+    ) -> SourceConfig {
+        SourceConfig {
+            path,
+            recursive,
+            extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
+            min_width,
+            min_height,
+        }
+    }
+
+    fn write_bmp_header(path: &Path, width: u32, height: u32) {
+        let row_bytes = (width * 3).div_ceil(4) * 4;
+        let image_bytes = row_bytes * height;
+        let mut header = [0u8; 54];
+        header[0..2].copy_from_slice(b"BM");
+        header[2..6].copy_from_slice(&(54 + image_bytes).to_le_bytes());
+        header[10..14].copy_from_slice(&54u32.to_le_bytes());
+        header[14..18].copy_from_slice(&40u32.to_le_bytes());
+        header[18..22].copy_from_slice(&(width as i32).to_le_bytes());
+        header[22..26].copy_from_slice(&(height as i32).to_le_bytes());
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[28..30].copy_from_slice(&24u16.to_le_bytes());
+        header[34..38].copy_from_slice(&image_bytes.to_le_bytes());
+        std::fs::write(path, header).unwrap();
+    }
+
+    struct TestComApartment;
+
+    impl TestComApartment {
+        fn initialize() -> Self {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+            let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            assert!(result.is_ok(), "CoInitializeEx failed: {result:?}");
+            Self
+        }
+    }
+
+    impl Drop for TestComApartment {
+        fn drop(&mut self) {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
     }
 
     #[test]
@@ -523,18 +443,194 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_next_sequential_wraps() {
+    fn scan_skips_oversized_files_before_image_validation() {
         let dir = tempfile::tempdir().expect("tempdir");
-        make_temp_jpg(dir.path(), "1.jpg");
-        make_temp_jpg(dir.path(), "2.jpg");
-        make_temp_jpg(dir.path(), "3.jpg");
+        let path = dir.path().join("oversized.jpg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(crate::decode::MAX_IMAGE_FILE_BYTES + 1)
+            .unwrap();
 
-        let roots = vec![dir.path().to_path_buf()];
-        let exts = vec!["jpg".to_string()];
-        let index = PhotoIndex::scan(&roots, &exts, false).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert!(build_entry(&path, &metadata, 0, 0).unwrap().is_none());
+    }
 
-        // Should always find a next entry in a 3-photo index
-        let next = index.pick_next_sequential(0);
-        assert!(next.is_some());
+    #[test]
+    fn scan_skips_oversized_pixel_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pixel-bomb.bmp");
+        write_bmp_header(&path, 10_001, 10_000);
+        assert_eq!(image::image_dimensions(&path).unwrap(), (10_001, 10_000));
+        assert!(crate::decode::validate_image_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("exceed maximum"));
+
+        let index =
+            PhotoIndex::scan(&[dir.path().to_path_buf()], &["bmp".to_string()], false).unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn scan_skips_malformed_wic_only_files() {
+        let _com = TestComApartment::initialize();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for extension in ["heic", "heif", "avif"] {
+            std::fs::write(
+                dir.path().join(format!("malformed.{extension}")),
+                b"not an image",
+            )
+            .unwrap();
+        }
+
+        let extensions = ["heic", "heif", "avif"].map(str::to_string);
+        let index = PhotoIndex::scan(&[dir.path().to_path_buf()], &extensions, false).unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn scan_skips_missing_and_duplicate_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_temp_jpg(dir.path(), "only-once.jpg");
+
+        let roots = vec![
+            dir.path().join("missing"),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ];
+        let index = PhotoIndex::scan(&roots, &["jpg".to_string()], true).unwrap();
+
+        assert_eq!(index.photos.len(), 1);
+    }
+
+    #[test]
+    fn scan_sources_rechecks_extensions_and_dimensions_for_each_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_temp_image(dir.path(), "small.jpg", 16, 16);
+        make_temp_image(dir.path(), "small.png", 16, 16);
+
+        let strict = source(dir.path().to_path_buf(), false, &["png"], 32, 32);
+        let permissive = source(dir.path().to_path_buf(), false, &["jpg", "png"], 0, 0);
+
+        for sources in [[strict.clone(), permissive.clone()], [permissive, strict]] {
+            let index = PhotoIndex::scan_sources(&sources).unwrap();
+            let mut names: Vec<_> = index
+                .photos
+                .iter()
+                .map(|photo| {
+                    photo
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+
+            assert_eq!(names, ["small.jpg", "small.png"]);
+        }
+    }
+
+    #[test]
+    fn scan_sources_rechecks_recursion_for_each_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        make_temp_jpg(dir.path(), "root.jpg");
+        make_temp_jpg(&nested, "nested.jpg");
+
+        let shallow = source(dir.path().to_path_buf(), false, &["jpg"], 0, 0);
+        let recursive = source(dir.path().to_path_buf(), true, &["jpg"], 0, 0);
+
+        for sources in [[shallow.clone(), recursive.clone()], [recursive, shallow]] {
+            let index = PhotoIndex::scan_sources(&sources).unwrap();
+
+            assert_eq!(index.photos.len(), 2);
+            assert!(index
+                .photos
+                .iter()
+                .any(|photo| photo.path.ends_with("nested.jpg")));
+        }
+    }
+
+    #[test]
+    fn scan_sources_deduplicates_duplicate_and_alias_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_temp_jpg(dir.path(), "only-once.jpg");
+        let root = dir.path().to_path_buf();
+        let sources = vec![
+            source(root.clone(), true, &["jpg"], 0, 0),
+            source(root.clone(), true, &["jpg"], 0, 0),
+            source(root.join("."), true, &["jpg"], 0, 0),
+        ];
+
+        let index = PhotoIndex::scan_sources(&sources).unwrap();
+
+        assert_eq!(index.photos.len(), 1);
+    }
+
+    #[test]
+    fn scan_sources_errors_when_every_configured_root_is_inaccessible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = vec![
+            source(dir.path().join("missing-a"), true, &["jpg"], 0, 0),
+            source(dir.path().join("missing-b"), true, &["jpg"], 0, 0),
+        ];
+
+        let error = PhotoIndex::scan_sources(&sources).unwrap_err().to_string();
+
+        assert!(error.contains("none of the 2 configured photo source roots"));
+    }
+
+    #[test]
+    fn scan_sources_allows_mixed_accessible_and_inaccessible_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_temp_jpg(dir.path(), "accessible.jpg");
+        let sources = vec![
+            source(dir.path().join("missing"), true, &["jpg"], 0, 0),
+            source(dir.path().to_path_buf(), true, &["jpg"], 0, 0),
+        ];
+
+        let index = PhotoIndex::scan_sources(&sources).unwrap();
+
+        assert_eq!(index.photos.len(), 1);
+    }
+
+    #[test]
+    fn scan_sources_allows_accessible_empty_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = [source(dir.path().to_path_buf(), true, &["jpg"], 0, 0)];
+
+        let index = PhotoIndex::scan_sources(&sources).unwrap();
+
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn recursive_scan_stops_at_directory_cycles_when_links_are_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        make_temp_jpg(&nested, "cycle.jpg");
+        let link = nested.join("back-to-root");
+
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(dir.path(), &link).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(dir.path(), &link).is_err() {
+            return;
+        }
+        #[cfg(not(any(windows, unix)))]
+        return;
+
+        let index =
+            PhotoIndex::scan(&[dir.path().to_path_buf()], &["jpg".to_string()], true).unwrap();
+
+        assert_eq!(index.photos.len(), 1);
     }
 }

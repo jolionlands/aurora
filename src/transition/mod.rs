@@ -1,3 +1,4 @@
+pub use crate::decode::DecodedImage;
 use anyhow::Result;
 
 pub mod cpu;
@@ -6,21 +7,6 @@ pub mod gpu;
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
-
-/// A decoded image ready for blending — BGRA32 pixel data + dimensions.
-///
-/// TODO(audit): unify with crate::decode::DecodedImage when the foundation
-/// wires all modules together.  The foundation uses field name `bgra`; we use
-/// `data` here so callers can build a TransitionImage without depending on
-/// decode internals.  A From<&crate::decode::DecodedImage> impl should be
-/// added at integration time.
-#[derive(Debug, Clone)]
-pub struct DecodedImage {
-    pub width: u32,
-    pub height: u32,
-    /// Raw BGRA bytes, length == width * height * 4.
-    pub data: Vec<u8>,
-}
 
 /// Monitor screen-space rectangle.
 #[derive(Debug, Clone, Copy)]
@@ -88,13 +74,13 @@ impl TransitionStyle {
     pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "crossfade" | "cross" => Self::Crossfade,
-            "slideleft" | "slide_left" => Self::SlideLeft,
-            "slideright" | "slide_right" => Self::SlideRight,
-            "wipeleft" | "wipe_left" => Self::WipeLeft,
-            "wiperight" | "wipe_right" => Self::WipeRight,
+            "slideleft" | "slide_left" | "slide-left" => Self::SlideLeft,
+            "slideright" | "slide_right" | "slide-right" => Self::SlideRight,
+            "wipeleft" | "wipe_left" | "wipe-left" => Self::WipeLeft,
+            "wiperight" | "wipe_right" | "wipe-right" => Self::WipeRight,
             "dissolve" => Self::Dissolve,
-            "zoomin" | "zoom_in" => Self::ZoomIn,
-            "zoomout" | "zoom_out" => Self::ZoomOut,
+            "zoomin" | "zoom_in" | "zoom-in" => Self::ZoomIn,
+            "zoomout" | "zoom_out" | "zoom-out" => Self::ZoomOut,
             _ => Self::None,
         }
     }
@@ -134,6 +120,7 @@ impl Backend {
 pub struct TransitionRenderer {
     pub style: TransitionStyle,
     pub duration_ms: u32,
+    requested: Backend,
     resolved: ResolvedBackend,
 }
 
@@ -144,7 +131,7 @@ enum ResolvedBackend {
 
 impl TransitionRenderer {
     pub fn new(style: TransitionStyle, duration_ms: u32, backend: Backend) -> Self {
-        let resolved = match backend {
+        let resolved = match &backend {
             Backend::Gpu => ResolvedBackend::Gpu,
             Backend::Cpu => ResolvedBackend::Cpu,
             Backend::Auto => {
@@ -169,6 +156,7 @@ impl TransitionRenderer {
         Self {
             style,
             duration_ms,
+            requested: backend,
             resolved,
         }
     }
@@ -185,26 +173,56 @@ impl TransitionRenderer {
             return Ok(());
         }
 
-        match &self.resolved {
-            ResolvedBackend::Gpu => {
-                gpu::run_transition(monitor_bounds, old, new, &self.style, self.duration_ms)
+        let run_cpu = || {
+            // For GPU-only styles, degrade gracefully to crossfade
+            let effective_style = if self.style.cpu_capable() {
+                &self.style
+            } else {
+                &TransitionStyle::Crossfade
+            };
+            cpu::run_transition(monitor_bounds, old, new, effective_style, self.duration_ms)
+        };
+
+        run_selected_backend(
+            &self.requested,
+            &self.resolved,
+            || gpu::run_transition(monitor_bounds, old, new, &self.style, self.duration_ms),
+            run_cpu,
+        )
+    }
+}
+
+fn run_selected_backend<G, C>(
+    requested: &Backend,
+    resolved: &ResolvedBackend,
+    run_gpu: G,
+    run_cpu: C,
+) -> Result<()>
+where
+    G: FnOnce() -> Result<()>,
+    C: FnOnce() -> Result<()>,
+{
+    match resolved {
+        ResolvedBackend::Gpu => match run_gpu() {
+            Err(error) if *requested == Backend::Auto => {
+                tracing::warn!(%error, "GPU transition failed; falling back to CPU");
+                run_cpu()
             }
-            ResolvedBackend::Cpu => {
-                // For GPU-only styles, degrade gracefully to crossfade
-                let effective_style = if self.style.cpu_capable() {
-                    &self.style
-                } else {
-                    &TransitionStyle::Crossfade
-                };
-                cpu::run_transition(monitor_bounds, old, new, effective_style, self.duration_ms)
-            }
-        }
+            result => result,
+        },
+        ResolvedBackend::Cpu => run_cpu(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::scale_to_cover;
+    use super::{
+        run_selected_backend, scale_to_cover, Backend, Rect, ResolvedBackend, TransitionRenderer,
+        TransitionStyle,
+    };
+    use crate::decode::DecodedImage;
+    use anyhow::anyhow;
+    use std::cell::Cell;
 
     #[test]
     fn scale_to_cover_crops_without_stretching() {
@@ -220,5 +238,77 @@ mod tests {
         assert_eq!(out[0], out[8]);
         assert!(out[0] > 0 && out[0] < 3);
         assert!(out[4] > out[0]);
+    }
+
+    #[test]
+    fn advertised_hyphenated_styles_parse() {
+        for (name, expected) in [
+            ("slide-left", TransitionStyle::SlideLeft),
+            ("slide-right", TransitionStyle::SlideRight),
+            ("wipe-left", TransitionStyle::WipeLeft),
+            ("wipe-right", TransitionStyle::WipeRight),
+            ("zoom-in", TransitionStyle::ZoomIn),
+            ("zoom-out", TransitionStyle::ZoomOut),
+        ] {
+            assert_eq!(TransitionStyle::parse(name), expected);
+        }
+    }
+
+    #[test]
+    fn renderer_borrows_decoder_images_directly() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0, 0, 0, 255],
+        };
+        TransitionRenderer::new(TransitionStyle::None, 0, Backend::Cpu)
+            .run(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                &image,
+                &image,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_retries_cpu_after_gpu_failure() {
+        let cpu_runs = Cell::new(0);
+
+        run_selected_backend(
+            &Backend::Auto,
+            &ResolvedBackend::Gpu,
+            || Err(anyhow!("GPU failed")),
+            || {
+                cpu_runs.set(cpu_runs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cpu_runs.get(), 1);
+    }
+
+    #[test]
+    fn explicit_gpu_failure_is_returned_without_cpu_retry() {
+        let cpu_runs = Cell::new(0);
+
+        let error = run_selected_backend(
+            &Backend::Gpu,
+            &ResolvedBackend::Gpu,
+            || Err(anyhow!("GPU failed")),
+            || {
+                cpu_runs.set(cpu_runs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "GPU failed");
+        assert_eq!(cpu_runs.get(), 0);
     }
 }

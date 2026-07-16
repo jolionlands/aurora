@@ -1,42 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-#[derive(thiserror::Error, Debug)]
-pub enum IpcError {
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("Read error: {0}")]
-    ReadError(String),
-    #[error("Write error: {0}")]
-    WriteError(String),
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-    #[error("Pipe creation failed: {0}")]
-    PipeCreationFailed(String),
-    #[error("Client disconnected")]
-    ClientDisconnected,
-    #[error("Timeout")]
-    Timeout,
-    #[error("Invalid message: {0}")]
-    InvalidMessage(String),
-    #[error("Windows API error: {0}")]
-    WindowsError(String),
-}
-
-impl From<std::io::Error> for IpcError {
-    fn from(e: std::io::Error) -> Self {
-        IpcError::ReadError(e.to_string())
-    }
-}
-
-impl From<serde_json::Error> for IpcError {
-    fn from(e: serde_json::Error) -> Self {
-        IpcError::SerializationError(e.to_string())
-    }
-}
+pub const DEFAULT_PLAYLIST_SHOW_LIMIT: usize = 100;
+pub const MAX_PLAYLIST_SHOW_LIMIT: usize = 256;
 
 // ---------------------------------------------------------------------------
 // IPC message enum (client → daemon)
@@ -76,10 +41,6 @@ pub enum IpcMessage {
     #[serde(rename = "set_folder")]
     SetFolder { path: String },
 
-    /// Rate the currently displayed photo (1–5 stars).
-    #[serde(rename = "rate")]
-    Rate { stars: u8 },
-
     /// Ban a photo by its content hash so it is never shown again.
     #[serde(rename = "ban")]
     Ban { hash: String },
@@ -88,8 +49,8 @@ pub enum IpcMessage {
     #[serde(rename = "stats")]
     Stats,
 
-    /// Reload photo sources from disk. Schedule, transition, monitor, and
-    /// cache settings still require a daemon restart.
+    /// Reload photo sources from disk. Schedule, transition, monitor, cache,
+    /// metrics, and log-level settings still require a daemon restart.
     #[serde(rename = "reload")]
     Reload,
 
@@ -105,7 +66,7 @@ pub enum IpcMessage {
         types: Vec<String>,
     },
 
-    /// Query the currently displayed wallpaper path for each monitor.
+    /// Query the last successfully applied wallpaper snapshot for each monitor.
     #[serde(rename = "get_current_wallpaper")]
     GetCurrentWallpaper,
 
@@ -115,6 +76,16 @@ pub enum IpcMessage {
     /// List all playlists and the active one.
     #[serde(rename = "playlist_list")]
     PlaylistList,
+
+    /// Return one bounded page of a playlist and its metadata.
+    #[serde(rename = "playlist_show")]
+    PlaylistShow {
+        name: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_playlist_show_limit")]
+        limit: usize,
+    },
 
     /// Create an empty playlist.
     #[serde(rename = "playlist_create")]
@@ -150,11 +121,35 @@ pub enum IpcMessage {
         frequency: u32,
     },
 
+    /// Enable or disable shuffled selection for a playlist.
+    #[serde(rename = "playlist_shuffle")]
+    PlaylistShuffle { name: String, shuffle: bool },
+
+    /// Check whether one playlist path already has autotag metadata.
+    #[serde(rename = "playlist_autotag_status")]
+    PlaylistAutotagStatus { name: String, path: String },
+
+    /// Atomically add one path and apply all of its autotag metadata.
+    #[serde(rename = "playlist_autotag_upsert")]
+    PlaylistAutotagUpsert {
+        name: String,
+        path: String,
+        groups: std::collections::BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        rating: Option<u8>,
+        #[serde(default)]
+        frequency: Option<u32>,
+        #[serde(default)]
+        create_playlist: bool,
+        #[serde(default)]
+        overwrite_existing: bool,
+    },
+
     /// Remove a path from a playlist.
     #[serde(rename = "playlist_remove")]
     PlaylistRemove { name: String, path: String },
 
-    /// Set the active playlist and immediately apply one of its wallpapers.
+    /// Set the active playlist and request an immediate wallpaper swap.
     #[serde(rename = "playlist_activate")]
     PlaylistActivate { name: String },
 
@@ -169,6 +164,10 @@ pub enum IpcMessage {
 
 fn default_tag_kind() -> String {
     "general".to_string()
+}
+
+fn default_playlist_show_limit() -> usize {
+    DEFAULT_PLAYLIST_SHOW_LIMIT
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +247,51 @@ mod tests {
             IpcMessage::Pause { duration_secs } => assert_eq!(duration_secs, Some(3600)),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_playlist_shuffle_roundtrip() {
+        let raw = serde_json::to_string(&IpcMessage::PlaylistShuffle {
+            name: "focus".to_string(),
+            shuffle: true,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str(&raw).unwrap(),
+            IpcMessage::PlaylistShuffle {
+                name,
+                shuffle: true
+            } if name == "focus"
+        ));
+    }
+
+    #[test]
+    fn test_playlist_show_roundtrip() {
+        let raw = serde_json::to_string(&IpcMessage::PlaylistShow {
+            name: "focus".to_string(),
+            offset: 12,
+            limit: 64,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str(&raw).unwrap(),
+            IpcMessage::PlaylistShow {
+                name,
+                offset: 12,
+                limit: 64,
+            } if name == "focus"
+        ));
+
+        let defaulted: IpcMessage =
+            serde_json::from_str(r#"{"type":"playlist_show","data":{"name":"focus"}}"#).unwrap();
+        assert!(matches!(
+            defaulted,
+            IpcMessage::PlaylistShow {
+                offset: 0,
+                limit: DEFAULT_PLAYLIST_SHOW_LIMIT,
+                ..
+            }
+        ));
     }
 
     #[test]

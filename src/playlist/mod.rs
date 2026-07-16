@@ -22,7 +22,7 @@
 /// at pick time; non-existent files are silently skipped.
 use anyhow::{Context, Result};
 use rand::Rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ pub struct Playlist {
     pub custom_tags: HashMap<String, HashMap<String, Vec<String>>>,
     /// Per-path star ratings, 0-5. Higher ratings are picked more often.
     pub ratings: HashMap<String, u8>,
-    /// Per-path frequency weights. Values below 1 are normalized to 1.
+    /// Per-path positive frequency weights.
     pub frequencies: HashMap<String, u32>,
 }
 
@@ -92,6 +92,7 @@ impl PlaylistStore {
 
     /// Create an empty playlist.  Returns `Err` if the name already exists.
     pub fn create(&mut self, name: &str) -> Result<()> {
+        validate_playlist_name(name)?;
         if self.get(name).is_some() {
             anyhow::bail!("playlist '{}' already exists", name);
         }
@@ -115,43 +116,43 @@ impl PlaylistStore {
         Ok(())
     }
 
-    /// Add `path` to the named playlist (appends; duplicates are allowed so the
-    /// user can weight a file by repeating it, consistent with the spec).
+    /// Add `path` to the named playlist. Existing paths are left unchanged;
+    /// frequency is the supported weighting mechanism.
     pub fn add_path(&mut self, name: &str, path: &str) -> Result<()> {
+        validate_playlist_path(path)?;
         let pl = self
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
-        pl.paths.push(path.to_string());
+        if !pl.paths.iter().any(|stored| stored == path) {
+            pl.paths.push(path.to_string());
+        }
         Ok(())
     }
 
-    /// Remove the first occurrence of `path` from the named playlist.
+    /// Remove `path` from the named playlist.
     pub fn remove_path(&mut self, name: &str, path: &str) -> Result<()> {
+        validate_playlist_path(path)?;
         let pl = self
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
         if let Some(pos) = pl.paths.iter().position(|p| p == path) {
             pl.paths.remove(pos);
             if !pl.paths.iter().any(|p| p == path) {
-                pl.tags.remove(path);
-                pl.themes.remove(path);
-                pl.content.remove(path);
-                pl.colors.remove(path);
-                pl.sources.remove(path);
-                pl.media.remove(path);
-                pl.safety.remove(path);
-                pl.franchises.remove(path);
-                pl.characters.remove(path);
-                for group in pl.custom_tags.values_mut() {
-                    group.remove(path);
-                }
-                pl.ratings.remove(path);
-                pl.frequencies.remove(path);
+                clear_playlist_path_metadata(pl, path);
             }
             Ok(())
         } else {
             anyhow::bail!("path '{}' not in playlist '{}'", path, name);
         }
+    }
+
+    pub fn clear_path_metadata(&mut self, name: &str, path: &str) -> Result<()> {
+        let pl = self
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
+        ensure_path_exists(pl, path)?;
+        clear_playlist_path_metadata(pl, path);
+        Ok(())
     }
 
     pub fn set_tags(&mut self, name: &str, path: &str, tags: Vec<String>) -> Result<()> {
@@ -169,30 +170,45 @@ impl PlaylistStore {
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
         ensure_path_exists(pl, path)?;
-        let tags: Vec<String> = tags
+        let mut tags: Vec<String> = tags
             .into_iter()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
+        dedupe_strings(&mut tags);
         set_group_map(pl, path, kind, tags)?;
         Ok(())
     }
 
     pub fn set_rating(&mut self, name: &str, path: &str, rating: u8) -> Result<()> {
+        if rating > 5 {
+            anyhow::bail!("rating must be between 0 and 5");
+        }
         let pl = self
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
         ensure_path_exists(pl, path)?;
-        pl.ratings.insert(path.to_string(), rating.min(5));
+        pl.ratings.insert(path.to_string(), rating);
         Ok(())
     }
 
     pub fn set_frequency(&mut self, name: &str, path: &str, frequency: u32) -> Result<()> {
+        if frequency == 0 {
+            anyhow::bail!("frequency must be at least 1");
+        }
         let pl = self
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
         ensure_path_exists(pl, path)?;
-        pl.frequencies.insert(path.to_string(), frequency.max(1));
+        pl.frequencies.insert(path.to_string(), frequency);
+        Ok(())
+    }
+
+    pub fn set_shuffle(&mut self, name: &str, shuffle: bool) -> Result<()> {
+        let pl = self
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
+        pl.shuffle = shuffle;
         Ok(())
     }
 
@@ -240,7 +256,7 @@ impl PlaylistStore {
         recent_paths: &VecDeque<PathBuf>,
     ) -> Option<PathBuf> {
         let roots: Vec<&Path> = source_root.into_iter().collect();
-        self.pick_from_roots(&roots, cursor, recent_window, recent_paths)
+        self.pick_from_roots(&roots, cursor, recent_window, recent_paths, &HashSet::new())
     }
 
     /// Pick from a playlist, resolving relative paths against every configured
@@ -251,6 +267,7 @@ impl PlaylistStore {
         cursor: &mut HashMap<String, usize>,
         recent_window: usize,
         recent_paths: &VecDeque<PathBuf>,
+        excluded_paths: &HashSet<PathBuf>,
     ) -> Option<PathBuf> {
         let pl = self.active_playlist()?;
 
@@ -268,7 +285,7 @@ impl PlaylistStore {
                         .map(|root| root.join(&p))
                         .find(|candidate| candidate.is_file())?
                 };
-                if !resolved.is_file() {
+                if !resolved.is_file() || excluded_paths.contains(&resolved) {
                     return None;
                 }
                 let frequency = pl.frequencies.get(s).copied().unwrap_or(1).max(1) as u64;
@@ -387,165 +404,142 @@ pub fn parse_playlists(input: &str) -> Result<PlaylistStore> {
     let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     let mut store = PlaylistStore::default();
 
-    // Parser state
     let mut in_playlist: Option<Playlist> = None;
 
-    for raw in input.lines() {
+    for (line_index, raw) in input.lines().enumerate() {
+        let line_number = line_index + 1;
         let line = strip_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
 
         if line == "}" {
-            // Close current playlist block.
-            if let Some(pl) = in_playlist.take() {
-                store.playlists.push(pl);
+            let mut playlist = in_playlist.take().ok_or_else(|| {
+                anyhow::anyhow!("playlists line {line_number}: unexpected closing brace")
+            })?;
+            normalize_playlist(&mut playlist);
+            validate_playlist(&playlist)
+                .map_err(|error| anyhow::anyhow!("playlists line {line_number}: {error:#}"))?;
+            if store.get(&playlist.name).is_some() {
+                anyhow::bail!(
+                    "playlists line {line_number}: duplicate playlist '{}'",
+                    playlist.name
+                );
             }
+            store.playlists.push(playlist);
             continue;
         }
 
-        // Section open: `playlist "name" {`
-        if let Some(rest) = line.strip_prefix("playlist") {
-            if let Some(body) = rest.strip_suffix('{') {
-                let body = body.trim();
-                if let Some(name) = extract_quoted(body) {
-                    in_playlist = Some(Playlist {
-                        name,
-                        shuffle: false,
-                        paths: Vec::new(),
-                        tags: HashMap::new(),
-                        themes: HashMap::new(),
-                        content: HashMap::new(),
-                        colors: HashMap::new(),
-                        sources: HashMap::new(),
-                        media: HashMap::new(),
-                        safety: HashMap::new(),
-                        franchises: HashMap::new(),
-                        characters: HashMap::new(),
-                        custom_tags: HashMap::new(),
-                        ratings: HashMap::new(),
-                        frequencies: HashMap::new(),
-                    });
-                }
-                continue;
+        if let Some(rest) = node_args(line, "playlist") {
+            if let Some(open) = &in_playlist {
+                anyhow::bail!(
+                    "playlists line {line_number}: playlist '{}' block is still open",
+                    open.name
+                );
             }
-        }
-
-        // Top-level `active "name"` directive.
-        if let Some(rest) = line.strip_prefix("active") {
-            let rest = rest.trim();
-            if let Some(name) = extract_quoted(rest) {
-                store.active = Some(name);
-            }
+            let body = rest.strip_suffix('{').ok_or_else(|| {
+                anyhow::anyhow!("playlists line {line_number}: playlist must end with '{{'")
+            })?;
+            let values = parse_quoted_values(body)
+                .map_err(|error| anyhow::anyhow!("playlists line {line_number}: {error:#}"))?;
+            let [name] = values.as_slice() else {
+                anyhow::bail!("playlists line {line_number}: playlist expects one quoted name");
+            };
+            validate_playlist_name(name)
+                .map_err(|error| anyhow::anyhow!("playlists line {line_number}: {error}"))?;
+            in_playlist = Some(Playlist {
+                name: name.clone(),
+                ..Playlist::default()
+            });
             continue;
         }
 
-        // Inside a playlist block.
-        if let Some(ref mut pl) = in_playlist {
-            // `shuffle true/false`
-            if let Some(val) = line.strip_prefix("shuffle") {
-                pl.shuffle = parse_bool(val.trim());
-                continue;
-            }
-            // `path "..."`
-            if let Some(rest) = line.strip_prefix("path") {
-                let rest = rest.trim();
-                if let Some(p) = extract_quoted(rest) {
-                    pl.paths.push(p);
-                } else if !rest.is_empty() {
-                    // Bare (unquoted) path token.
-                    pl.paths.push(rest.to_string());
+        if in_playlist.is_none() {
+            if let Some(rest) = node_args(line, "active") {
+                if store.active.is_some() {
+                    anyhow::bail!("playlists line {line_number}: duplicate active directive");
                 }
+                let values = parse_quoted_values(rest)
+                    .map_err(|error| anyhow::anyhow!("playlists line {line_number}: {error:#}"))?;
+                let [name] = values.as_slice() else {
+                    anyhow::bail!(
+                        "playlists line {line_number}: active expects one quoted playlist name"
+                    );
+                };
+                store.active = Some(name.clone());
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("tag") {
-                let quoted = extract_all_quoted(rest.trim());
-                match quoted.as_slice() {
-                    [path, tag] => {
-                        let _ = push_group_tag(pl, path, "general", tag);
-                    }
-                    [path, kind, tag] => {
-                        let _ = push_group_tag(pl, path, kind, tag);
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("theme") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "theme", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("content") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "content", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("color") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "color", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("source") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "source", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("medium") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "medium", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("safety") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "safety", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("franchise") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "franchise", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("character") {
-                if let Some((path, tag)) = extract_two_quoted(rest.trim()) {
-                    let _ = push_group_tag(pl, &path, "character", &tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("facet") {
-                let quoted = extract_all_quoted(rest.trim());
-                if let [path, kind, tag] = quoted.as_slice() {
-                    let _ = push_group_tag(pl, path, kind, tag);
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("rating") {
-                if let Some((path, value)) = extract_quoted_and_tail(rest.trim()) {
-                    if let Ok(rating) = value.trim().parse::<u8>() {
-                        pl.ratings.insert(path, rating.min(5));
-                    }
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("frequency") {
-                if let Some((path, value)) = extract_quoted_and_tail(rest.trim()) {
-                    if let Ok(frequency) = value.trim().parse::<u32>() {
-                        pl.frequencies.insert(path, frequency.max(1));
-                    }
-                }
-                continue;
-            }
-            // Unknown keys inside a playlist block — silently ignore.
+            let (key, _) = split_node(line);
+            anyhow::bail!("playlists line {line_number}: unknown top-level node '{key}'");
         }
+
+        let (key, args) = split_node(line);
+        let playlist = in_playlist.as_mut().unwrap();
+        let result: Result<()> = (|| {
+            match key {
+                "shuffle" => playlist.shuffle = parse_bool(args)?,
+                "path" => {
+                    let values = parse_quoted_values(args)?;
+                    let [path] = values.as_slice() else {
+                        anyhow::bail!("path expects one quoted value");
+                    };
+                    validate_playlist_path(path)?;
+                    playlist.paths.push(path.clone());
+                }
+                "tag" => {
+                    let values = parse_quoted_values(args)?;
+                    match values.as_slice() {
+                        [path, tag] => push_group_tag(playlist, path, "general", tag)?,
+                        [path, kind, tag] => push_group_tag(playlist, path, kind, tag)?,
+                        _ => anyhow::bail!("tag expects path/tag or path/kind/tag"),
+                    }
+                }
+                "theme" | "content" | "color" | "source" | "medium" | "safety" | "franchise"
+                | "character" => {
+                    let values = parse_quoted_values(args)?;
+                    let [path, tag] = values.as_slice() else {
+                        anyhow::bail!("{key} expects a quoted path and tag");
+                    };
+                    push_group_tag(playlist, path, key, tag)?;
+                }
+                "facet" => {
+                    let values = parse_quoted_values(args)?;
+                    let [path, kind, tag] = values.as_slice() else {
+                        anyhow::bail!("facet expects a quoted path, kind, and tag");
+                    };
+                    push_group_tag(playlist, path, kind, tag)?;
+                }
+                "rating" => {
+                    let (path, value) = parse_quoted_and_token(args)?;
+                    let rating = value
+                        .parse::<u8>()
+                        .context("rating must be an integer from 0 to 5")?;
+                    if rating > 5 {
+                        anyhow::bail!("rating must be between 0 and 5");
+                    }
+                    playlist.ratings.insert(path, rating);
+                }
+                "frequency" => {
+                    let (path, value) = parse_quoted_and_token(args)?;
+                    let frequency = value
+                        .parse::<u32>()
+                        .context("frequency must be a positive integer")?;
+                    if frequency == 0 {
+                        anyhow::bail!("frequency must be at least 1");
+                    }
+                    playlist.frequencies.insert(path, frequency);
+                }
+                _ => anyhow::bail!("unknown playlist node '{key}'"),
+            }
+            Ok(())
+        })();
+        result.map_err(|error| anyhow::anyhow!("playlists line {line_number}: {error:#}"))?;
     }
 
+    if let Some(playlist) = in_playlist {
+        anyhow::bail!("unclosed playlist '{}' block", playlist.name);
+    }
+    validate_store(&store)?;
     Ok(store)
 }
 
@@ -563,10 +557,16 @@ pub fn serialize_playlists(store: &PlaylistStore) -> String {
             "    shuffle {}\n",
             if pl.shuffle { "true" } else { "false" }
         ));
-        for path in &pl.paths {
+        let mut seen = HashSet::new();
+        let paths: Vec<&String> = pl
+            .paths
+            .iter()
+            .filter(|path| seen.insert(path.as_str()))
+            .collect();
+        for path in &paths {
             out.push_str(&format!("    path \"{}\"\n", escape_kdl(path)));
         }
-        for path in &pl.paths {
+        for path in paths {
             if let Some(tags) = pl.tags.get(path) {
                 for tag in tags {
                     out.push_str(&format!(
@@ -627,6 +627,7 @@ pub fn serialize_playlists(store: &PlaylistStore) -> String {
 
 /// Write `store` to `path` atomically via a `.tmp` sibling + rename.
 pub fn persist_playlists(store: &PlaylistStore, path: &Path) -> Result<()> {
+    validate_store(store).context("validate playlists before persist")?;
     let content = serialize_playlists(store);
 
     // Ensure the parent directory exists.
@@ -643,7 +644,7 @@ pub fn persist_playlists(store: &PlaylistStore, path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
@@ -671,7 +672,7 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
     std::fs::rename(tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
@@ -715,58 +716,175 @@ fn strip_comment(s: &str) -> &str {
     s
 }
 
-fn quoted_span(s: &str) -> Option<(usize, usize)> {
-    let bytes = s.as_bytes();
-    let start = bytes.iter().position(|b| *b == b'"' || *b == b'\'')?;
-    let quote = bytes[start];
+fn split_node(line: &str) -> (&str, &str) {
+    match line.find(char::is_whitespace) {
+        Some(index) => (&line[..index], line[index..].trim()),
+        None => (line, ""),
+    }
+}
+
+fn node_args<'a>(line: &'a str, expected: &str) -> Option<&'a str> {
+    let (node, args) = split_node(line);
+    (node == expected).then_some(args)
+}
+
+fn parse_quoted_prefix(input: &str) -> Result<(String, &str)> {
+    let input = input.trim_start();
+    let bytes = input.as_bytes();
+    let quote = match bytes.first() {
+        Some(b'"' | b'\'') => bytes[0],
+        _ => anyhow::bail!("expected a quoted string"),
+    };
     let mut escaped = false;
-    for (i, byte) in bytes.iter().enumerate().skip(start + 1) {
+    for (index, byte) in bytes.iter().enumerate().skip(1) {
         if escaped {
             escaped = false;
         } else if *byte == b'\\' {
             escaped = true;
         } else if *byte == quote {
-            return Some((start, i));
+            let tail = &input[index + 1..];
+            if tail
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_whitespace())
+            {
+                anyhow::bail!("quoted values must be separated by whitespace");
+            }
+            return Ok((unescape_kdl(&input[1..index])?, tail));
         }
     }
-    None
+    anyhow::bail!("unterminated quoted string")
 }
 
-/// Extract the first double- or single-quoted string from `s`.
-fn extract_quoted(s: &str) -> Option<String> {
-    let (start, end) = quoted_span(s)?;
-    Some(unescape_kdl(&s[start + 1..end]))
-}
-
-fn extract_quoted_and_tail(s: &str) -> Option<(String, String)> {
-    let (start, end) = quoted_span(s)?;
-    let path = unescape_kdl(&s[start + 1..end]);
-    let tail = s[end + 1..].trim().to_string();
-    Some((path, tail))
-}
-
-fn extract_two_quoted(s: &str) -> Option<(String, String)> {
-    let (first, tail) = extract_quoted_and_tail(s)?;
-    let second = extract_quoted(&tail)?;
-    Some((first, second))
-}
-
-fn extract_all_quoted(s: &str) -> Vec<String> {
+fn parse_quoted_values(mut input: &str) -> Result<Vec<String>> {
     let mut values = Vec::new();
-    let mut offset = 0;
-    while offset < s.len() {
-        let Some((start, end)) = quoted_span(&s[offset..]) else {
-            break;
-        };
-        let start = offset + start;
-        let end = offset + end;
-        values.push(unescape_kdl(&s[start + 1..end]));
-        offset = end + 1;
+    while !input.trim().is_empty() {
+        let (value, tail) = parse_quoted_prefix(input)?;
+        values.push(value);
+        input = tail;
     }
-    values
+    Ok(values)
+}
+
+fn parse_quoted_and_token(input: &str) -> Result<(String, &str)> {
+    let (value, tail) = parse_quoted_prefix(input)?;
+    let mut tokens = tail.split_whitespace();
+    let token = tokens
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("expected a value after the quoted path"))?;
+    if tokens.next().is_some() {
+        anyhow::bail!("unexpected trailing values");
+    }
+    Ok((value, token))
+}
+
+fn validate_playlist(playlist: &Playlist) -> Result<()> {
+    validate_playlist_name(&playlist.name)?;
+    for path in &playlist.paths {
+        validate_playlist_path(path)?;
+    }
+    let maps = [
+        &playlist.tags,
+        &playlist.themes,
+        &playlist.content,
+        &playlist.colors,
+        &playlist.sources,
+        &playlist.media,
+        &playlist.safety,
+        &playlist.franchises,
+        &playlist.characters,
+    ];
+    for map in maps {
+        for path in map.keys() {
+            ensure_path_exists(playlist, path)?;
+        }
+    }
+    for (kind, map) in &playlist.custom_tags {
+        validate_tag_kind(kind)?;
+        for path in map.keys() {
+            ensure_path_exists(playlist, path)?;
+        }
+    }
+    for (path, rating) in &playlist.ratings {
+        ensure_path_exists(playlist, path)?;
+        if *rating > 5 {
+            anyhow::bail!("rating must be between 0 and 5");
+        }
+    }
+    for (path, frequency) in &playlist.frequencies {
+        ensure_path_exists(playlist, path)?;
+        if *frequency == 0 {
+            anyhow::bail!("frequency must be at least 1");
+        }
+    }
+    Ok(())
+}
+
+fn validate_store(store: &PlaylistStore) -> Result<()> {
+    let mut names = HashSet::new();
+    for playlist in &store.playlists {
+        validate_playlist(playlist)?;
+        if !names.insert(playlist.name.as_str()) {
+            anyhow::bail!("duplicate playlist '{}'", playlist.name);
+        }
+    }
+    if let Some(active) = &store.active {
+        validate_playlist_name(active)?;
+        if store.get(active).is_none() {
+            anyhow::bail!("active playlist '{}' does not exist", active);
+        }
+    }
+    Ok(())
+}
+
+fn validate_playlist_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("playlist name must not be blank");
+    }
+    Ok(())
+}
+
+fn validate_playlist_path(path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("playlist path must not be blank");
+    }
+    Ok(())
+}
+
+fn validate_tag_kind(kind: &str) -> Result<()> {
+    if kind.trim().is_empty() {
+        anyhow::bail!("tag kind must not be blank");
+    }
+    Ok(())
+}
+
+fn normalize_playlist(playlist: &mut Playlist) {
+    dedupe_strings(&mut playlist.paths);
+    let maps = [
+        &mut playlist.tags,
+        &mut playlist.themes,
+        &mut playlist.content,
+        &mut playlist.colors,
+        &mut playlist.sources,
+        &mut playlist.media,
+        &mut playlist.safety,
+        &mut playlist.franchises,
+        &mut playlist.characters,
+    ];
+    for map in maps.into_iter().chain(playlist.custom_tags.values_mut()) {
+        for tags in map.values_mut() {
+            dedupe_strings(tags);
+        }
+    }
+}
+
+fn dedupe_strings(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn ensure_path_exists(pl: &Playlist, path: &str) -> Result<()> {
+    validate_playlist_path(path)?;
     if pl.paths.iter().any(|p| p == path) {
         Ok(())
     } else {
@@ -774,9 +892,31 @@ fn ensure_path_exists(pl: &Playlist, path: &str) -> Result<()> {
     }
 }
 
+fn clear_playlist_path_metadata(pl: &mut Playlist, path: &str) {
+    for group in [
+        &mut pl.tags,
+        &mut pl.themes,
+        &mut pl.content,
+        &mut pl.colors,
+        &mut pl.sources,
+        &mut pl.media,
+        &mut pl.safety,
+        &mut pl.franchises,
+        &mut pl.characters,
+    ] {
+        group.remove(path);
+    }
+    pl.custom_tags.retain(|_, group| {
+        group.remove(path);
+        !group.is_empty()
+    });
+    pl.ratings.remove(path);
+    pl.frequencies.remove(path);
+}
+
 fn normalized_tag_kind(kind: &str) -> Option<&'static str> {
     match kind.trim().to_ascii_lowercase().as_str() {
-        "" | "general" | "tag" | "tags" => Some("general"),
+        "general" | "tag" | "tags" => Some("general"),
         "theme" | "themes" | "style" | "styles" => Some("theme"),
         "content" | "contents" | "subject" | "subjects" => Some("content"),
         "color" | "colors" | "colour" | "colours" | "palette" | "palettes" => Some("color"),
@@ -832,6 +972,7 @@ fn group_map_mut<'a>(
 }
 
 fn set_group_map(pl: &mut Playlist, path: &str, kind: &str, tags: Vec<String>) -> Result<()> {
+    validate_tag_kind(kind)?;
     let map = match group_map_mut(pl, kind) {
         Ok(map) => map,
         Err(_) => {
@@ -851,6 +992,7 @@ fn set_group_map(pl: &mut Playlist, path: &str, kind: &str, tags: Vec<String>) -
 }
 
 fn push_group_tag(pl: &mut Playlist, path: &str, kind: &str, tag: &str) -> Result<()> {
+    validate_tag_kind(kind)?;
     let tag = tag.trim();
     if tag.is_empty() {
         return Ok(());
@@ -884,38 +1026,77 @@ fn write_tag_lines(out: &mut String, key: &str, path: &str, tags: Option<&Vec<St
     }
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("boolean must be true or false"),
+    }
 }
 
 /// Escape a string for inclusion inside KDL double-quotes.
 fn escape_kdl(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for character in s.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            control if control.is_control() => {
+                out.push_str(&format!("\\u{{{:x}}}", control as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
-/// Unescape `\n`, `\t`, `\\`, `\"` sequences inside a quoted KDL string.
-fn unescape_kdl(s: &str) -> String {
+fn unescape_kdl(s: &str) -> Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
                 Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
+                Some('u') => {
+                    if chars.next() != Some('{') {
+                        anyhow::bail!("unicode escape must use \\u{{hex}} syntax");
+                    }
+                    let mut hex = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') if !hex.is_empty() => break,
+                            Some(digit) if digit.is_ascii_hexdigit() && hex.len() < 6 => {
+                                hex.push(digit);
+                            }
+                            _ => anyhow::bail!("invalid unicode escape"),
+                        }
+                    }
+                    let value = u32::from_str_radix(&hex, 16).context("invalid unicode escape")?;
+                    out.push(
+                        char::from_u32(value)
+                            .ok_or_else(|| anyhow::anyhow!("invalid Unicode scalar value"))?,
+                    );
                 }
-                None => out.push('\\'),
+                Some(other) => anyhow::bail!("unsupported escape \\{other}"),
+                None => anyhow::bail!("trailing backslash in quoted string"),
             }
         } else {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1160,111 @@ playlist "special" {
     }
 
     #[test]
+    fn duplicate_paths_and_metadata_converge_after_parse_and_persist() {
+        let source = r#"
+playlist "legacy" {
+    path "same.jpg"
+    path "same.jpg"
+    tag "same.jpg" " calm "
+    tag "same.jpg" "calm"
+}
+"#;
+        let parsed = parse_playlists(source).unwrap();
+        let playlist = parsed.get("legacy").unwrap();
+        assert_eq!(playlist.paths, ["same.jpg"]);
+        assert_eq!(playlist.tags["same.jpg"], ["calm"]);
+
+        let serialized = serialize_playlists(&parsed);
+        assert_eq!(
+            serialized
+                .lines()
+                .filter(|line| line.trim() == "path \"same.jpg\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            serialized
+                .lines()
+                .filter(|line| line.trim() == "tag \"same.jpg\" \"calm\"")
+                .count(),
+            1
+        );
+        let reparsed = parse_playlists(&serialized).unwrap();
+        assert_eq!(reparsed.get("legacy").unwrap().paths, ["same.jpg"]);
+        assert_eq!(reparsed.get("legacy").unwrap().tags["same.jpg"], ["calm"]);
+    }
+
+    #[test]
+    fn strict_parser_rejects_incomplete_or_invalid_files() {
+        let cases = [
+            (
+                "playlist \"open\" {\n    path \"a.jpg\"\n",
+                "unclosed playlist 'open' block",
+            ),
+            (
+                "playlist \"bad\" {\n    mystery true\n}\n",
+                "unknown playlist node 'mystery'",
+            ),
+            (
+                "playlist \"bad\" {\n    shuffle perhaps\n}\n",
+                "boolean must be true or false",
+            ),
+            (
+                "active \"missing\"\n",
+                "active playlist 'missing' does not exist",
+            ),
+            (
+                "playlist \"bad\" {\n    rating \"missing.jpg\" 4\n}\n",
+                "path 'missing.jpg' not in playlist 'bad'",
+            ),
+            ("playlist \"   \" {\n}\n", "playlist name must not be blank"),
+            (
+                "playlist \"bad\" {\n    path \"   \"\n}\n",
+                "playlist path must not be blank",
+            ),
+            (
+                "playlist \"bad\" {\n    path \"a.jpg\"\n    rating \"a.jpg\" 6\n}\n",
+                "rating must be between 0 and 5",
+            ),
+            (
+                "playlist \"bad\" {\n    path \"a.jpg\"\n    frequency \"a.jpg\" 0\n}\n",
+                "frequency must be at least 1",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_playlists(source).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn serialization_escapes_control_characters() {
+        let name = "odd\nname";
+        let path = "C:\\wallpapers\\odd\t\"name\"\u{7}.jpg";
+        let mut store = PlaylistStore::default();
+        store.create(name).unwrap();
+        store.add_path(name, path).unwrap();
+        store
+            .set_tags(name, path, vec!["line\rbreak".to_string()])
+            .unwrap();
+        store.activate(name).unwrap();
+
+        let serialized = serialize_playlists(&store);
+        assert!(!serialized.contains('\u{7}'));
+        let reparsed = parse_playlists(&serialized).unwrap();
+        assert_eq!(reparsed.active.as_deref(), Some(name));
+        assert_eq!(reparsed.get(name).unwrap().paths, vec![path]);
+        assert_eq!(
+            reparsed.get(name).unwrap().tags.get(path).unwrap(),
+            &vec!["line\rbreak".to_string()]
+        );
+    }
+
+    #[test]
     fn test_serialize_parse_identity() {
         let store = parse_playlists(SAMPLE).expect("parse");
         let kdl = serialize_playlists(&store);
@@ -997,6 +1283,7 @@ playlist "special" {
         let mut store = PlaylistStore::default();
         store.create("test").unwrap();
         store.add_path("test", "foo.jpg").unwrap();
+        store.add_path("test", "foo.jpg").unwrap();
         store.add_path("test", "bar.jpg").unwrap();
         assert_eq!(store.get("test").unwrap().paths.len(), 2);
         store.remove_path("test", "foo.jpg").unwrap();
@@ -1008,6 +1295,9 @@ playlist "special" {
         let mut store = PlaylistStore::default();
         store.create("alpha").unwrap();
         store.create("beta").unwrap();
+        store.set_shuffle("alpha", true).unwrap();
+        assert!(store.get("alpha").unwrap().shuffle);
+        assert!(store.set_shuffle("missing", true).is_err());
         store.activate("alpha").unwrap();
         assert_eq!(store.active, Some("alpha".to_string()));
         store.deactivate();
@@ -1023,6 +1313,46 @@ playlist "special" {
         let mut store = PlaylistStore::default();
         store.create("x").unwrap();
         assert!(store.create("x").is_err());
+    }
+
+    #[test]
+    fn store_rejects_invalid_values_and_deduplicates_trimmed_tags() {
+        let mut store = PlaylistStore::default();
+        assert!(store.create(" \t").is_err());
+        store.create("valid").unwrap();
+        assert!(store.add_path("valid", " \t").is_err());
+        store.add_path("valid", "photo.jpg").unwrap();
+        assert!(store.set_rating("valid", "photo.jpg", 6).is_err());
+        assert!(store.set_frequency("valid", "photo.jpg", 0).is_err());
+        store
+            .set_tags(
+                "valid",
+                "photo.jpg",
+                vec![" calm ".into(), "calm".into(), " blue ".into()],
+            )
+            .unwrap();
+
+        let playlist = store.get("valid").unwrap();
+        assert!(!playlist.ratings.contains_key("photo.jpg"));
+        assert!(!playlist.frequencies.contains_key("photo.jpg"));
+        assert_eq!(playlist.tags["photo.jpg"], ["calm", "blue"]);
+    }
+
+    #[test]
+    fn set_tag_group_rejects_blank_kind_without_mutating_general_tags() {
+        let mut store = PlaylistStore::default();
+        store.create("valid").unwrap();
+        store.add_path("valid", "photo.jpg").unwrap();
+
+        let error = store
+            .set_tag_group("valid", "photo.jpg", " \t", vec!["calm".into()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("tag kind must not be blank"));
+        let playlist = store.get("valid").unwrap();
+        assert!(!playlist.tags.contains_key("photo.jpg"));
+        assert!(playlist.custom_tags.is_empty());
     }
 
     #[test]
@@ -1067,15 +1397,64 @@ playlist "special" {
         let mut cursor = HashMap::new();
         let mut recent = VecDeque::new();
         let first = store
-            .pick_from_roots(&roots, &mut cursor, 0, &recent)
+            .pick_from_roots(&roots, &mut cursor, 0, &recent, &HashSet::new())
             .unwrap();
         assert_eq!(first, root_a.path().join("first.jpg"));
 
         recent.push_back(first);
         let second = store
-            .pick_from_roots(&roots, &mut cursor, 1, &recent)
+            .pick_from_roots(&roots, &mut cursor, 1, &recent, &HashSet::new())
             .unwrap();
         assert_eq!(second, root_b.path().join("second.jpg"));
+    }
+
+    #[test]
+    fn active_playlist_skips_banned_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let banned = root.path().join("banned.jpg");
+        let allowed = root.path().join("allowed.jpg");
+        std::fs::write(&banned, b"banned").unwrap();
+        std::fs::write(&allowed, b"allowed").unwrap();
+
+        let mut store = PlaylistStore::default();
+        store.create("filtered").unwrap();
+        store.add_path("filtered", "banned.jpg").unwrap();
+        store.add_path("filtered", "allowed.jpg").unwrap();
+        store.activate("filtered").unwrap();
+
+        assert_eq!(
+            store.pick_from_roots(
+                &[root.path()],
+                &mut HashMap::new(),
+                0,
+                &VecDeque::new(),
+                &HashSet::from([banned]),
+            ),
+            Some(allowed)
+        );
+    }
+
+    #[test]
+    fn active_playlist_returns_none_when_every_path_is_banned() {
+        let root = tempfile::tempdir().unwrap();
+        let banned = root.path().join("banned.jpg");
+        std::fs::write(&banned, b"banned").unwrap();
+
+        let mut store = PlaylistStore::default();
+        store.create("filtered").unwrap();
+        store.add_path("filtered", "banned.jpg").unwrap();
+        store.activate("filtered").unwrap();
+
+        assert_eq!(
+            store.pick_from_roots(
+                &[root.path()],
+                &mut HashMap::new(),
+                0,
+                &VecDeque::new(),
+                &HashSet::from([banned]),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1175,6 +1554,16 @@ playlist "focus" {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("playlists.kdl");
 
+        let invalid = PlaylistStore {
+            playlists: vec![Playlist {
+                name: " ".to_string(),
+                ..Playlist::default()
+            }],
+            active: None,
+        };
+        assert!(persist_playlists(&invalid, &path).is_err());
+        assert!(!path.exists());
+
         let mut store = PlaylistStore::default();
         store.create("x").unwrap();
         store.add_path("x", "photo.jpg").unwrap();
@@ -1189,5 +1578,48 @@ playlist "focus" {
         let loaded = load_playlists(&path).unwrap();
         assert_eq!(loaded.playlists.len(), 2);
         assert_eq!(loaded.active, Some("x".to_string()));
+    }
+
+    #[test]
+    fn persist_rejects_duplicate_playlist_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicates.kdl");
+        let playlist = Playlist {
+            name: "same".to_string(),
+            ..Playlist::default()
+        };
+        let store = PlaylistStore {
+            playlists: vec![playlist.clone(), playlist],
+            active: None,
+        };
+
+        let error = format!("{:#}", persist_playlists(&store, &path).unwrap_err());
+
+        assert!(error.contains("duplicate playlist 'same'"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn persist_rejects_blank_custom_tag_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blank-custom-kind.kdl");
+        let mut playlist = Playlist {
+            name: "valid".to_string(),
+            paths: vec!["photo.jpg".to_string()],
+            ..Playlist::default()
+        };
+        playlist.custom_tags.insert(
+            " \t".to_string(),
+            HashMap::from([("photo.jpg".to_string(), vec!["calm".to_string()])]),
+        );
+        let store = PlaylistStore {
+            playlists: vec![playlist],
+            active: None,
+        };
+
+        let error = format!("{:#}", persist_playlists(&store, &path).unwrap_err());
+
+        assert!(error.contains("tag kind must not be blank"));
+        assert!(!path.exists());
     }
 }

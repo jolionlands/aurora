@@ -1,12 +1,18 @@
 use std::path::PathBuf;
 
+pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "ico",
+];
+
+/// Upper bound for a configured wallpaper transition.
+pub const MAX_TRANSITION_DURATION_MS: u32 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub sources: Vec<SourceConfig>,
     pub schedule: ScheduleConfig,
     pub monitors: Vec<MonitorOverride>,
     pub transitions: TransitionConfig,
-    pub triggers: TriggerConfig,
     pub metrics: MetricsConfig,
     pub cache: CacheConfig,
     pub log_level: String,
@@ -19,7 +25,6 @@ impl Default for Config {
             schedule: ScheduleConfig::default(),
             monitors: Vec::new(),
             transitions: TransitionConfig::default(),
-            triggers: TriggerConfig::default(),
             metrics: MetricsConfig::default(),
             cache: CacheConfig::default(),
             log_level: "info".to_string(),
@@ -41,16 +46,10 @@ impl Default for SourceConfig {
         Self {
             path: PathBuf::new(),
             recursive: true,
-            extensions: vec![
-                "jpg".to_string(),
-                "jpeg".to_string(),
-                "png".to_string(),
-                "webp".to_string(),
-                "avif".to_string(),
-                "tiff".to_string(),
-                "bmp".to_string(),
-                "heic".to_string(),
-            ],
+            extensions: DEFAULT_IMAGE_EXTENSIONS
+                .iter()
+                .map(|extension| (*extension).to_string())
+                .collect(),
             min_width: 1280,
             min_height: 720,
         }
@@ -86,7 +85,6 @@ impl Default for ScheduleConfig {
 pub struct MonitorOverride {
     pub name: String,
     pub fit: String,
-    pub tint: String,
 }
 
 impl Default for MonitorOverride {
@@ -94,7 +92,6 @@ impl Default for MonitorOverride {
         Self {
             name: String::new(),
             fit: "fill".to_string(),
-            tint: "none".to_string(),
         }
     }
 }
@@ -118,12 +115,6 @@ impl Default for TransitionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct TriggerConfig {
-    pub on_startup: Vec<String>,
-    pub on_wiri_workspace: Vec<(i32, String)>,
-}
-
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
     pub enabled: bool,
@@ -142,14 +133,15 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub decoded_mb: u32,
-    pub prefetch_count: usize,
+    /// Deprecated compatibility field; parsed and warned about, never applied.
+    pub deprecated_prefetch_count: Option<usize>,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             decoded_mb: 256,
-            prefetch_count: 3,
+            deprecated_prefetch_count: None,
         }
     }
 }

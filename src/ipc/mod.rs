@@ -1,14 +1,73 @@
 pub mod messages;
 pub mod server;
 
-pub use messages::{IpcError, IpcEvent, IpcMessage};
+pub use messages::{IpcEvent, IpcMessage};
 pub use server::IpcServer;
 
-/// Named pipe path used by both daemon and ctl.
-pub const PIPE_PATH: &str = r"\\.\pipe\aurora";
+fn current_session_id() -> anyhow::Result<u32> {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    let mut session_id = 0;
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id)? };
+    Ok(session_id)
+}
+
+/// Named pipe path used by the daemon and ctl in the current Windows session.
+pub fn pipe_path() -> anyhow::Result<String> {
+    Ok(pipe_path_for_session(current_session_id()?))
+}
+
+fn pipe_path_for_session(session_id: u32) -> String {
+    format!(r"\\.\pipe\aurora-{session_id}")
+}
+
+/// Held for the daemon lifetime so a brief gap between pipe instances cannot
+/// admit a second daemon in the same Windows session.
+pub struct SingletonGuard(windows::Win32::Foundation::HANDLE);
+
+impl SingletonGuard {
+    pub fn acquire() -> anyhow::Result<Self> {
+        acquire_named_singleton(&format!(r"Local\Aurora-{}", current_session_id()?))
+    }
+}
+
+fn acquire_named_singleton(name: &str) -> anyhow::Result<SingletonGuard> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
+    };
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr()))? };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        anyhow::bail!("another Aurora instance is already running in this Windows session");
+    }
+    Ok(SingletonGuard(handle))
+}
+
+impl Drop for SingletonGuard {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 /// Maximum JSON payload in one IPC frame.
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+
+/// Bound frame setup and writes so a peer cannot hold an IPC task forever.
+pub const FRAME_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Commands such as source reloads may legitimately take much longer than frame I/O.
+pub const COMMAND_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Read one length-prefixed IPC frame. A clean EOF before the header is
 /// returned as `Ok(None)`; partial/truncated frames are errors.
@@ -41,6 +100,24 @@ where
     Ok(Some(payload))
 }
 
+/// Read a complete frame under one deadline, including its header and payload.
+pub async fn read_frame_with_timeout<R>(
+    reader: &mut R,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    tokio::time::timeout(timeout, read_frame(reader))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out reading IPC frame after {} ms",
+                timeout.as_millis()
+            )
+        })?
+}
+
 /// Write one length-prefixed IPC frame.
 pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Result<()>
 where
@@ -58,18 +135,38 @@ where
     Ok(())
 }
 
+/// Write and flush a complete frame under one deadline.
+pub async fn write_frame_with_timeout<W>(
+    writer: &mut W,
+    payload: &[u8],
+    timeout: std::time::Duration,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, write_frame(writer, payload))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out writing IPC frame after {} ms",
+                timeout.as_millis()
+            )
+        })?
+}
+
 /// Send a single `IpcMessage` to a running aurora daemon and return the
 /// raw JSON response bytes.  Used by `aurora-ctl`.
 pub async fn send_message(msg: &IpcMessage) -> anyhow::Result<Vec<u8>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
+    let path = pipe_path()?;
     let mut client = ClientOptions::new()
-        .open(PIPE_PATH)
-        .map_err(|e| anyhow::anyhow!("Cannot connect to aurora daemon at {}: {}", PIPE_PATH, e))?;
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("Cannot connect to aurora daemon at {}: {}", path, e))?;
 
     let bytes = serde_json::to_vec(msg)?;
-    write_frame(&mut client, &bytes).await?;
-    read_frame(&mut client)
+    write_frame_with_timeout(&mut client, &bytes, FRAME_IO_TIMEOUT).await?;
+    read_frame_with_timeout(&mut client, COMMAND_RESPONSE_TIMEOUT)
         .await?
         .ok_or_else(|| anyhow::anyhow!("aurora daemon closed IPC pipe without a response"))
 }
@@ -78,6 +175,20 @@ pub async fn send_message(msg: &IpcMessage) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn pipe_name_is_scoped_to_session() {
+        assert_eq!(pipe_path_for_session(0), r"\\.\pipe\aurora-0");
+        assert_eq!(pipe_path_for_session(42), r"\\.\pipe\aurora-42");
+        assert_ne!(pipe_path_for_session(1), pipe_path_for_session(2));
+    }
+
+    #[test]
+    fn singleton_rejects_a_second_owner() {
+        let name = format!(r"Local\Aurora-test-{}", std::process::id());
+        let _owner = acquire_named_singleton(&name).expect("acquire singleton");
+        assert!(acquire_named_singleton(&name).is_err());
+    }
 
     #[tokio::test]
     async fn frame_roundtrip_handles_short_reads() {
@@ -103,5 +214,38 @@ mod tests {
             .unwrap();
         drop(tx);
         assert!(read_frame(&mut rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn frame_deadline_covers_stalled_header_and_write() {
+        let (mut tx, mut rx) = tokio::io::duplex(8);
+        tx.write_all(&[1]).await.unwrap();
+        let read_error = read_frame_with_timeout(&mut rx, std::time::Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(read_error
+            .to_string()
+            .contains("timed out reading IPC frame"));
+
+        let (mut tx, _rx) = tokio::io::duplex(1);
+        let write_error =
+            write_frame_with_timeout(&mut tx, &[0; 64], std::time::Duration::from_millis(10))
+                .await
+                .unwrap_err();
+        assert!(write_error
+            .to_string()
+            .contains("timed out writing IPC frame"));
+    }
+
+    #[tokio::test]
+    async fn timed_frame_read_reports_truncated_header_without_waiting_for_deadline() {
+        let (mut tx, mut rx) = tokio::io::duplex(8);
+        tx.write_all(&[1, 0]).await.unwrap();
+        drop(tx);
+
+        let error = read_frame_with_timeout(&mut rx, std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated IPC frame header"));
     }
 }
