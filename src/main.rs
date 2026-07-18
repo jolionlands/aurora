@@ -309,9 +309,7 @@ fn apply_once(path: &Path) -> Result<()> {
             .with_context(|| format!("read config {}", config_path.display()))?,
     )
     .with_context(|| format!("parse config {}", config_path.display()))?;
-    let result = WallpaperApplier::new()?.apply_all(&config, path)?;
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    WallpaperApplier::new()?.apply_all(&config, path)
 }
 
 fn init_logging(default_filter: &str) -> Result<()> {

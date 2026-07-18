@@ -1,19 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use tracing::warn;
-use windows::core::PCWSTR;
+use windows::core::{Owned, PCWSTR};
 use windows::Win32::Foundation::ERROR_MORE_DATA;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ, REG_VALUE_TYPE,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_READ, KEY_WRITE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
-const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-
 pub struct StartupManager {
-    app_name: String,
     exe_path: PathBuf,
 }
 
@@ -21,10 +17,7 @@ impl Default for StartupManager {
     fn default() -> Self {
         let exe_path = std::env::current_exe().unwrap_or_default();
 
-        Self {
-            app_name: "aurora".to_string(),
-            exe_path,
-        }
+        Self { exe_path }
     }
 }
 
@@ -41,112 +34,46 @@ impl StartupManager {
 
     fn get_registered_command(&self) -> Option<Vec<u16>> {
         unsafe {
-            let mut hkey: HKEY = HKEY::default();
-            let key_path: Vec<u16> = OsStr::new(RUN_KEY_PATH)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let result = RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR::from_raw(key_path.as_ptr()),
-                0,
-                KEY_READ,
-                &mut hkey,
-            );
-
-            if result.is_err() {
-                return None;
-            }
-
-            let value_name: Vec<u16> = OsStr::new(&self.app_name)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
+            let hkey = open_run_key(KEY_READ).ok()?;
+            let value_name = windows::core::w!("aurora");
 
             let mut value_type = REG_VALUE_TYPE::default();
             let mut data_size = 0;
             let size_result = RegQueryValueExW(
-                hkey,
-                PCWSTR::from_raw(value_name.as_ptr()),
+                *hkey,
+                value_name,
                 None,
                 Some(&mut value_type),
                 None,
                 Some(&mut data_size),
             );
 
-            let command = if size_result.is_ok() && value_type == REG_SZ {
-                read_registry_string(hkey, &value_name, data_size)
+            if size_result.is_ok() && value_type == REG_SZ {
+                read_registry_string(*hkey, value_name, data_size)
             } else {
                 None
-            };
-
-            if let Err(e) = RegCloseKey(hkey).ok() {
-                warn!(
-                    "StartupManager::get_registered_path: RegCloseKey failed: {:?}",
-                    e
-                );
             }
-
-            command
         }
     }
 
     pub fn register(&self) -> Result<()> {
         unsafe {
-            let mut hkey: HKEY = HKEY::default();
-            let key_path: Vec<u16> = OsStr::new(RUN_KEY_PATH)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let result = RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR::from_raw(key_path.as_ptr()),
-                0,
-                KEY_WRITE,
-                &mut hkey,
-            );
-            if result.is_err() {
-                return Err(anyhow::anyhow!(
-                    "Failed to open Run registry key: {:?}",
-                    result
-                ));
-            }
-
-            let value_name: Vec<u16> = OsStr::new(&self.app_name)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
+            let hkey = open_run_key(KEY_WRITE).context("open Windows Run key")?;
             let path_bytes: Vec<u8> = quoted_executable_command(self.exe_path.as_os_str())
                 .into_iter()
                 .chain(std::iter::once(0))
                 .flat_map(|c| c.to_le_bytes())
                 .collect();
 
-            let result = RegSetValueExW(
-                hkey,
-                PCWSTR::from_raw(value_name.as_ptr()),
+            RegSetValueExW(
+                *hkey,
+                windows::core::w!("aurora"),
                 0,
                 REG_SZ,
                 Some(&path_bytes),
-            );
-            if result.is_err() {
-                let _ = RegCloseKey(hkey);
-                return Err(anyhow::anyhow!(
-                    "Failed to set registry value: {:?}",
-                    result
-                ));
-            }
-
-            let result = RegCloseKey(hkey);
-            if result.is_err() {
-                return Err(anyhow::anyhow!(
-                    "Failed to close registry key: {:?}",
-                    result
-                ));
-            }
+            )
+            .ok()
+            .context("set Aurora Windows Run value")?;
         }
 
         Ok(())
@@ -154,50 +81,28 @@ impl StartupManager {
 
     pub fn unregister(&self) -> Result<()> {
         unsafe {
-            let mut hkey: HKEY = HKEY::default();
-            let key_path: Vec<u16> = OsStr::new(RUN_KEY_PATH)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let result = RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR::from_raw(key_path.as_ptr()),
-                0,
-                KEY_WRITE,
-                &mut hkey,
-            );
-            if result.is_err() {
-                return Err(anyhow::anyhow!(
-                    "Failed to open Run registry key: {:?}",
-                    result
-                ));
-            }
-
-            let value_name: Vec<u16> = OsStr::new(&self.app_name)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let result = RegDeleteValueW(hkey, PCWSTR::from_raw(value_name.as_ptr()));
-            if result.is_err() {
-                let _ = RegCloseKey(hkey);
-                return Err(anyhow::anyhow!(
-                    "Failed to delete registry value: {:?}",
-                    result
-                ));
-            }
-
-            let result = RegCloseKey(hkey);
-            if result.is_err() {
-                return Err(anyhow::anyhow!(
-                    "Failed to close registry key: {:?}",
-                    result
-                ));
-            }
+            let hkey = open_run_key(KEY_WRITE).context("open Windows Run key")?;
+            RegDeleteValueW(*hkey, windows::core::w!("aurora"))
+                .ok()
+                .context("delete Aurora Windows Run value")?;
         }
 
         Ok(())
+    }
+}
+
+fn open_run_key(access: REG_SAM_FLAGS) -> windows::core::Result<Owned<HKEY>> {
+    let mut hkey = HKEY::default();
+    unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            0,
+            access,
+            &mut hkey,
+        )
+        .ok()?;
+        Ok(Owned::new(hkey))
     }
 }
 
@@ -214,7 +119,7 @@ fn registration_matches(command: &[u16], path: &OsStr) -> bool {
 
 unsafe fn read_registry_string(
     hkey: HKEY,
-    value_name: &[u16],
+    value_name: PCWSTR,
     mut data_size: u32,
 ) -> Option<Vec<u16>> {
     loop {
@@ -223,7 +128,7 @@ unsafe fn read_registry_string(
         let mut value_type = REG_VALUE_TYPE::default();
         let result = RegQueryValueExW(
             hkey,
-            PCWSTR::from_raw(value_name.as_ptr()),
+            value_name,
             None,
             Some(&mut value_type),
             Some(data.as_mut_ptr()),

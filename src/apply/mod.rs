@@ -29,13 +29,6 @@ pub struct MonitorInfo {
     pub height: u32,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct DirectApplyResult {
-    pub successful_monitors: Vec<String>,
-    pub failures: Vec<String>,
-    pub total_monitors: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
     Fill,
@@ -194,7 +187,7 @@ impl WallpaperApplier {
         }
     }
 
-    pub fn apply_all(&self, config: &Config, path: &Path) -> Result<DirectApplyResult> {
+    pub fn apply_all(&self, config: &Config, path: &Path) -> Result<()> {
         if let Some(first) = config.monitors.first() {
             let fit = WallpaperFit::parse(&first.fit);
             if config
@@ -209,12 +202,7 @@ impl WallpaperApplier {
             }
             self.set_fit(fit)?;
         }
-        self.set_for_all_monitors(path)?;
-        Ok(DirectApplyResult {
-            successful_monitors: vec!["all".to_string()],
-            failures: Vec::new(),
-            total_monitors: 1,
-        })
+        self.set_for_all_monitors(path)
     }
 }
 

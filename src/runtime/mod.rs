@@ -15,7 +15,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::apply::{configured_global_fit, DirectApplyResult, WallpaperApplier};
+use crate::apply::{configured_global_fit, WallpaperApplier};
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
@@ -165,7 +165,7 @@ fn needs_transition_decode(enabled: bool, has_previous: bool) -> bool {
     enabled && has_previous
 }
 
-fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
+fn apply_direct_in_child(path: &Path) -> Result<()> {
     use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
@@ -173,7 +173,7 @@ fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
         .arg("--apply-once")
         .arg(path)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW.0);
     let child = command.spawn().context("start wallpaper apply helper")?;
@@ -184,7 +184,7 @@ fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    serde_json::from_slice(&output.stdout).context("parse wallpaper apply helper output")
+    Ok(())
 }
 
 fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
@@ -567,17 +567,12 @@ impl Runtime {
         }
 
         let (successful_monitors, failures, total_monitors) = if !self.config.transitions.enabled {
-            let result = self
-                .ban_gate
+            self.ban_gate
                 .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path))?
                 .ok_or_else(|| {
                     anyhow::anyhow!("wallpaper was banned during swap: {}", new_path.display())
                 })?;
-            (
-                result.successful_monitors,
-                result.failures,
-                result.total_monitors,
-            )
+            (vec!["all".to_string()], Vec::new(), 1)
         } else {
             let monitors = self.applier.list_monitors().context("listing monitors")?;
             if monitors.is_empty() {
