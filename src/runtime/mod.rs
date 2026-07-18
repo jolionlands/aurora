@@ -116,17 +116,17 @@ impl BanGate {
     }
 }
 
-struct ScanComApartment {
+pub struct ComApartment {
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl ScanComApartment {
-    fn initialize() -> Result<Self> {
+impl ComApartment {
+    pub fn initialize() -> Result<Self> {
         use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
         let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         if result.is_err() {
-            anyhow::bail!("initialize COM for photo scan: {result:?}");
+            anyhow::bail!("CoInitializeEx failed: {result:?}");
         }
         Ok(Self {
             _not_send: std::marker::PhantomData,
@@ -134,7 +134,7 @@ impl ScanComApartment {
     }
 }
 
-impl Drop for ScanComApartment {
+impl Drop for ComApartment {
     fn drop(&mut self) {
         unsafe { windows::Win32::System::Com::CoUninitialize() };
     }
@@ -407,11 +407,6 @@ impl Runtime {
             "decode cache capacity: {} entries (~{} MB budget)",
             cache_capacity, config.cache.decoded_mb
         );
-        if let Some(count) = config.cache.deprecated_prefetch_count {
-            warn!(
-                "cache prefetch-count ({count}) is deprecated and ignored; remove it from config"
-            );
-        }
         let cache = SharedDecodeCache::with_byte_budget(
             cache_capacity,
             configured_cache_bytes,
@@ -1029,7 +1024,7 @@ impl RuntimeHandle {
         let mut new_index = if config.sources.is_empty() {
             PhotoIndex::default()
         } else {
-            let _com = ScanComApartment::initialize()?;
+            let _com = ComApartment::initialize()?;
             PhotoIndex::scan_sources(&config.sources)
                 .context("scanning photo sources during reload")?
         };
@@ -1069,7 +1064,7 @@ impl RuntimeHandle {
             .collect();
 
         let mut new_index = {
-            let _com = ScanComApartment::initialize()?;
+            let _com = ComApartment::initialize()?;
             PhotoIndex::scan(std::slice::from_ref(&path), &extensions, true)
                 .with_context(|| format!("set_folder: scan {:?}", path))?
         };
@@ -1395,10 +1390,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_com_apartment_balances_on_a_fresh_thread() {
+    fn com_apartment_balances_on_a_fresh_thread() {
         std::thread::spawn(|| {
             for _ in 0..2 {
-                let guard = ScanComApartment::initialize().unwrap();
+                let guard = ComApartment::initialize().unwrap();
                 drop(guard);
             }
         })

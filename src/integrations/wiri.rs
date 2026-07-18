@@ -36,20 +36,9 @@ pub async fn subscribe_wiri_events(swap_tx: mpsc::Sender<SwapRequest>) -> Result
 }
 
 async fn try_connect_and_subscribe(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        connect_windows(swap_tx).await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // On non-Windows, we simply wait indefinitely (no wiri)
-        let _ = swap_tx;
-        futures::future::pending::<()>().await;
-        Ok(())
-    }
+    connect_windows(swap_tx).await
 }
 
-#[cfg(target_os = "windows")]
 async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ClientOptions;
@@ -152,7 +141,6 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn verify_server_session(pipe: &tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;

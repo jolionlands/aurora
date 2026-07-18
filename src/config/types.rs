@@ -133,15 +133,10 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub decoded_mb: u32,
-    /// Deprecated compatibility field; parsed and warned about, never applied.
-    pub deprecated_prefetch_count: Option<usize>,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self {
-            decoded_mb: 256,
-            deprecated_prefetch_count: None,
-        }
+        Self { decoded_mb: 256 }
     }
 }

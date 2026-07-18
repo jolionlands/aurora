@@ -169,14 +169,13 @@ fn should_fire_at(
 }
 
 pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
-    let parts: Vec<&str> = s.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        bail!("invalid at_time format '{}': expected HH:MM", s);
-    }
-    let h: u32 = parts[0]
+    let (hour, minute) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid at_time format '{}': expected HH:MM", s))?;
+    let h: u32 = hour
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid hour in '{}'", s))?;
-    let m: u32 = parts[1]
+    let m: u32 = minute
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid minute in '{}'", s))?;
     if h > 23 {
@@ -199,68 +198,54 @@ fn local_hour_minute() -> (u32, u32) {
 
 /// Returns true if the foreground window covers an entire monitor.
 fn is_fullscreen_active() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-        };
-        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
 
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.is_invalid() {
-                return false;
-            }
-
-            let mut win_rect = RECT::default();
-            if GetWindowRect(hwnd, &mut win_rect).is_err() {
-                return false;
-            }
-
-            let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
-                return false;
-            }
-
-            let mr = mi.rcMonitor;
-            win_rect.left == mr.left
-                && win_rect.top == mr.top
-                && win_rect.right == mr.right
-                && win_rect.bottom == mr.bottom
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
         }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
+
+        let mut win_rect = RECT::default();
+        if GetWindowRect(hwnd, &mut win_rect).is_err() {
+            return false;
+        }
+
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return false;
+        }
+
+        let mr = mi.rcMonitor;
+        win_rect.left == mr.left
+            && win_rect.top == mr.top
+            && win_rect.right == mr.right
+            && win_rect.bottom == mr.bottom
     }
 }
 
 /// Returns how many seconds the system has been idle (no keyboard/mouse input).
 fn get_idle_secs() -> u64 {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::SystemInformation::GetTickCount;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
-        unsafe {
-            let mut lii = LASTINPUTINFO {
-                cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-                dwTime: 0,
-            };
-            if !GetLastInputInfo(&mut lii).as_bool() {
-                return 0;
-            }
-            idle_millis(GetTickCount(), lii.dwTime) as u64 / 1000
+    unsafe {
+        let mut lii = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !GetLastInputInfo(&mut lii).as_bool() {
+            return 0;
         }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        0
+        idle_millis(GetTickCount(), lii.dwTime) as u64 / 1000
     }
 }
 

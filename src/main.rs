@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -17,7 +17,7 @@ use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
 use aurora::metrics::{serve_metrics, Metrics};
 use aurora::playlist::default_playlists_path;
-use aurora::runtime::{Runtime, RuntimeHandle, RuntimeStateSnapshot};
+use aurora::runtime::{ComApartment, Runtime, RuntimeHandle, RuntimeStateSnapshot};
 use aurora::scheduler::Scheduler;
 
 /// Bundled default configuration — written to disk on first run.
@@ -195,14 +195,14 @@ async fn main() -> Result<()> {
     ipc.set_shutdown_sender(shutdown_tx);
 
     let ipc_server = Arc::clone(&ipc);
-    let mut ipc_task = tokio::spawn(async move { ipc_server.run().await });
+    let ipc_task = tokio::spawn(async move { ipc_server.run().await });
 
     info!("aurora ready. IPC pipe: {}", aurora::ipc::pipe_path()?);
 
     // ---------------------------------------------------------------------------
     // 8. Start scheduler
     // ---------------------------------------------------------------------------
-    let mut scheduler_task = tokio::spawn({
+    let scheduler_task = tokio::spawn({
         let s = Arc::clone(&scheduler);
         async move {
             s.run().await;
@@ -237,68 +237,13 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     // Runtime owns apartment-bound COM interfaces, so poll it on the root
     // thread where COM was initialized rather than on a Tokio worker.
-    let exit = wait_for_core_exit(
+    wait_for_core_exit(
         runtime.run(swap_rx, snap_state, pause_arc),
         shutdown_rx,
-        &mut ipc_task,
-        &mut scheduler_task,
+        ipc_task,
+        scheduler_task,
     )
-    .await;
-
-    let (ipc_done, scheduler_done, fatal) = match exit {
-        CoreExit::Shutdown(Ok(())) => {
-            info!("Shutdown signal received — exiting");
-            (false, false, None)
-        }
-        CoreExit::Shutdown(Err(e)) => (
-            false,
-            false,
-            Some(anyhow::anyhow!("shutdown channel closed unexpectedly: {e}")),
-        ),
-        CoreExit::Runtime => (
-            false,
-            false,
-            Some(anyhow::anyhow!("runtime exited unexpectedly")),
-        ),
-        CoreExit::Ipc(Ok(Ok(()))) => (
-            true,
-            false,
-            Some(anyhow::anyhow!("IPC server exited unexpectedly")),
-        ),
-        CoreExit::Ipc(Ok(Err(e))) => (
-            true,
-            false,
-            Some(anyhow::anyhow!("IPC server failed: {e:#}")),
-        ),
-        CoreExit::Ipc(Err(e)) => (
-            true,
-            false,
-            Some(anyhow::anyhow!("IPC server task failed: {e}")),
-        ),
-        CoreExit::Scheduler(Ok(())) => (
-            false,
-            true,
-            Some(anyhow::anyhow!("scheduler exited unexpectedly")),
-        ),
-        CoreExit::Scheduler(Err(e)) => (
-            false,
-            true,
-            Some(anyhow::anyhow!("scheduler task failed: {e}")),
-        ),
-    };
-
-    if !ipc_done {
-        abort_and_join(&mut ipc_task).await;
-    }
-    if !scheduler_done {
-        abort_and_join(&mut scheduler_task).await;
-    }
-
-    if let Some(error) = fatal {
-        return Err(error);
-    }
-
-    Ok(())
+    .await
 }
 
 fn apply_once(path: &Path) -> Result<()> {
@@ -328,25 +273,47 @@ fn init_logging(default_filter: &str) -> Result<()> {
         .context("initialize logging")
 }
 
-enum CoreExit {
-    Shutdown(std::result::Result<(), oneshot::error::RecvError>),
-    Runtime,
-    Ipc(std::result::Result<Result<()>, JoinError>),
-    Scheduler(std::result::Result<(), JoinError>),
-}
-
 async fn wait_for_core_exit(
     runtime: impl Future<Output = ()>,
     mut shutdown_rx: oneshot::Receiver<()>,
-    ipc_task: &mut JoinHandle<Result<()>>,
-    scheduler_task: &mut JoinHandle<()>,
-) -> CoreExit {
+    mut ipc_task: JoinHandle<Result<()>>,
+    mut scheduler_task: JoinHandle<()>,
+) -> Result<()> {
     tokio::pin!(runtime);
     tokio::select! {
-        result = &mut shutdown_rx => CoreExit::Shutdown(result),
-        _ = &mut runtime => CoreExit::Runtime,
-        result = &mut *ipc_task => CoreExit::Ipc(result),
-        result = &mut *scheduler_task => CoreExit::Scheduler(result),
+        result = &mut shutdown_rx => {
+            abort_and_join(&mut ipc_task).await;
+            abort_and_join(&mut scheduler_task).await;
+            match result {
+                Ok(()) => {
+                    info!("Shutdown signal received — exiting");
+                    Ok(())
+                }
+                Err(error) => Err(anyhow::anyhow!(
+                    "shutdown channel closed unexpectedly: {error}"
+                )),
+            }
+        }
+        _ = &mut runtime => {
+            abort_and_join(&mut ipc_task).await;
+            abort_and_join(&mut scheduler_task).await;
+            Err(anyhow::anyhow!("runtime exited unexpectedly"))
+        }
+        result = &mut ipc_task => {
+            abort_and_join(&mut scheduler_task).await;
+            match result {
+                Ok(Ok(())) => Err(anyhow::anyhow!("IPC server exited unexpectedly")),
+                Ok(Err(error)) => Err(anyhow::anyhow!("IPC server failed: {error:#}")),
+                Err(error) => Err(anyhow::anyhow!("IPC server task failed: {error}")),
+            }
+        }
+        result = &mut scheduler_task => {
+            abort_and_join(&mut ipc_task).await;
+            match result {
+                Ok(()) => Err(anyhow::anyhow!("scheduler exited unexpectedly")),
+                Err(error) => Err(anyhow::anyhow!("scheduler task failed: {error}")),
+            }
+        }
     }
 }
 
@@ -355,27 +322,6 @@ async fn abort_and_join<T>(task: &mut JoinHandle<T>) {
     let _ = task.await;
 }
 
-struct ComApartment;
-
-impl ComApartment {
-    fn initialize() -> Result<Self> {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if hr.is_err() {
-            return Err(anyhow::anyhow!("CoInitializeEx failed: {:?}", hr));
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn enable_dpi_awareness() {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -385,9 +331,6 @@ fn enable_dpi_awareness() {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
-#[cfg(not(target_os = "windows"))]
-fn enable_dpi_awareness() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,59 +338,75 @@ mod tests {
     #[tokio::test]
     async fn ipc_exit_wakes_supervisor() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let mut ipc_task = tokio::spawn(async { Err(anyhow::anyhow!("pipe failed")) });
-        let mut scheduler_task = tokio::spawn(std::future::pending::<()>());
+        let ipc_task = tokio::spawn(async { Err(anyhow::anyhow!("pipe failed")) });
+        let scheduler_task = tokio::spawn(std::future::pending::<()>());
 
-        let exit = wait_for_core_exit(
+        let error = wait_for_core_exit(
             std::future::pending(),
             shutdown_rx,
-            &mut ipc_task,
-            &mut scheduler_task,
+            ipc_task,
+            scheduler_task,
         )
-        .await;
+        .await
+        .unwrap_err();
 
-        match exit {
-            CoreExit::Ipc(Ok(Err(error))) => assert_eq!(error.to_string(), "pipe failed"),
-            _ => panic!("IPC exit was not selected"),
-        }
-        abort_and_join(&mut scheduler_task).await;
+        assert_eq!(error.to_string(), "IPC server failed: pipe failed");
     }
 
     #[tokio::test]
     async fn scheduler_exit_wakes_supervisor() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let mut ipc_task = tokio::spawn(async {
+        let ipc_task = tokio::spawn(async {
             std::future::pending::<()>().await;
             Ok(())
         });
-        let mut scheduler_task = tokio::spawn(async {});
+        let scheduler_task = tokio::spawn(async {});
 
-        let exit = wait_for_core_exit(
+        let error = wait_for_core_exit(
             std::future::pending(),
             shutdown_rx,
-            &mut ipc_task,
-            &mut scheduler_task,
+            ipc_task,
+            scheduler_task,
         )
-        .await;
+        .await
+        .unwrap_err();
 
-        assert!(matches!(exit, CoreExit::Scheduler(Ok(()))));
-        abort_and_join(&mut ipc_task).await;
+        assert_eq!(error.to_string(), "scheduler exited unexpectedly");
     }
 
     #[tokio::test]
     async fn runtime_exit_wakes_supervisor() {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let mut ipc_task = tokio::spawn(async {
+        let ipc_task = tokio::spawn(async {
             std::future::pending::<()>().await;
             Ok(())
         });
-        let mut scheduler_task = tokio::spawn(std::future::pending::<()>());
+        let scheduler_task = tokio::spawn(std::future::pending::<()>());
 
-        let exit =
-            wait_for_core_exit(async {}, shutdown_rx, &mut ipc_task, &mut scheduler_task).await;
+        let error = wait_for_core_exit(async {}, shutdown_rx, ipc_task, scheduler_task)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(exit, CoreExit::Runtime));
-        abort_and_join(&mut ipc_task).await;
-        abort_and_join(&mut scheduler_task).await;
+        assert_eq!(error.to_string(), "runtime exited unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_exits_cleanly() {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let ipc_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let scheduler_task = tokio::spawn(std::future::pending::<()>());
+        shutdown_tx.send(()).unwrap();
+
+        wait_for_core_exit(
+            std::future::pending(),
+            shutdown_rx,
+            ipc_task,
+            scheduler_task,
+        )
+        .await
+        .unwrap();
     }
 }

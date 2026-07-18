@@ -529,7 +529,7 @@ fn apply_kv(
         "cache" => match key {
             "decoded-mb" | "decoded_mb" => config.cache.decoded_mb = parse_u32(value)?,
             "prefetch-count" | "prefetch_count" => {
-                config.cache.deprecated_prefetch_count = Some(parse_usize(value)?);
+                parse_usize(value)?;
             }
             _ => bail!("unknown key {:?} in cache", key),
         },
@@ -580,7 +580,6 @@ mod tests {
         );
         assert_eq!(cfg.schedule.mode, "interval");
         assert!(!cfg.transitions.enabled);
-        assert!(cfg.cache.deprecated_prefetch_count.is_none());
         tracing_subscriber::EnvFilter::try_new(&cfg.log_level)
             .expect("default log-level must be a valid filter");
 
@@ -637,9 +636,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_deprecated_prefetch_but_rejects_dead_config() {
-        let config = parse_kdl_config("cache {\nprefetch-count 2\n}").unwrap();
-        assert_eq!(config.cache.deprecated_prefetch_count, Some(2));
+    fn accepts_deprecated_prefetch_but_rejects_other_dead_config() {
+        parse_kdl_config("cache {\nprefetch-count 2\n}").unwrap();
 
         for input in [
             "monitor {\ntint \"none\"\n}",
