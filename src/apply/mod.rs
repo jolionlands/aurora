@@ -98,6 +98,7 @@ impl WallpaperApplier {
                     .GetMonitorDevicePathAt(i)
                     .with_context(|| format!("GetMonitorDevicePathAt({})", i))?
             };
+            let rect = unsafe { self.desktop.GetMonitorRECT(PCWSTR::from_raw(pwstr.0)) };
             // PWSTR::to_string() returns Result<String, FromUtf16Error>
             let id = unsafe {
                 let id = pwstr
@@ -106,12 +107,7 @@ impl WallpaperApplier {
                 CoTaskMemFree(Some(pwstr.0.cast()));
                 id
             };
-            let monitor_wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0u16)).collect();
-            let rect = unsafe {
-                self.desktop
-                    .GetMonitorRECT(PCWSTR::from_raw(monitor_wide.as_ptr()))
-                    .with_context(|| format!("GetMonitorRECT({})", id))?
-            };
+            let rect = rect.with_context(|| format!("GetMonitorRECT({})", id))?;
             let width = rect.right.saturating_sub(rect.left);
             let height = rect.bottom.saturating_sub(rect.top);
             if width <= 0 || height <= 0 {

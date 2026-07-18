@@ -1,8 +1,15 @@
 pub use crate::decode::DecodedImage;
 use anyhow::Result;
+use windows::Win32::UI::WindowsAndMessaging::{
+    WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+};
 
 pub mod cpu;
 pub mod gpu;
+
+pub(crate) fn transition_window_ex_style() -> WINDOW_EX_STYLE {
+    WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT
+}
 
 // ---------------------------------------------------------------------------
 // Shared types

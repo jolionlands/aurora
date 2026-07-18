@@ -10,21 +10,18 @@
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
-use super::{scale_to_cover, Rect, TransitionStyle};
+use super::{scale_to_cover, transition_window_ex_style, Rect, TransitionStyle};
 use crate::decode::DecodedImage;
 
 // Frame target: 60 fps ≈ 16.67 ms per frame
 const FRAME_INTERVAL_MS: u64 = 17;
 
-#[cfg(target_os = "windows")]
 fn last_win32_error(operation: &str) -> anyhow::Error {
     anyhow::anyhow!("{operation}: {}", windows::core::Error::from_win32())
 }
 
-#[cfg(target_os = "windows")]
 struct TransitionWindow(Option<windows::Win32::Foundation::HWND>);
 
-#[cfg(target_os = "windows")]
 impl TransitionWindow {
     fn new(hwnd: windows::Win32::Foundation::HWND) -> Self {
         Self(Some(hwnd))
@@ -49,7 +46,6 @@ impl TransitionWindow {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for TransitionWindow {
     fn drop(&mut self) {
         if let Err(error) = self.destroy() {
@@ -58,10 +54,8 @@ impl Drop for TransitionWindow {
     }
 }
 
-#[cfg(target_os = "windows")]
 struct ScreenDc(Option<windows::Win32::Graphics::Gdi::HDC>);
 
-#[cfg(target_os = "windows")]
 impl ScreenDc {
     fn acquire() -> Result<Self> {
         let dc = unsafe { windows::Win32::Graphics::Gdi::GetDC(None) };
@@ -92,7 +86,6 @@ impl ScreenDc {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for ScreenDc {
     fn drop(&mut self) {
         if let Err(error) = self.release() {
@@ -101,14 +94,12 @@ impl Drop for ScreenDc {
     }
 }
 
-#[cfg(target_os = "windows")]
 struct MemorySurface {
     dc: Option<windows::Win32::Graphics::Gdi::HDC>,
     bitmap: Option<windows::Win32::Graphics::Gdi::HBITMAP>,
     original: Option<windows::Win32::Graphics::Gdi::HGDIOBJ>,
 }
 
-#[cfg(target_os = "windows")]
 impl MemorySurface {
     fn create(
         screen_dc: windows::Win32::Graphics::Gdi::HDC,
@@ -216,7 +207,6 @@ impl MemorySurface {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for MemorySurface {
     fn drop(&mut self) {
         if let Err(error) = self.cleanup() {
@@ -225,40 +215,11 @@ impl Drop for MemorySurface {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn transition_window_ex_style() -> windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    };
-
-    WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT
-}
-
-#[cfg(target_os = "windows")]
 fn stretch_dibits_failed(scan_lines: i32) -> bool {
     scan_lines == 0 || scan_lines == windows::Win32::Graphics::Gdi::GDI_ERROR
 }
 
 pub fn run_transition(
-    monitor_bounds: Rect,
-    old: &DecodedImage,
-    new: &DecodedImage,
-    style: &TransitionStyle,
-    duration_ms: u32,
-) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        run_windows(monitor_bounds, old, new, style, duration_ms)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (monitor_bounds, old, new, style, duration_ms);
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn run_windows(
     monitor_bounds: Rect,
     old: &DecodedImage,
     new: &DecodedImage,
@@ -466,7 +427,6 @@ fn run_windows(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 unsafe extern "system" fn transition_wnd_proc(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
@@ -488,17 +448,6 @@ fn blend_frame(
     n_pixels: usize,
 ) {
     match style {
-        TransitionStyle::Crossfade => {
-            let alpha_new = progress;
-            let alpha_old = 1.0 - progress;
-            for i in 0..n_pixels {
-                let base = i * 4;
-                out[base] = blend_u8(old[base], new[base], alpha_old, alpha_new);
-                out[base + 1] = blend_u8(old[base + 1], new[base + 1], alpha_old, alpha_new);
-                out[base + 2] = blend_u8(old[base + 2], new[base + 2], alpha_old, alpha_new);
-                out[base + 3] = 255;
-            }
-        }
         TransitionStyle::Dissolve => {
             // Each pixel transitions from old → new when progress > mask[pixel]
             for (i, mask) in dissolve_mask.iter().enumerate().take(n_pixels) {
@@ -512,7 +461,7 @@ fn blend_frame(
                 out[base + 3] = 255;
             }
         }
-        // For any other style (shouldn't reach here in v1), fall back to crossfade
+        // The CPU backend approximates every other style with a crossfade.
         _ => {
             let alpha_new = progress;
             let alpha_old = 1.0 - progress;
@@ -556,6 +505,27 @@ mod tests {
         assert!(style.contains(WS_EX_LAYERED));
         assert!(style.contains(WS_EX_NOACTIVATE));
         assert!(style.contains(WS_EX_TRANSPARENT));
+    }
+
+    #[test]
+    fn unsupported_style_uses_crossfade() {
+        let render = |style| {
+            let mut out = [0; 4];
+            blend_frame(
+                &mut out,
+                &[0, 50, 100, 255],
+                &[100, 150, 200, 255],
+                &[],
+                &style,
+                0.25,
+                1,
+            );
+            out
+        };
+        assert_eq!(
+            render(TransitionStyle::SlideLeft),
+            render(TransitionStyle::Crossfade)
+        );
     }
 
     #[test]

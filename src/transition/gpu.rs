@@ -10,15 +10,13 @@
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
-use super::{scale_to_cover, Rect, TransitionStyle};
+use super::{scale_to_cover, transition_window_ex_style, Rect, TransitionStyle};
 use crate::decode::DecodedImage;
 
 const FRAME_INTERVAL_MS: u64 = 17; // ~60 fps
 
-#[cfg(target_os = "windows")]
 struct TransitionWindow(windows::Win32::Foundation::HWND);
 
-#[cfg(target_os = "windows")]
 impl Drop for TransitionWindow {
     fn drop(&mut self) {
         unsafe {
@@ -27,16 +25,6 @@ impl Drop for TransitionWindow {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn transition_window_ex_style() -> windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    };
-
-    WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT
-}
-
-#[cfg(target_os = "windows")]
 unsafe fn initialize_layered_overlay(hwnd: windows::Win32::Foundation::HWND) -> Result<()> {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::UI::WindowsAndMessaging::{SetLayeredWindowAttributes, LWA_ALPHA};
@@ -47,43 +35,18 @@ unsafe fn initialize_layered_overlay(hwnd: windows::Win32::Foundation::HWND) -> 
 
 /// Returns true if GPU (Direct2D) is likely available on this system.
 pub fn is_available() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // Attempt to create a D2D factory as a probe.
-        use windows::Win32::Graphics::Direct2D::{
-            D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-        };
-        unsafe {
-            let result: Result<ID2D1Factory, _> =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None);
-            result.is_ok()
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
-}
-pub fn run_transition(
-    monitor_bounds: Rect,
-    old: &DecodedImage,
-    new: &DecodedImage,
-    style: &TransitionStyle,
-    duration_ms: u32,
-) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        run_d2d(monitor_bounds, old, new, style, duration_ms)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (monitor_bounds, old, new, style, duration_ms);
-        Ok(())
+    // Attempt to create a D2D factory as a probe.
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    };
+    unsafe {
+        let result: Result<ID2D1Factory, _> =
+            D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None);
+        result.is_ok()
     }
 }
 
-#[cfg(target_os = "windows")]
-fn run_d2d(
+pub fn run_transition(
     monitor_bounds: Rect,
     old: &DecodedImage,
     new: &DecodedImage,
@@ -508,7 +471,6 @@ fn run_d2d(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 unsafe extern "system" fn d2d_wnd_proc(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
