@@ -756,22 +756,7 @@ fn playlist_summary_json(playlist: &Playlist, active: Option<&str>) -> serde_jso
 
 fn playlist_item_json(playlist: &Playlist, path: &str) -> serde_json::Value {
     let mut tag_groups = serde_json::Map::new();
-    for (kind, group) in [
-        ("general", &playlist.tags),
-        ("theme", &playlist.themes),
-        ("content", &playlist.content),
-        ("color", &playlist.colors),
-        ("source", &playlist.sources),
-        ("medium", &playlist.media),
-        ("safety", &playlist.safety),
-        ("franchise", &playlist.franchises),
-        ("character", &playlist.characters),
-    ] {
-        if let Some(tags) = group.get(path).filter(|tags| !tags.is_empty()) {
-            tag_groups.insert(kind.to_string(), serde_json::json!(tags));
-        }
-    }
-    for (kind, group) in &playlist.custom_tags {
+    for (kind, group) in &playlist.tag_groups {
         if let Some(tags) = group.get(path).filter(|tags| !tags.is_empty()) {
             tag_groups.insert(kind.clone(), serde_json::json!(tags));
         }
@@ -814,22 +799,11 @@ fn playlist_path_has_autotag_metadata(store: &PlaylistStore, name: &str, path: &
     let Some(playlist) = store.get(name) else {
         return false;
     };
-    let groups = [
-        &playlist.tags,
-        &playlist.themes,
-        &playlist.content,
-        &playlist.colors,
-        &playlist.sources,
-        &playlist.media,
-        &playlist.safety,
-        &playlist.franchises,
-        &playlist.characters,
-    ];
     playlist.ratings.contains_key(path)
         || playlist.frequencies.contains_key(path)
-        || groups
-            .into_iter()
-            .chain(playlist.custom_tags.values())
+        || playlist
+            .tag_groups
+            .values()
             .any(|group| group.get(path).is_some_and(|tags| !tags.is_empty()))
 }
 
@@ -1908,8 +1882,8 @@ mod tests {
         let current = store.lock();
         let playlist = current.get("legacy").unwrap();
         assert_eq!(playlist.paths, ["photo.jpg"]);
-        assert_eq!(playlist.themes["photo.jpg"], ["night"]);
-        assert_eq!(playlist.content["photo.jpg"], ["city"]);
+        assert_eq!(playlist.tag_groups["theme"]["photo.jpg"], ["night"]);
+        assert_eq!(playlist.tag_groups["content"]["photo.jpg"], ["city"]);
         assert_eq!(playlist.ratings["photo.jpg"], 4);
         assert_eq!(playlist.frequencies["photo.jpg"], 2);
         drop(current);
@@ -2029,10 +2003,10 @@ mod tests {
         let persisted = load_playlists(&playlists_path).unwrap();
         let playlist = persisted.get("auto").unwrap();
         assert_eq!(playlist.paths, ["photo.jpg"]);
-        assert_eq!(playlist.themes["photo.jpg"], ["sunrise"]);
-        assert!(!playlist.characters.contains_key("photo.jpg"));
-        assert!(!playlist.custom_tags.contains_key("artist"));
-        assert!(!playlist.custom_tags.contains_key("unused"));
+        assert_eq!(playlist.tag_groups["theme"]["photo.jpg"], ["sunrise"]);
+        assert!(!playlist.tag_groups.contains_key("character"));
+        assert!(!playlist.tag_groups.contains_key("artist"));
+        assert!(!playlist.tag_groups.contains_key("unused"));
         assert!(!playlist.ratings.contains_key("photo.jpg"));
         assert!(!playlist.frequencies.contains_key("photo.jpg"));
     }
@@ -2067,7 +2041,7 @@ mod tests {
         assert!(error.contains("no tags, rating, or frequency"), "{error}");
         let playlist = store.lock();
         let playlist = playlist.get("auto").unwrap();
-        assert_eq!(playlist.themes["photo.jpg"], ["night"]);
+        assert_eq!(playlist.tag_groups["theme"]["photo.jpg"], ["night"]);
         assert_eq!(playlist.ratings["photo.jpg"], 4);
         assert!(!playlists_path.exists());
     }

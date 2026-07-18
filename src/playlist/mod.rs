@@ -22,7 +22,7 @@
 /// at pick time; non-existent files are silently skipped.
 use anyhow::{Context, Result};
 use rand::Rng;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -35,26 +35,8 @@ pub struct Playlist {
     pub shuffle: bool,
     /// Paths as stored in the KDL (may be relative or absolute).
     pub paths: Vec<String>,
-    /// Per-path tags. Keys match entries in `paths` exactly as stored.
-    pub tags: HashMap<String, Vec<String>>,
-    /// Theme/style tags, e.g. cyberpunk, nature, minimal, vaporwave.
-    pub themes: HashMap<String, Vec<String>>,
-    /// Content/subject tags, e.g. mountain, city, character, abstract.
-    pub content: HashMap<String, Vec<String>>,
-    /// Color/palette tags, e.g. blue, neon, monochrome, warm.
-    pub colors: HashMap<String, Vec<String>>,
-    /// Source/collection tags, e.g. wallhaven, generated, camera-roll.
-    pub sources: HashMap<String, Vec<String>>,
-    /// Medium/type tags, e.g. anime, real-photo, illustration, screenshot.
-    pub media: HashMap<String, Vec<String>>,
-    /// Safety tags, e.g. sfw, nsfw, lewd.
-    pub safety: HashMap<String, Vec<String>>,
-    /// Franchise/fandom tags, e.g. naruto, persona, one-piece.
-    pub franchises: HashMap<String, Vec<String>>,
-    /// Character tags, e.g. naruto-uzumaki, hatsune-miku.
-    pub characters: HashMap<String, Vec<String>>,
-    /// Future/custom tag groups. Outer key is the group name, inner key is path.
-    pub custom_tags: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Tag kind → stored path → tags, including built-in and custom groups.
+    pub tag_groups: BTreeMap<String, HashMap<String, Vec<String>>>,
     /// Per-path star ratings, 0-5. Higher ratings are picked more often.
     pub ratings: HashMap<String, u8>,
     /// Per-path positive frequency weights.
@@ -98,20 +80,7 @@ impl PlaylistStore {
         }
         self.playlists.push(Playlist {
             name: name.to_string(),
-            shuffle: false,
-            paths: Vec::new(),
-            tags: HashMap::new(),
-            themes: HashMap::new(),
-            content: HashMap::new(),
-            colors: HashMap::new(),
-            sources: HashMap::new(),
-            media: HashMap::new(),
-            safety: HashMap::new(),
-            franchises: HashMap::new(),
-            characters: HashMap::new(),
-            custom_tags: HashMap::new(),
-            ratings: HashMap::new(),
-            frequencies: HashMap::new(),
+            ..Playlist::default()
         });
         Ok(())
     }
@@ -552,32 +521,25 @@ pub fn serialize_playlists(store: &PlaylistStore) -> String {
             out.push_str(&format!("    path \"{}\"\n", escape_kdl(path)));
         }
         for path in paths {
-            if let Some(tags) = pl.tags.get(path) {
-                for tag in tags {
-                    out.push_str(&format!(
-                        "    tag \"{}\" \"{}\"\n",
-                        escape_kdl(path),
-                        escape_kdl(tag)
-                    ));
-                }
-            }
-            write_tag_lines(&mut out, "theme", path, pl.themes.get(path));
-            write_tag_lines(&mut out, "content", path, pl.content.get(path));
-            write_tag_lines(&mut out, "color", path, pl.colors.get(path));
-            write_tag_lines(&mut out, "source", path, pl.sources.get(path));
-            write_tag_lines(&mut out, "medium", path, pl.media.get(path));
-            write_tag_lines(&mut out, "safety", path, pl.safety.get(path));
-            write_tag_lines(&mut out, "franchise", path, pl.franchises.get(path));
-            write_tag_lines(&mut out, "character", path, pl.characters.get(path));
-            for (kind, group) in &pl.custom_tags {
-                if let Some(tags) = group.get(path) {
-                    for tag in tags {
-                        out.push_str(&format!(
-                            "    facet \"{}\" \"{}\" \"{}\"\n",
-                            escape_kdl(path),
-                            escape_kdl(kind),
-                            escape_kdl(tag)
-                        ));
+            for (kind, group) in &pl.tag_groups {
+                let Some(tags) = group.get(path) else {
+                    continue;
+                };
+                match kind.as_str() {
+                    "general" => write_tag_lines(&mut out, "tag", path, Some(tags)),
+                    "theme" | "content" | "color" | "source" | "medium" | "safety"
+                    | "franchise" | "character" => {
+                        write_tag_lines(&mut out, kind, path, Some(tags));
+                    }
+                    _ => {
+                        for tag in tags {
+                            out.push_str(&format!(
+                                "    facet \"{}\" \"{}\" \"{}\"\n",
+                                escape_kdl(path),
+                                escape_kdl(kind),
+                                escape_kdl(tag)
+                            ));
+                        }
                     }
                 }
             }
@@ -768,23 +730,7 @@ fn validate_playlist(playlist: &Playlist) -> Result<()> {
     for path in &playlist.paths {
         validate_playlist_path(path)?;
     }
-    let maps = [
-        &playlist.tags,
-        &playlist.themes,
-        &playlist.content,
-        &playlist.colors,
-        &playlist.sources,
-        &playlist.media,
-        &playlist.safety,
-        &playlist.franchises,
-        &playlist.characters,
-    ];
-    for map in maps {
-        for path in map.keys() {
-            ensure_path_exists(playlist, path)?;
-        }
-    }
-    for (kind, map) in &playlist.custom_tags {
+    for (kind, map) in &playlist.tag_groups {
         validate_tag_kind(kind)?;
         for path in map.keys() {
             ensure_path_exists(playlist, path)?;
@@ -845,18 +791,7 @@ fn validate_tag_kind(kind: &str) -> Result<()> {
 
 fn normalize_playlist(playlist: &mut Playlist) {
     dedupe_strings(&mut playlist.paths);
-    let maps = [
-        &mut playlist.tags,
-        &mut playlist.themes,
-        &mut playlist.content,
-        &mut playlist.colors,
-        &mut playlist.sources,
-        &mut playlist.media,
-        &mut playlist.safety,
-        &mut playlist.franchises,
-        &mut playlist.characters,
-    ];
-    for map in maps.into_iter().chain(playlist.custom_tags.values_mut()) {
+    for map in playlist.tag_groups.values_mut() {
         for tags in map.values_mut() {
             dedupe_strings(tags);
         }
@@ -878,20 +813,7 @@ fn ensure_path_exists(pl: &Playlist, path: &str) -> Result<()> {
 }
 
 fn clear_playlist_path_metadata(pl: &mut Playlist, path: &str) {
-    for group in [
-        &mut pl.tags,
-        &mut pl.themes,
-        &mut pl.content,
-        &mut pl.colors,
-        &mut pl.sources,
-        &mut pl.media,
-        &mut pl.safety,
-        &mut pl.franchises,
-        &mut pl.characters,
-    ] {
-        group.remove(path);
-    }
-    pl.custom_tags.retain(|_, group| {
+    pl.tag_groups.retain(|_, group| {
         group.remove(path);
         !group.is_empty()
     });
@@ -935,64 +857,46 @@ fn normalize_custom_kind(kind: &str) -> String {
         .join("-")
 }
 
-fn group_map_mut<'a>(
-    pl: &'a mut Playlist,
-    kind: &str,
-) -> Result<&'a mut HashMap<String, Vec<String>>> {
-    match normalized_tag_kind(kind) {
-        Some("general") => Ok(&mut pl.tags),
-        Some("theme") => Ok(&mut pl.themes),
-        Some("content") => Ok(&mut pl.content),
-        Some("color") => Ok(&mut pl.colors),
-        Some("source") => Ok(&mut pl.sources),
-        Some("medium") => Ok(&mut pl.media),
-        Some("safety") => Ok(&mut pl.safety),
-        Some("franchise") => Ok(&mut pl.franchises),
-        Some("character") => Ok(&mut pl.characters),
-        _ => anyhow::bail!(
-            "unknown tag kind '{}'; expected general, theme, content, color, source, medium, safety, franchise, or character",
-            kind
-        ),
+fn canonical_tag_kind(kind: &str) -> Result<String> {
+    validate_tag_kind(kind)?;
+    if let Some(kind) = normalized_tag_kind(kind) {
+        return Ok(kind.to_string());
     }
+    let kind = normalize_custom_kind(kind);
+    if kind.is_empty() {
+        anyhow::bail!("empty tag kind");
+    }
+    Ok(kind)
 }
 
 fn set_group_map(pl: &mut Playlist, path: &str, kind: &str, tags: Vec<String>) -> Result<()> {
-    validate_tag_kind(kind)?;
-    let map = match group_map_mut(pl, kind) {
-        Ok(map) => map,
-        Err(_) => {
-            let custom_kind = normalize_custom_kind(kind);
-            if custom_kind.is_empty() {
-                anyhow::bail!("empty tag kind");
-            }
-            pl.custom_tags.entry(custom_kind).or_default()
-        }
-    };
+    let kind = canonical_tag_kind(kind)?;
     if tags.is_empty() {
-        map.remove(path);
+        if pl.tag_groups.get_mut(&kind).is_some_and(|map| {
+            map.remove(path);
+            map.is_empty()
+        }) {
+            pl.tag_groups.remove(&kind);
+        }
     } else {
-        map.insert(path.to_string(), tags);
+        pl.tag_groups
+            .entry(kind)
+            .or_default()
+            .insert(path.to_string(), tags);
     }
     Ok(())
 }
 
 fn push_group_tag(pl: &mut Playlist, path: &str, kind: &str, tag: &str) -> Result<()> {
-    validate_tag_kind(kind)?;
+    let kind = canonical_tag_kind(kind)?;
     let tag = tag.trim();
     if tag.is_empty() {
         return Ok(());
     }
-    let map = match group_map_mut(pl, kind) {
-        Ok(map) => map,
-        Err(_) => {
-            let custom_kind = normalize_custom_kind(kind);
-            if custom_kind.is_empty() {
-                anyhow::bail!("empty tag kind");
-            }
-            pl.custom_tags.entry(custom_kind).or_default()
-        }
-    };
-    map.entry(path.to_string())
+    pl.tag_groups
+        .entry(kind)
+        .or_default()
+        .entry(path.to_string())
         .or_default()
         .push(tag.to_string());
     Ok(())
@@ -1139,7 +1043,9 @@ playlist "special" {
         let pl = store.get("special").expect("playlist");
         assert_eq!(pl.paths, vec![r#"folder//wall\"paper.jpg"#.to_string()]);
         assert_eq!(
-            pl.tags.get(r#"folder//wall\"paper.jpg"#).unwrap(),
+            pl.tag_groups["general"]
+                .get(r#"folder//wall\"paper.jpg"#)
+                .unwrap(),
             &vec!["calm//blue".to_string()]
         );
     }
@@ -1157,7 +1063,7 @@ playlist "legacy" {
         let parsed = parse_playlists(source).unwrap();
         let playlist = parsed.get("legacy").unwrap();
         assert_eq!(playlist.paths, ["same.jpg"]);
-        assert_eq!(playlist.tags["same.jpg"], ["calm"]);
+        assert_eq!(playlist.tag_groups["general"]["same.jpg"], ["calm"]);
 
         let serialized = serialize_playlists(&parsed);
         assert_eq!(
@@ -1176,7 +1082,10 @@ playlist "legacy" {
         );
         let reparsed = parse_playlists(&serialized).unwrap();
         assert_eq!(reparsed.get("legacy").unwrap().paths, ["same.jpg"]);
-        assert_eq!(reparsed.get("legacy").unwrap().tags["same.jpg"], ["calm"]);
+        assert_eq!(
+            reparsed.get("legacy").unwrap().tag_groups["general"]["same.jpg"],
+            ["calm"]
+        );
     }
 
     #[test]
@@ -1244,7 +1153,9 @@ playlist "legacy" {
         assert_eq!(reparsed.active.as_deref(), Some(name));
         assert_eq!(reparsed.get(name).unwrap().paths, vec![path]);
         assert_eq!(
-            reparsed.get(name).unwrap().tags.get(path).unwrap(),
+            reparsed.get(name).unwrap().tag_groups["general"]
+                .get(path)
+                .unwrap(),
             &vec!["line\rbreak".to_string()]
         );
     }
@@ -1320,7 +1231,10 @@ playlist "legacy" {
         let playlist = store.get("valid").unwrap();
         assert!(!playlist.ratings.contains_key("photo.jpg"));
         assert!(!playlist.frequencies.contains_key("photo.jpg"));
-        assert_eq!(playlist.tags["photo.jpg"], ["calm", "blue"]);
+        assert_eq!(
+            playlist.tag_groups["general"]["photo.jpg"],
+            ["calm", "blue"]
+        );
     }
 
     #[test]
@@ -1336,8 +1250,7 @@ playlist "legacy" {
 
         assert!(error.contains("tag kind must not be blank"));
         let playlist = store.get("valid").unwrap();
-        assert!(!playlist.tags.contains_key("photo.jpg"));
-        assert!(playlist.custom_tags.is_empty());
+        assert!(playlist.tag_groups.is_empty());
     }
 
     #[test]
@@ -1473,34 +1386,43 @@ playlist "focus" {
         let store = parse_playlists(src).expect("parse");
         let pl = store.get("focus").expect("playlist");
         assert_eq!(
-            pl.tags.get("a.jpg").unwrap(),
+            pl.tag_groups["general"].get("a.jpg").unwrap(),
             &vec!["calm".to_string(), "blue".to_string()]
         );
         assert_eq!(
-            pl.themes.get("a.jpg").unwrap(),
+            pl.tag_groups["theme"].get("a.jpg").unwrap(),
             &vec!["minimal".to_string()]
         );
         assert_eq!(
-            pl.content.get("a.jpg").unwrap(),
+            pl.tag_groups["content"].get("a.jpg").unwrap(),
             &vec!["mountain".to_string()]
         );
-        assert_eq!(pl.colors.get("a.jpg").unwrap(), &vec!["cyan".to_string()]);
         assert_eq!(
-            pl.sources.get("a.jpg").unwrap(),
+            pl.tag_groups["color"].get("a.jpg").unwrap(),
+            &vec!["cyan".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["source"].get("a.jpg").unwrap(),
             &vec!["wallhaven".to_string()]
         );
-        assert_eq!(pl.media.get("a.jpg").unwrap(), &vec!["anime".to_string()]);
-        assert_eq!(pl.safety.get("a.jpg").unwrap(), &vec!["nsfw".to_string()]);
         assert_eq!(
-            pl.franchises.get("a.jpg").unwrap(),
+            pl.tag_groups["medium"].get("a.jpg").unwrap(),
+            &vec!["anime".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["safety"].get("a.jpg").unwrap(),
+            &vec!["nsfw".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["franchise"].get("a.jpg").unwrap(),
             &vec!["naruto".to_string()]
         );
         assert_eq!(
-            pl.characters.get("a.jpg").unwrap(),
+            pl.tag_groups["character"].get("a.jpg").unwrap(),
             &vec!["naruto-uzumaki".to_string()]
         );
         assert_eq!(
-            pl.custom_tags.get("artist").unwrap().get("a.jpg").unwrap(),
+            pl.tag_groups["artist"].get("a.jpg").unwrap(),
             &vec!["kishimoto".to_string()]
         );
         assert_eq!(pl.ratings.get("a.jpg"), Some(&4));
@@ -1509,32 +1431,41 @@ playlist "focus" {
         let serialized = serialize_playlists(&store);
         let reparsed = parse_playlists(&serialized).expect("reparse");
         let pl = reparsed.get("focus").expect("playlist");
-        assert_eq!(pl.tags.get("a.jpg").unwrap().len(), 2);
+        assert_eq!(pl.tag_groups["general"].get("a.jpg").unwrap().len(), 2);
         assert_eq!(
-            pl.themes.get("a.jpg").unwrap(),
+            pl.tag_groups["theme"].get("a.jpg").unwrap(),
             &vec!["minimal".to_string()]
         );
         assert_eq!(
-            pl.content.get("a.jpg").unwrap(),
+            pl.tag_groups["content"].get("a.jpg").unwrap(),
             &vec!["mountain".to_string()]
         );
-        assert_eq!(pl.colors.get("a.jpg").unwrap(), &vec!["cyan".to_string()]);
         assert_eq!(
-            pl.sources.get("a.jpg").unwrap(),
+            pl.tag_groups["color"].get("a.jpg").unwrap(),
+            &vec!["cyan".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["source"].get("a.jpg").unwrap(),
             &vec!["wallhaven".to_string()]
         );
-        assert_eq!(pl.media.get("a.jpg").unwrap(), &vec!["anime".to_string()]);
-        assert_eq!(pl.safety.get("a.jpg").unwrap(), &vec!["nsfw".to_string()]);
         assert_eq!(
-            pl.franchises.get("a.jpg").unwrap(),
+            pl.tag_groups["medium"].get("a.jpg").unwrap(),
+            &vec!["anime".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["safety"].get("a.jpg").unwrap(),
+            &vec!["nsfw".to_string()]
+        );
+        assert_eq!(
+            pl.tag_groups["franchise"].get("a.jpg").unwrap(),
             &vec!["naruto".to_string()]
         );
         assert_eq!(
-            pl.characters.get("a.jpg").unwrap(),
+            pl.tag_groups["character"].get("a.jpg").unwrap(),
             &vec!["naruto-uzumaki".to_string()]
         );
         assert_eq!(
-            pl.custom_tags.get("artist").unwrap().get("a.jpg").unwrap(),
+            pl.tag_groups["artist"].get("a.jpg").unwrap(),
             &vec!["kishimoto".to_string()]
         );
         assert_eq!(pl.ratings.get("a.jpg"), Some(&4));
@@ -1600,7 +1531,7 @@ playlist "focus" {
             paths: vec!["photo.jpg".to_string()],
             ..Playlist::default()
         };
-        playlist.custom_tags.insert(
+        playlist.tag_groups.insert(
             " \t".to_string(),
             HashMap::from([("photo.jpg".to_string(), vec!["calm".to_string()])]),
         );
