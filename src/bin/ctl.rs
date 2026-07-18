@@ -2037,69 +2037,59 @@ impl Drop for WinHttpHandle {
 }
 
 fn parse_http_url(url: &str, allow_http: bool) -> anyhow::Result<ParsedHttpUrl> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("model endpoint must be an https:// URL"))?;
-    let (secure, default_port) = if scheme.eq_ignore_ascii_case("https") {
-        (true, 443)
-    } else if scheme.eq_ignore_ascii_case("http") {
-        if !allow_http {
-            anyhow::bail!(
-                "plaintext HTTP is disabled; use HTTPS or pass --allow-http for a trusted endpoint"
-            );
-        }
-        (false, 80)
-    } else {
-        anyhow::bail!("unsupported model endpoint scheme {scheme:?}; use https://");
+    use windows::Win32::Networking::WinHttp::{
+        WinHttpCrackUrl, ICU_REJECT_USERPWD, URL_COMPONENTS, WINHTTP_INTERNET_SCHEME_HTTP,
+        WINHTTP_INTERNET_SCHEME_HTTPS,
     };
-    let split = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = &rest[..split];
-    let path = match rest.get(split..) {
-        Some(query) if query.starts_with('?') => format!("/{query}"),
-        Some(path) if !path.is_empty() => path.to_string(),
-        _ => "/".to_string(),
-    };
-    if authority.is_empty()
-        || authority
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '@' | '#' | '?' | '\\'))
-        || path
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '#' | '\\'))
+
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '#' | '\\'))
     {
         anyhow::bail!("invalid model endpoint URL");
     }
-    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
-        let end = ipv6
-            .find(']')
-            .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 model endpoint"))?;
-        let host = &ipv6[..end];
-        let suffix = &ipv6[end + 1..];
-        let port = if suffix.is_empty() {
-            default_port
-        } else {
-            suffix
-                .strip_prefix(':')
-                .ok_or_else(|| anyhow::anyhow!("invalid bracketed IPv6 model endpoint"))?
-                .parse::<u16>()?
-        };
-        (host.to_string(), port)
-    } else {
-        if authority.matches(':').count() > 1 {
-            anyhow::bail!("IPv6 model endpoints must use brackets");
-        }
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), port.parse::<u16>()?),
-            None => (authority.to_string(), default_port),
-        }
+
+    let wide: Vec<u16> = url.encode_utf16().collect();
+    let mut components = URL_COMPONENTS {
+        dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
+        dwSchemeLength: u32::MAX,
+        dwHostNameLength: u32::MAX,
+        dwUrlPathLength: u32::MAX,
+        ..Default::default()
     };
+    unsafe { WinHttpCrackUrl(&wide, ICU_REJECT_USERPWD.0, &mut components) }
+        .map_err(|error| anyhow::anyhow!("invalid model endpoint URL: {error}"))?;
+
+    let secure = match components.nScheme {
+        WINHTTP_INTERNET_SCHEME_HTTPS => true,
+        WINHTTP_INTERNET_SCHEME_HTTP if allow_http => false,
+        WINHTTP_INTERNET_SCHEME_HTTP => anyhow::bail!(
+            "plaintext HTTP is disabled; use HTTPS or pass --allow-http for a trusted endpoint"
+        ),
+        _ => anyhow::bail!("unsupported model endpoint scheme; use https://"),
+    };
+    let component = |ptr: windows::core::PWSTR, len: u32| -> anyhow::Result<String> {
+        let len = usize::try_from(len).context("model endpoint component is too long")?;
+        if ptr.is_null() || len == 0 {
+            return Ok(String::new());
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
+            .context("model endpoint is not valid UTF-16")
+    };
+    let host = component(components.lpszHostName, components.dwHostNameLength)?;
     if host.is_empty() {
         anyhow::bail!("model endpoint is missing a host");
+    }
+    let mut path = component(components.lpszUrlPath, components.dwUrlPathLength)?;
+    if path.is_empty() {
+        path.push('/');
+    } else if path.starts_with('?') {
+        path.insert(0, '/');
     }
     Ok(ParsedHttpUrl {
         secure,
         host,
-        port,
+        port: components.nPort,
         path,
     })
 }

@@ -244,21 +244,6 @@ impl PlaylistStore {
     // Picker
     // -----------------------------------------------------------------------
 
-    /// Pick an absolute path from the active playlist, resolving relative paths
-    /// against `source_root`.  Files that do not exist on disk are silently
-    /// skipped.  Returns `None` if the playlist is empty or all files are missing.
-    pub fn pick(
-        &self,
-        source_root: Option<&Path>,
-        // Sequential cursor: maps playlist_name -> next weighted slot. Updated in-place.
-        cursor: &mut HashMap<String, usize>,
-        recent_window: usize,
-        recent_paths: &VecDeque<PathBuf>,
-    ) -> Option<PathBuf> {
-        let roots: Vec<&Path> = source_root.into_iter().collect();
-        self.pick_from_roots(&roots, cursor, recent_window, recent_paths, &HashSet::new())
-    }
-
     /// Pick from a playlist, resolving relative paths against every configured
     /// source root until an existing file is found.
     pub fn pick_from_roots(
@@ -1372,9 +1357,16 @@ playlist "legacy" {
 
         let mut cursor = HashMap::new();
         let recent = VecDeque::new();
-        let p1 = store.pick(None, &mut cursor, 0, &recent).unwrap();
-        let p2 = store.pick(None, &mut cursor, 0, &recent).unwrap();
-        let p3 = store.pick(None, &mut cursor, 0, &recent).unwrap(); // wraps back to first
+        let excluded = HashSet::new();
+        let p1 = store
+            .pick_from_roots(&[], &mut cursor, 0, &recent, &excluded)
+            .unwrap();
+        let p2 = store
+            .pick_from_roots(&[], &mut cursor, 0, &recent, &excluded)
+            .unwrap();
+        let p3 = store
+            .pick_from_roots(&[], &mut cursor, 0, &recent, &excluded)
+            .unwrap(); // wraps back to first
         assert_ne!(p1, p2);
         assert_eq!(p1, p3);
     }

@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     }
 
     if args.register_autostart {
-        let mgr = StartupManager::new();
+        let mgr = StartupManager::default();
         match mgr.register() {
             Ok(()) => {
                 info!(
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     }
 
     if args.unregister_autostart {
-        let mgr = StartupManager::new();
+        let mgr = StartupManager::default();
         match mgr.unregister() {
             Ok(()) => {
                 info!("autostart: removed aurora from Windows Run key");
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
 
     // Log autostart status.
     {
-        let mgr = StartupManager::new();
+        let mgr = StartupManager::default();
         if mgr.is_registered() {
             info!(
                 "autostart: registered (path: {})",

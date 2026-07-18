@@ -2281,7 +2281,6 @@ mod tests {
             hash: normalized.clone(),
             banned: false,
         });
-        index.by_hash.insert(normalized, 0);
         assert_eq!(index.apply_bans(&loaded), 1);
         assert!(index.photos[0].banned);
     }
@@ -2300,8 +2299,6 @@ mod tests {
             hash: hash.clone(),
             banned: false,
         });
-        index.by_hash.insert(hash.clone(), 0);
-
         let (tx, mut rx) = mpsc::channel(1);
         let handle = RuntimeHandle::new(
             tx,
@@ -2355,8 +2352,6 @@ mod tests {
             Arc::clone(&playlists),
             directory.path().join("playlists.kdl"),
         );
-        assert!(!index.read().by_hash.contains_key(&hash));
-
         handle.ban(&hash).unwrap();
 
         assert_eq!(

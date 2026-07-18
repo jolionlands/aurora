@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::config::types::SourceConfig;
@@ -22,8 +22,6 @@ pub struct PhotoEntry {
 #[derive(Debug, Default)]
 pub struct PhotoIndex {
     pub photos: Vec<PhotoEntry>,
-    /// hash → index into `photos`
-    pub by_hash: HashMap<String, usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -274,11 +272,8 @@ fn collect_files(
 
         match build_entry(&path, &meta, min_dimensions.0, min_dimensions.1) {
             Ok(Some(photo)) => {
-                let hash = photo.hash.clone();
-                let idx = index.photos.len();
                 index.photos.push(photo);
                 admitted_files.insert(canonical_file);
-                index.by_hash.entry(hash).or_insert(idx);
             }
             Ok(None) => {}
             Err(e) => {

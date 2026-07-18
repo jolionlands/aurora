@@ -173,12 +173,6 @@ fn escape_label_value(value: &str) -> String {
     escaped
 }
 
-impl Default for Metrics {
-    fn default() -> Self {
-        Arc::try_unwrap(Self::new()).unwrap_or_else(|_| panic!("arc unwrap failed"))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------

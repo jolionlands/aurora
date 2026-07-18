@@ -17,8 +17,8 @@ pub struct StartupManager {
     exe_path: PathBuf,
 }
 
-impl StartupManager {
-    pub fn new() -> Self {
+impl Default for StartupManager {
+    fn default() -> Self {
         let exe_path = std::env::current_exe().unwrap_or_default();
 
         Self {
@@ -26,7 +26,9 @@ impl StartupManager {
             exe_path,
         }
     }
+}
 
+impl StartupManager {
     pub fn is_registered(&self) -> bool {
         self.get_registered_command()
             .is_some_and(|command| registration_matches(&command, self.exe_path.as_os_str()))
@@ -196,12 +198,6 @@ impl StartupManager {
         }
 
         Ok(())
-    }
-}
-
-impl Default for StartupManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
