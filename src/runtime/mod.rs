@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -176,7 +176,18 @@ fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW.0);
-    let mut child = command.spawn().context("start wallpaper apply helper")?;
+    let child = command.spawn().context("start wallpaper apply helper")?;
+    let output = wait_for_apply_child(child, DIRECT_APPLY_TIMEOUT)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "wallpaper apply helper failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse wallpaper apply helper output")
+}
+
+fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
     let started = Instant::now();
 
     loop {
@@ -185,24 +196,16 @@ fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
             .context("poll wallpaper apply helper")?
             .is_some()
         {
-            let output = child
+            return child
                 .wait_with_output()
-                .context("collect wallpaper apply helper output")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "wallpaper apply helper failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            return serde_json::from_slice(&output.stdout)
-                .context("parse wallpaper apply helper output");
+                .context("collect wallpaper apply helper output");
         }
-        if started.elapsed() >= DIRECT_APPLY_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!(
-                "wallpaper apply timed out after {} seconds",
-                DIRECT_APPLY_TIMEOUT.as_secs()
+                "wallpaper apply timed out after {} milliseconds",
+                timeout.as_millis()
             );
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -2542,6 +2545,35 @@ mod tests {
         assert!(!needs_transition_decode(false, true));
         assert!(!needs_transition_decode(true, false));
         assert!(needs_transition_decode(true, true));
+    }
+
+    #[test]
+    fn hung_apply_helper_is_killed_at_timeout() {
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 5",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW.0);
+
+        let error = wait_for_apply_child(
+            command.spawn().expect("start timeout test helper"),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out after 50 milliseconds"));
     }
 
     // -----------------------------------------------------------------------
