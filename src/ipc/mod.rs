@@ -128,8 +128,7 @@ where
     if payload.len() > MAX_FRAME_SIZE {
         anyhow::bail!("IPC frame exceeds {} byte limit", MAX_FRAME_SIZE);
     }
-    let len = (payload.len() as u32).to_le_bytes();
-    writer.write_all(&len).await?;
+    writer.write_u32_le(payload.len() as u32).await?;
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())

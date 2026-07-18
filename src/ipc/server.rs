@@ -285,21 +285,9 @@ impl IpcServer {
                 serde_json::json!({ "success": false, "error": "quit requires an IPC connection" })
             }
 
-            IpcMessage::Next => {
-                let h = runtime!();
-                match h.skip_next() {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            IpcMessage::Next => command_response(runtime!().skip_next()),
 
-            IpcMessage::Prev => {
-                let h = runtime!();
-                match h.prev() {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            IpcMessage::Prev => command_response(runtime!().prev()),
 
             IpcMessage::Pause { duration_secs } => {
                 let h = runtime!();
@@ -317,31 +305,18 @@ impl IpcServer {
             }
 
             IpcMessage::Set { path } => {
-                let h = runtime!();
-                match h.set_specific(std::path::PathBuf::from(path)) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().set_specific(std::path::PathBuf::from(path)))
             }
 
             IpcMessage::SetFolder { path } => {
                 if let Some(handle) = self.runtime.lock().clone() {
-                    match handle.set_folder(std::path::PathBuf::from(path)) {
-                        Ok(()) => serde_json::json!({ "success": true }),
-                        Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                    }
+                    command_response(handle.set_folder(std::path::PathBuf::from(path)))
                 } else {
                     serde_json::json!({ "success": false, "error": "runtime not initialised" })
                 }
             }
 
-            IpcMessage::Ban { hash } => {
-                let h = runtime!();
-                match h.ban(&hash) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            IpcMessage::Ban { hash } => command_response(runtime!().ban(&hash)),
 
             IpcMessage::SubscribeEvents { .. } => {
                 // Handled above in handle_client before reaching process_message.
@@ -383,19 +358,11 @@ impl IpcServer {
             }
 
             IpcMessage::PlaylistCreate { name } => {
-                let h = runtime!();
-                match h.playlist_create(&name) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_create(&name))
             }
 
             IpcMessage::PlaylistAdd { name, path } => {
-                let h = runtime!();
-                match h.playlist_add(&name, &path) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_add(&name, &path))
             }
 
             IpcMessage::PlaylistTag {
@@ -403,40 +370,20 @@ impl IpcServer {
                 path,
                 kind,
                 tags,
-            } => {
-                let h = runtime!();
-                match h.playlist_tag(&name, &path, &kind, tags) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            } => command_response(runtime!().playlist_tag(&name, &path, &kind, tags)),
 
             IpcMessage::PlaylistRate { name, path, rating } => {
-                let h = runtime!();
-                match h.playlist_rate(&name, &path, rating) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_rate(&name, &path, rating))
             }
 
             IpcMessage::PlaylistFrequency {
                 name,
                 path,
                 frequency,
-            } => {
-                let h = runtime!();
-                match h.playlist_frequency(&name, &path, frequency) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            } => command_response(runtime!().playlist_frequency(&name, &path, frequency)),
 
             IpcMessage::PlaylistShuffle { name, shuffle } => {
-                let h = runtime!();
-                match h.playlist_shuffle(&name, shuffle) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_shuffle(&name, shuffle))
             }
 
             IpcMessage::PlaylistAutotagStatus { name, path } => {
@@ -478,37 +425,26 @@ impl IpcServer {
             }
 
             IpcMessage::PlaylistRemove { name, path } => {
-                let h = runtime!();
-                match h.playlist_remove(&name, &path) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_remove(&name, &path))
             }
 
             IpcMessage::PlaylistActivate { name } => {
-                let h = runtime!();
-                match h.playlist_activate(&name) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_activate(&name))
             }
 
-            IpcMessage::PlaylistDeactivate => {
-                let h = runtime!();
-                match h.playlist_deactivate() {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
+            IpcMessage::PlaylistDeactivate => command_response(runtime!().playlist_deactivate()),
 
             IpcMessage::PlaylistDelete { name } => {
-                let h = runtime!();
-                match h.playlist_delete(&name) {
-                    Ok(()) => serde_json::json!({ "success": true }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
+                command_response(runtime!().playlist_delete(&name))
             }
         }
+    }
+}
+
+fn command_response(result: Result<()>) -> serde_json::Value {
+    match result {
+        Ok(()) => serde_json::json!({ "success": true }),
+        Err(error) => serde_json::json!({ "success": false, "error": error.to_string() }),
     }
 }
 
@@ -755,6 +691,18 @@ mod tests {
         };
         server.set_runtime(runtime);
         server
+    }
+
+    #[test]
+    fn command_response_preserves_wire_shape() {
+        assert_eq!(
+            command_response(Ok(())),
+            serde_json::json!({ "success": true })
+        );
+        assert_eq!(
+            command_response(Err(anyhow::anyhow!("failed"))),
+            serde_json::json!({ "success": false, "error": "failed" })
+        );
     }
 
     #[test]
