@@ -211,31 +211,26 @@ async fn handle_request(stream: &mut tokio::net::TcpStream, metrics: &Arc<Metric
         .await
         .context("metrics request timed out")??;
 
-    // Route
-    if get_request_path(&request_line) == Some("/metrics") {
-        let body = metrics.render_prometheus();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        writer.write_all(response.as_bytes()).await?;
-    } else if get_request_path(&request_line) == Some("/healthz") {
-        let body = "ok\n";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        writer.write_all(response.as_bytes()).await?;
-    } else {
-        let body = "404 Not Found\n";
-        let response = format!(
-            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        writer.write_all(response.as_bytes()).await?;
+    match get_request_path(&request_line) {
+        Some("/metrics") => {
+            let body = metrics.render_prometheus();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            writer.write_all(response.as_bytes()).await?;
+        }
+        Some("/healthz") => {
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n")
+                .await?;
+        }
+        _ => {
+            writer
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\nConnection: close\r\n\r\n404 Not Found\n")
+                .await?;
+        }
     }
 
     Ok(())

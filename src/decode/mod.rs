@@ -1,7 +1,6 @@
 use crate::metrics::Metrics;
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -156,15 +155,11 @@ fn decode_via_image_crate(path: &Path, target_w: u32, target_h: u32) -> Result<D
         img
     };
 
-    // Convert to BGRA
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    let mut bgra = Vec::with_capacity((w * h * 4) as usize);
-    for pixel in rgba.pixels() {
-        bgra.push(pixel[2]); // B
-        bgra.push(pixel[1]); // G
-        bgra.push(pixel[0]); // R
-        bgra.push(pixel[3]); // A
+    let mut bgra = rgba.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
     }
 
     Ok(DecodedImage {
@@ -183,7 +178,7 @@ struct WicFrame {
 }
 
 fn open_wic_frame(path: &Path) -> Result<WicFrame> {
-    use windows::core::PCWSTR;
+    use windows::core::HSTRING;
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, IWICBitmapDecoder, IWICImagingFactory,
@@ -191,23 +186,14 @@ fn open_wic_frame(path: &Path) -> Result<WicFrame> {
     };
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-    let path_wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0u16))
-        .collect();
+    let path = HSTRING::from(path);
 
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
                 .context("CoCreateInstance(WICImagingFactory)")?;
         let decoder: IWICBitmapDecoder = factory
-            .CreateDecoderFromFilename(
-                PCWSTR::from_raw(path_wide.as_ptr()),
-                None,
-                GENERIC_READ,
-                WICDecodeMetadataCacheOnDemand,
-            )
+            .CreateDecoderFromFilename(&path, None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
             .context("WIC CreateDecoderFromFilename")?;
         let frame = decoder.GetFrame(0).context("WIC GetFrame(0)")?;
         let mut width = 0;
@@ -328,7 +314,7 @@ impl FileSignature {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct CacheKey {
     path: std::path::PathBuf,
     target_w: u32,
@@ -362,14 +348,14 @@ impl DecodeCache {
 
     /// Look up an entry. On hit, move to front (MRU position).
     fn get(&mut self, key: &CacheKey) -> Option<Arc<DecodedImage>> {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
-            let entry = self.entries.remove(pos).unwrap();
-            let val = Arc::clone(&entry.1);
-            self.entries.push_front(entry);
-            Some(val)
-        } else {
-            None
-        }
+        let pos = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)?;
+        let entry = self.entries.remove(pos)?;
+        let value = Arc::clone(&entry.1);
+        self.entries.push_front(entry);
+        Some(value)
     }
 
     /// Insert an entry, evicting the LRU tail if at capacity.

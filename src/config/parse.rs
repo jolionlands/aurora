@@ -17,12 +17,11 @@ use crate::transition::{Backend, TransitionStyle};
 // ---------------------------------------------------------------------------
 
 /// A parsed token from one non-blank, non-comment line.
-#[derive(Debug)]
 enum Line<'a> {
     SectionOpen { name: &'a str, arg: Option<String> },
     SectionClose,
-    KeyValue { key: String, value: String },
-    Bare { token: String },
+    KeyValue { key: &'a str, value: String },
+    Bare { token: &'a str },
 }
 
 fn strip_comment(s: &str) -> Result<&str> {
@@ -53,15 +52,14 @@ fn strip_comment(s: &str) -> Result<&str> {
     Ok(s)
 }
 
-/// Pull out a quoted string starting from byte `start`, returning
-/// (content, end_index_exclusive).
-fn parse_quoted(s: &str, start: usize) -> Option<(String, usize)> {
+/// Pull out a leading quoted string, returning (content, end_index_exclusive).
+fn parse_quoted(s: &str) -> Option<(String, usize)> {
     let bytes = s.as_bytes();
-    if bytes.get(start) != Some(&b'"') && bytes.get(start) != Some(&b'\'') {
+    if bytes.first() != Some(&b'"') && bytes.first() != Some(&b'\'') {
         return None;
     }
-    let quote = bytes[start] as char;
-    let mut i = start + 1;
+    let quote = bytes[0] as char;
+    let mut i = 1;
     let mut out = String::new();
     while i < bytes.len() {
         let ch = s[i..].chars().next()?;
@@ -101,7 +99,7 @@ fn parse_value_tokens(mut s: &str) -> Result<Vec<String>> {
 
         if s.starts_with('"') || s.starts_with('\'') {
             let (value, end) =
-                parse_quoted(s, 0).ok_or_else(|| anyhow::anyhow!("unterminated quoted string"))?;
+                parse_quoted(s).ok_or_else(|| anyhow::anyhow!("unterminated quoted string"))?;
             if s[end..]
                 .chars()
                 .next()
@@ -153,7 +151,7 @@ fn lex_line(raw: &str) -> Result<Option<Line<'_>>> {
         let arg = if rest.is_empty() {
             None
         } else {
-            let (arg, end) = parse_quoted(rest, 0)
+            let (arg, end) = parse_quoted(rest)
                 .ok_or_else(|| anyhow::anyhow!("expected quoted section argument"))?;
             if !rest[end..].trim().is_empty() {
                 bail!("unexpected text after section argument");
@@ -179,32 +177,24 @@ fn lex_line(raw: &str) -> Result<Option<Line<'_>>> {
         value_start = rest.trim_start();
     }
 
-    if key == "extensions" {
-        let values = parse_value_tokens(value_start)?;
-        if !values.is_empty() {
-            return Ok(Some(Line::KeyValue {
-                key: key.to_string(),
-                value: values.join(","),
-            }));
-        }
+    let values = parse_value_tokens(value_start)?;
+    if key == "extensions" && !values.is_empty() {
+        return Ok(Some(Line::KeyValue {
+            key,
+            value: values.join(","),
+        }));
     }
 
-    let values = parse_value_tokens(value_start)?;
     if values.len() > 1 {
         bail!("expected one value for key {:?}", key);
     }
 
     if let Some(value) = values.into_iter().next() {
-        return Ok(Some(Line::KeyValue {
-            key: key.to_string(),
-            value,
-        }));
+        return Ok(Some(Line::KeyValue { key, value }));
     }
 
     // No value — bare token / flag
-    Ok(Some(Line::Bare {
-        token: key.to_string(),
-    }))
+    Ok(Some(Line::Bare { token: key }))
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +304,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                     &mut cur_source,
                     &mut cur_monitor,
                     &section,
-                    &key,
+                    key,
                     &value,
                 )
                 .map_err(|e| anyhow::anyhow!("line {}: {}", lineno + 1, e))?;
@@ -331,7 +321,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                         &mut cur_source,
                         &mut cur_monitor,
                         &section,
-                        &token,
+                        token,
                         "true",
                     )
                     .map_err(|error| anyhow::anyhow!("line {}: {}", lineno + 1, error))?;
@@ -543,23 +533,20 @@ fn apply_kv(
 // Default config path helper
 // ---------------------------------------------------------------------------
 
-pub fn default_config_path() -> std::path::PathBuf {
-    let mut p = dirs_or_appdata();
-    p.push("aurora");
-    p.push("config.kdl");
-    p
+pub fn default_config_path() -> PathBuf {
+    dirs_or_appdata().join("aurora").join("config.kdl")
 }
 
-fn dirs_or_appdata() -> std::path::PathBuf {
+fn dirs_or_appdata() -> PathBuf {
     // %APPDATA%  e.g. C:\Users\kalli\AppData\Roaming
     if let Some(p) = std::env::var_os("APPDATA") {
-        return std::path::PathBuf::from(p);
+        return PathBuf::from(p);
     }
     // Fallback: home dir
     if let Some(p) = std::env::var_os("USERPROFILE") {
-        return std::path::PathBuf::from(p).join("AppData").join("Roaming");
+        return PathBuf::from(p).join("AppData").join("Roaming");
     }
-    std::path::PathBuf::from(".")
+    PathBuf::from(".")
 }
 
 #[cfg(test)]

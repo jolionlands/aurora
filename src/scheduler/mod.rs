@@ -59,6 +59,7 @@ impl Scheduler {
         // Track which at_times we have already fired this minute to avoid double-fire.
         let mut last_at_fired: Option<(u32, u32)> = None;
         let mut last_swap = None;
+        let at_times = parse_at_times(&self.config.at_times);
 
         loop {
             interval_ticker.tick().await;
@@ -80,7 +81,6 @@ impl Scheduler {
             // at_times check
             let current_hm = local_hour_minute();
 
-            let at_times = parse_at_times(&self.config.at_times);
             let should_at_fire =
                 should_fire_at(&self.config.mode, &at_times, current_hm, last_at_fired);
 

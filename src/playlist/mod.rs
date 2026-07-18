@@ -577,38 +577,20 @@ pub fn persist_playlists(store: &PlaylistStore, path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
+    use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
-    let tmp_wide: Vec<u16> = tmp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let path_wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
     unsafe {
         MoveFileExW(
-            PCWSTR::from_raw(tmp_wide.as_ptr()),
-            PCWSTR::from_raw(path_wide.as_ptr()),
+            &HSTRING::from(tmp),
+            &HSTRING::from(path),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    std::fs::rename(tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 /// Load the playlist store from disk (creates an empty one if the file does not exist).
