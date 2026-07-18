@@ -319,18 +319,10 @@ fn build_entry(
 
 /// Blake3 hash of the entire file, returned as lowercase hex.
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
-    use std::io::Read;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {:?} for hashing", path))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).context("read error")?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    hasher.update_reader(&mut file).context("read error")?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -353,6 +345,16 @@ mod tests {
 
     fn make_temp_jpg(dir: &std::path::Path, name: &str) -> PathBuf {
         make_temp_image(dir, name, 16, 16)
+    }
+
+    #[test]
+    fn hash_file_matches_blake3() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"aurora").unwrap();
+        assert_eq!(
+            hash_file(file.path()).unwrap(),
+            blake3::hash(b"aurora").to_hex().to_string()
+        );
     }
 
     fn source(

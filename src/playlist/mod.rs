@@ -332,20 +332,7 @@ impl PlaylistStore {
 // ---------------------------------------------------------------------------
 
 pub fn default_playlists_path() -> PathBuf {
-    let mut p = appdata_aurora_dir();
-    p.push("playlists.kdl");
-    p
-}
-
-fn appdata_aurora_dir() -> PathBuf {
-    let base = if let Some(p) = std::env::var_os("APPDATA") {
-        PathBuf::from(p)
-    } else if let Some(p) = std::env::var_os("USERPROFILE") {
-        PathBuf::from(p).join("AppData").join("Roaming")
-    } else {
-        PathBuf::from(".")
-    };
-    base.join("aurora")
+    crate::config::default_config_path().with_file_name("playlists.kdl")
 }
 
 // ---------------------------------------------------------------------------

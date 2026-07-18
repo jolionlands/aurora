@@ -498,9 +498,6 @@ async fn main() -> Result<()> {
             apply_playlist,
         } => {
             let resolved_path = resolve_playlist_path(path).await?;
-            if let Some(playlist) = apply_playlist.as_deref() {
-                let _ = playlist_path_has_metadata(playlist, &resolved_path).await?;
-            }
             let result = autotag_image(AutoTagOptions {
                 path: resolved_path.clone(),
                 base_url,
@@ -898,7 +895,9 @@ async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
         .resume_file
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(default_autotag_resume_path);
+        .unwrap_or_else(|| {
+            aurora::config::default_config_path().with_file_name("autotag-batch.jsonl")
+        });
     let audit = BatchAuditContext {
         run_id: format!("{}-{}", current_unix_ms(), std::process::id()),
         playlist: &opts.playlist,
@@ -1055,14 +1054,6 @@ fn reserve_autotag_attempt(attempted: &mut usize, limit: usize) -> bool {
 
 fn should_skip_tagged_candidate(force: bool, status: anyhow::Result<bool>) -> anyhow::Result<bool> {
     Ok(status? && !force)
-}
-
-fn default_autotag_resume_path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("aurora")
-        .join("autotag-batch.jsonl")
 }
 
 fn append_batch_resume(
