@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
@@ -33,6 +34,9 @@ const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl")
     version
 )]
 struct Args {
+    #[arg(long, hide = true, value_name = "PATH")]
+    apply_once: Option<PathBuf>,
+
     /// Register aurora in the Windows Run key so it starts with Windows.
     #[arg(long)]
     register_autostart: bool,
@@ -50,6 +54,9 @@ async fn main() -> Result<()> {
     // 1. CLI flags that do not start the daemon
     // ---------------------------------------------------------------------------
     let args = Args::parse();
+    if let Some(path) = args.apply_once {
+        return apply_once(&path);
+    }
     if args.register_autostart || args.unregister_autostart {
         init_logging("info")?;
     }
@@ -291,6 +298,19 @@ async fn main() -> Result<()> {
         return Err(error);
     }
 
+    Ok(())
+}
+
+fn apply_once(path: &Path) -> Result<()> {
+    let _com = ComApartment::initialize()?;
+    let config_path = default_config_path();
+    let config = parse_kdl_config(
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("read config {}", config_path.display()))?,
+    )
+    .with_context(|| format!("parse config {}", config_path.display()))?;
+    let result = WallpaperApplier::new()?.apply_all(&config, path)?;
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 

@@ -9,6 +9,8 @@ use windows::Win32::UI::Shell::{
     DWPOS_FIT, DWPOS_SPAN, DWPOS_STRETCH, DWPOS_TILE,
 };
 
+use crate::config::types::Config;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -25,6 +27,13 @@ pub struct MonitorInfo {
     pub width: u32,
     /// Physical monitor height in pixels.
     pub height: u32,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct DirectApplyResult {
+    pub successful_monitors: Vec<String>,
+    pub failures: Vec<String>,
+    pub total_monitors: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +163,24 @@ impl WallpaperApplier {
         }
     }
 
+    pub fn set_for_all_monitors(&self, path: &Path) -> Result<()> {
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect();
+        unsafe {
+            self.desktop
+                .SetWallpaper(PCWSTR::null(), PCWSTR::from_raw(path_wide.as_ptr()))
+                .with_context(|| {
+                    format!(
+                        "IDesktopWallpaper::SetWallpaper(all monitors, path={})",
+                        path.display()
+                    )
+                })
+        }
+    }
+
     /// Set the fit/position mode for all monitors.
     pub fn set_fit(&self, fit: WallpaperFit) -> Result<()> {
         let position = fit.to_dwpos();
@@ -166,4 +193,49 @@ impl WallpaperApplier {
                 .context("IDesktopWallpaper::SetPosition")
         }
     }
+
+    pub fn apply_all(&self, config: &Config, path: &Path) -> Result<DirectApplyResult> {
+        if let Some(first) = config.monitors.first() {
+            let fit = WallpaperFit::parse(&first.fit);
+            if config
+                .monitors
+                .iter()
+                .skip(1)
+                .any(|monitor| WallpaperFit::parse(&monitor.fit) != fit)
+            {
+                tracing::warn!(
+                    "per-monitor fit overrides differ, but Windows applies one global wallpaper position"
+                );
+            }
+            self.set_fit(fit)?;
+        }
+        self.set_for_all_monitors(path)?;
+        Ok(DirectApplyResult {
+            successful_monitors: vec!["all".to_string()],
+            failures: Vec::new(),
+            total_monitors: 1,
+        })
+    }
+}
+
+pub fn configured_global_fit(config: &Config, monitors: &[MonitorInfo]) -> WallpaperFit {
+    let fit_for = |monitor_id: &str| {
+        config
+            .monitors
+            .iter()
+            .find(|monitor| monitor.name == monitor_id)
+            .map(|monitor| WallpaperFit::parse(&monitor.fit))
+            .unwrap_or(WallpaperFit::Fill)
+    };
+    let fit = fit_for(&monitors[0].id);
+    if monitors
+        .iter()
+        .skip(1)
+        .any(|monitor| fit_for(&monitor.id) != fit)
+    {
+        tracing::warn!(
+            "per-monitor fit overrides differ, but Windows applies one global wallpaper position"
+        );
+    }
+    fit
 }

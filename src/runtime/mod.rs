@@ -3,7 +3,9 @@
 //! transition, applies the new wallpaper via IDesktopWallpaper, updates metrics.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +15,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::apply::{WallpaperApplier, WallpaperFit};
+use crate::apply::{configured_global_fit, DirectApplyResult, WallpaperApplier};
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::decode::SharedDecodeCache;
 use crate::index::PhotoIndex;
@@ -73,6 +75,7 @@ pub struct Runtime {
 const HISTORY_CAP: usize = 50;
 const BYTES_PER_4K_BGRA: usize = 3840 * 2160 * 4;
 const BANS_FILENAME: &str = "bans.txt";
+const DIRECT_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct BanCoordinator {
@@ -155,6 +158,54 @@ fn monitor_results(successful: usize, failures: &[String]) -> Result<()> {
             failures.len(),
             failures.join("; ")
         ))
+    }
+}
+
+fn needs_transition_decode(enabled: bool, has_previous: bool) -> bool {
+    enabled && has_previous
+}
+
+fn apply_direct_in_child(path: &Path) -> Result<DirectApplyResult> {
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
+    command
+        .arg("--apply-once")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW.0);
+    let mut child = command.spawn().context("start wallpaper apply helper")?;
+    let started = Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .context("poll wallpaper apply helper")?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .context("collect wallpaper apply helper output")?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "wallpaper apply helper failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            return serde_json::from_slice(&output.stdout)
+                .context("parse wallpaper apply helper output");
+        }
+        if started.elapsed() >= DIRECT_APPLY_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "wallpaper apply timed out after {} seconds",
+                DIRECT_APPLY_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -451,42 +502,6 @@ impl Runtime {
     }
 
     async fn handle_swap(&mut self, req: SwapRequest) -> Result<()> {
-        let monitors = self.applier.list_monitors().context("listing monitors")?;
-
-        if monitors.is_empty() {
-            warn!("no monitors found via IDesktopWallpaper — skip swap");
-            return Ok(());
-        }
-
-        // IDesktopWallpaper::SetPosition is global, not per-monitor. Pick the
-        // first monitor's configured mode once instead of letting the last
-        // monitor in the loop silently win.
-        let fit_for = |monitor_id: &str| {
-            self.config
-                .monitors
-                .iter()
-                .find(|m| m.name == monitor_id)
-                .map(|m| WallpaperFit::parse(m.fit.as_str()))
-                .unwrap_or(WallpaperFit::Fill)
-        };
-        let global_fit = fit_for(&monitors[0].id);
-        if monitors
-            .iter()
-            .skip(1)
-            .any(|m| fit_for(&m.id) != global_fit)
-        {
-            warn!(
-                "per-monitor fit overrides differ, but Windows applies one global wallpaper position; using {}",
-                self.config
-                    .monitors
-                    .iter()
-                    .find(|m| m.name == monitors[0].id)
-                    .map(|m| m.fit.as_str())
-                    .unwrap_or("fill")
-            );
-        }
-        self.applier.set_fit(global_fit)?;
-
         // Pick target path and retain the already-indexed hash when available.
         let (new_path, known_hash) = if req.reason == SwapReason::Previous {
             (
@@ -548,70 +563,93 @@ impl Runtime {
             anyhow::bail!("wallpaper is banned: {}", new_path.display());
         }
 
-        let mut successful_monitors = Vec::new();
-        let mut failures = Vec::new();
+        let (successful_monitors, failures, total_monitors) = if !self.config.transitions.enabled {
+            let result = self
+                .ban_gate
+                .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("wallpaper was banned during swap: {}", new_path.display())
+                })?;
+            (
+                result.successful_monitors,
+                result.failures,
+                result.total_monitors,
+            )
+        } else {
+            let monitors = self.applier.list_monitors().context("listing monitors")?;
+            if monitors.is_empty() {
+                warn!("no monitors found via IDesktopWallpaper — skip swap");
+                return Ok(());
+            }
+            self.applier
+                .set_fit(configured_global_fit(&self.config, &monitors))?;
 
-        // Per-monitor loop.
-        for monitor in &monitors {
-            let (tw, th) = (monitor.width, monitor.height);
-
-            // Decode the new image.
-            let t0 = std::time::Instant::now();
-            let new_decoded = self.cache.get_or_decode(&new_path, tw, th);
-            let decode_ms = t0.elapsed().as_millis() as u64;
-            self.metrics.record_decode_ms(decode_ms);
-            let new_decoded = match new_decoded {
-                Ok(image) => image,
-                Err(error) => {
-                    failures.push(format!(
-                        "monitor {}: decode {}: {error:#}",
-                        monitor.id,
-                        new_path.display()
-                    ));
-                    continue;
-                }
-            };
-
-            let prev_path = self.state.current_path.get(&monitor.id).cloned();
-            let old_decoded = if prev_path.is_some() && self.config.transitions.enabled {
-                prev_path
-                    .as_ref()
-                    .and_then(|old_path| self.cache.get_or_decode(old_path, tw, th).ok())
-            } else {
-                None
-            };
-
-            // Gate the visible transition and COM commit together. A ban writer
-            // cannot acknowledge while either is still showing this target.
-            match self.ban_gate.run_if_allowed(&target_hash, || {
-                if let Some(old) = &old_decoded {
-                    let bounds = Rect {
-                        x: monitor.x,
-                        y: monitor.y,
-                        width: monitor.width,
-                        height: monitor.height,
+            let mut successful_monitors = Vec::new();
+            let mut failures = Vec::new();
+            for monitor in &monitors {
+                let (tw, th) = (monitor.width, monitor.height);
+                let prev_path = self.state.current_path.get(&monitor.id).cloned();
+                let transition_images = if needs_transition_decode(
+                    self.config.transitions.enabled,
+                    prev_path.is_some(),
+                ) {
+                    let t0 = std::time::Instant::now();
+                    let new_decoded = self.cache.get_or_decode(&new_path, tw, th);
+                    self.metrics
+                        .record_decode_ms(t0.elapsed().as_millis() as u64);
+                    let new_decoded = match new_decoded {
+                        Ok(image) => image,
+                        Err(error) => {
+                            failures.push(format!(
+                                "monitor {}: decode {}: {error:#}",
+                                monitor.id,
+                                new_path.display()
+                            ));
+                            continue;
+                        }
                     };
-                    if let Err(error) = self.transitions.run(bounds, old, &new_decoded) {
-                        warn!(%error, "transition failed; continuing with direct apply");
+                    prev_path
+                        .as_ref()
+                        .and_then(|old_path| self.cache.get_or_decode(old_path, tw, th).ok())
+                        .map(|old_decoded| (old_decoded, new_decoded))
+                } else {
+                    None
+                };
+
+                // Gate the visible transition and COM commit together. A ban writer
+                // cannot acknowledge while either is still showing this target.
+                match self.ban_gate.run_if_allowed(&target_hash, || {
+                    if let Some((old_decoded, new_decoded)) = &transition_images {
+                        let bounds = Rect {
+                            x: monitor.x,
+                            y: monitor.y,
+                            width: monitor.width,
+                            height: monitor.height,
+                        };
+                        if let Err(error) = self.transitions.run(bounds, old_decoded, new_decoded) {
+                            warn!(%error, "transition failed; continuing with direct apply");
+                        }
+                    }
+                    self.applier.set_for_monitor(&monitor.id, &new_path)
+                }) {
+                    Ok(Some(())) => successful_monitors.push(monitor.id.clone()),
+                    Ok(None) => {
+                        failures.push(format!(
+                            "monitor {}: wallpaper was banned during swap: {}",
+                            monitor.id,
+                            new_path.display()
+                        ));
+                        break;
+                    }
+                    Err(error) => {
+                        failures.push(format!("monitor {}: {error:#}", monitor.id));
+                        continue;
                     }
                 }
-                self.applier.set_for_monitor(&monitor.id, &new_path)
-            }) {
-                Ok(Some(())) => successful_monitors.push(monitor.id.clone()),
-                Ok(None) => {
-                    failures.push(format!(
-                        "monitor {}: wallpaper was banned during swap: {}",
-                        monitor.id,
-                        new_path.display()
-                    ));
-                    break;
-                }
-                Err(error) => {
-                    failures.push(format!("monitor {}: {error:#}", monitor.id));
-                    continue;
-                }
             }
-        }
+            let total_monitors = monitors.len();
+            (successful_monitors, failures, total_monitors)
+        };
 
         let successful = successful_monitors.len();
         commit_successful_monitors(
@@ -628,7 +666,7 @@ impl Runtime {
                 "wallpaper swapped → {} on {}/{} monitor(s) (reason={:?})",
                 new_path.display(),
                 successful,
-                monitors.len(),
+                total_monitors,
                 req.reason
             );
         }
@@ -2499,16 +2537,11 @@ mod tests {
     // test_runtime_first_swap_no_transition
     // -----------------------------------------------------------------------
 
-    /// When current_path has no entry for a monitor (first swap), is_first = true,
-    /// so we should skip the transition branch.
     #[test]
-    fn test_runtime_first_swap_no_transition() {
-        let state = RuntimeState::new();
-        // On first swap, current_path is empty — prev_path is None.
-        let monitor_id = "\\\\?\\DISPLAY1";
-        let prev_path = state.current_path.get(monitor_id);
-        let is_first = prev_path.is_none();
-        assert!(is_first, "first swap should have no previous path");
+    fn transition_decode_requires_enabled_transition_and_previous_image() {
+        assert!(!needs_transition_decode(false, true));
+        assert!(!needs_transition_decode(true, false));
+        assert!(needs_transition_decode(true, true));
     }
 
     // -----------------------------------------------------------------------
