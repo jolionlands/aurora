@@ -1,23 +1,110 @@
-# aurora
+<div align="center">
 
-Efficient desktop background swapper for Windows.
+# Aurora
 
-- Bundled defaults are JPEG, PNG, GIF, WebP, BMP, TIFF, and ICO. Explicitly configured or direct AVIF, HEIC, and HEIF files may work only when Windows WIC and the file's AV1 or HEVC payload codec can decode that exact file
-- Per-monitor wallpapers via `IDesktopWallpaper` COM (Windows position mode is global)
-- Multiple transition styles (crossfade, slide, wipe, dissolve, zoom) — GPU-accelerated via Direct2D or CPU fallback
-- IPC over a length-prefixed JSON named pipe (`\\.\pipe\aurora-<session-id>`) with `aurora-ctl` client
-- Interval or fixed-time schedules, plus optional wiri workspace-change swaps
-- KDL config at `%APPDATA%\aurora\config.kdl`
-- Prometheus `/metrics` endpoint (opt-in) for monitoring
-- Bounded LRU decode cache
-- Persistent validated photo index cache for fast restarts and reloads
-- Single-instance check, autostart hook
+**Native, per-monitor wallpaper rotation for Windows.**
 
-## Playlists and tagging
+Fast indexing. Smooth transitions. Content-aware playlists. Local control.
 
-Start the `aurora` daemon before using playlist commands. Batch autotagging and
-`autotag --apply-playlist` also persist through the daemon; standalone autotagging
-of an explicit file can run without it.
+[![CI](https://github.com/jolionlands/aurora/actions/workflows/ci.yml/badge.svg)](https://github.com/jolionlands/aurora/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
+![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
+
+[Quick start](#quick-start) | [Transitions](#enable-transitions) | [Playlists](#playlists-and-metadata) | [Autotagging](#ai-assisted-tagging) | [Configuration](#configuration-and-storage)
+
+</div>
+
+Aurora is a small Windows daemon that keeps each display fresh without getting
+in your way. It uses native Windows wallpaper and graphics APIs, exposes a
+scriptable command-line client, and remembers image metadata by exact content
+rather than fragile file paths.
+
+## Highlights
+
+| | |
+| --- | --- |
+| **Per-monitor** | Independent wallpaper selection through `IDesktopWallpaper` |
+| **Smooth** | Crossfade, slide, wipe, dissolve, and zoom using Direct2D with a CPU fallback |
+| **Fast** | Persistent validated photo index and a bounded decoded-image LRU cache |
+| **Organized** | Playlists, ratings, frequency weights, grouped tags, and include/exclude filters |
+| **Content-aware** | Exact BLAKE3 identity reconnects indexed renames and shares metadata across duplicates |
+| **Automatable** | Named-pipe IPC, real-time events, optional Prometheus metrics, and a companion CLI |
+| **Flexible** | Interval or fixed-time schedules, fullscreen/idle pauses, and optional wiri workspace triggers |
+
+Bundled decoding supports JPEG, PNG, GIF, WebP, BMP, TIFF, and ICO. Explicit
+AVIF, HEIC, or HEIF files can also work when Windows WIC has the codec required
+by that file's AV1 or HEVC payload.
+
+## Quick start
+
+Aurora currently builds from source with the stable Rust toolchain on Windows.
+
+```powershell
+git clone https://github.com/jolionlands/aurora.git
+cd aurora
+cargo build --release
+.\target\release\aurora.exe
+```
+
+The first launch writes
+[`%APPDATA%\aurora\config.kdl`](resources/default_config.kdl). Add your wallpaper
+folders there, restart Aurora, then control the running daemon from another
+terminal:
+
+```powershell
+.\target\release\aurora-ctl.exe status
+.\target\release\aurora-ctl.exe next
+.\target\release\aurora-ctl.exe pause
+.\target\release\aurora-ctl.exe resume
+```
+
+Register or remove startup with Windows:
+
+```powershell
+.\target\release\aurora.exe --register-autostart
+.\target\release\aurora.exe --unregister-autostart
+```
+
+## Enable transitions
+
+Transitions are off in the default configuration, so wallpaper changes are
+instant until they are enabled. Set `enabled true`, then restart Aurora:
+
+```kdl
+transitions {
+    enabled true
+    duration-ms 800
+    style "crossfade"
+    renderer "auto"
+}
+```
+
+Available styles are `crossfade`, `slide-left`, `slide-right`, `wipe-left`,
+`wipe-right`, `dissolve`, `zoom-in`, `zoom-out`, and `none`. The renderer can be
+`gpu`, `cpu`, or `auto`.
+
+## Control
+
+| Command | Purpose |
+| --- | --- |
+| `aurora-ctl status` | Show daemon, index, scheduler, and playlist state |
+| `aurora-ctl next` / `prev` | Move through wallpaper history |
+| `aurora-ctl set <path>` | Apply one image immediately |
+| `aurora-ctl pause` / `resume` | Control automatic rotation |
+| `aurora-ctl folder <path>` | Narrow selection to a folder for this session |
+| `aurora-ctl ban <hash>` | Ban an exact BLAKE3 content hash from future selection |
+| `aurora-ctl reload` | Refresh sources, playlists, content metadata, and bans |
+| `aurora-ctl events` | Stream newline-delimited JSON events |
+| `aurora-ctl stats` | Print the metrics snapshot |
+| `aurora-ctl current-wallpaper` | Show the last successful wallpaper per monitor |
+
+Add `--json` before a command for machine-readable output.
+
+## Playlists and metadata
+
+Start the Aurora daemon before using playlist commands. A playlist can mix
+explicit files, selection weights, shared content metadata, and optional tag
+filters:
 
 ```powershell
 aurora-ctl playlist create favorites
@@ -33,42 +120,56 @@ aurora-ctl playlist show favorites --offset 0 --limit 100
 aurora-ctl playlist deactivate
 ```
 
-The built-in tag groups are `general`, `theme`, `content`, `color`, `source`,
-`medium`, `safety`, `franchise`, and `character`; any other non-empty kebab-case
-group is stored as custom metadata. Omit the tags to clear one group, for example
-`aurora-ctl playlist tag favorites current --kind artist`.
+Selection weight is `frequency * (rating + 1)`. Both factors default to `1`
+when unset, and frequency remains local to each playlist.
 
-Tag filters are optional selection rules. Repeat `--include` or `--exclude` with
-`KIND=TAG`; includes are OR within one kind and AND across kinds, while any
-excluded tag rejects an image. Run `aurora-ctl playlist filter favorites` with
-no rules to clear the filter. An active filtered playlist never falls back to
-the full library when no item matches.
+### Tags and filters
 
-Tags, dimensions, the default rating, and bounded autotag provenance (model,
-confidence, and normalized raw output) are keyed by the image's exact BLAKE3
-content ID. Exact duplicate files therefore share metadata, renamed content can
-be found again, and replacement bytes at the same path do not inherit the old
-image's metadata. Frequency remains playlist-local. Selection weight is
-`frequency * (rating + 1)`; both factors default to 1 when unset.
+Built-in tag groups are `general`, `theme`, `content`, `color`, `source`,
+`medium`, `safety`, `franchise`, and `character`. Any other non-empty,
+kebab-case group is stored as custom metadata.
 
-Playlists are persisted at `%APPDATA%\aurora\playlists.kdl`. Paths supplied
-through `aurora-ctl` are normalized to absolute paths. Legacy or hand-written
-relative entries remain supported and are resolved against each configured
-source root. Shared content metadata and playlist filters are stored in the
-versioned `%APPDATA%\aurora\content.json` sidecar. Existing path metadata is
-migrated without changing the backward-readable playlist file.
-`aurora-ctl reload` refreshes the configured sources, playlists, and content
-metadata together; schedule, transition, monitor, cache-budget, metrics, and
-log-level changes still require a daemon restart.
+Omit tags to clear a group:
 
-Autotagging uses an OpenAI-compatible vision endpoint. Pass the API base URL,
-without `/chat/completions`; Aurora appends that path. HTTPS is required unless
-`--allow-http` is explicitly used for a trusted endpoint. The API key comes from
-`PYLON_KEY` by default, another variable selected with `--api-key-env`, or a
-user-protected file selected with `--api-key-file` (the file takes precedence).
-Each image normally uses two model passes, identity and aesthetics; invalid or
-failed responses can trigger retries and fallback prompts, so a run can use more
-than two requests.
+```powershell
+aurora-ctl playlist tag favorites current --kind artist
+```
+
+Repeat `--include` or `--exclude` with `KIND=TAG`. Includes are OR within one
+kind and AND across kinds; any excluded tag rejects an image. Clear all rules
+with:
+
+```powershell
+aurora-ctl playlist filter favorites
+```
+
+An active filtered playlist never silently falls back to the full library when
+nothing matches.
+
+### Content identity
+
+Tags, dimensions, default rating, and bounded autotag provenance are keyed by
+the image's exact BLAKE3 content ID. This means:
+
+- Exact duplicates share metadata.
+- Persisted aliases can reconnect renamed content after an index refresh.
+- Replacement bytes at the same path do not inherit stale metadata after an
+  index refresh.
+- One image can keep consistent metadata across multiple playlists.
+
+## AI-assisted tagging
+
+Aurora can ask an OpenAI-compatible vision endpoint to tag one image or a
+batch. Supply the API base URL without `/chat/completions`; Aurora appends it.
+HTTPS is required unless `--allow-http` is explicitly used for a trusted
+endpoint.
+
+Standalone tagging of an explicit file can run by itself. Applying tags to a
+playlist, including batch tagging, persists through the running daemon.
+
+The API key comes from `PYLON_KEY` by default, another variable selected with
+`--api-key-env`, or a user-protected file selected with `--api-key-file`. A key
+file takes precedence.
 
 ```powershell
 $env:PYLON_KEY = "..."
@@ -77,28 +178,61 @@ aurora-ctl autotag-batch "D:\Wallpapers" --playlist catalog --base-url "https://
 aurora-ctl autotag-batch --manifest scan.json --playlist catalog --base-url "https://gateway.example/v1"
 ```
 
-Batch input is either a folder or a manifest, not both. A manifest is a JSON
-object with a `rows` array. Only rows whose `status` is `"ok"` are processed;
-those rows require `absolute_path` and may include a 64-hex-digit `sha256`
-(normalized to lowercase), `width`, and `height` for duplicate and small-image
-filtering:
+Batch input is either a folder or a manifest. A manifest is a JSON object with
+a `rows` array; only rows with `"status": "ok"` are processed. Those rows
+require `absolute_path` and can include a 64-hex-character `sha256` (normalized
+to lowercase), `width`, and `height`:
 
 ```json
-{"rows":[{"status":"ok","absolute_path":"D:\\Wallpapers\\lake.jpg","sha256":"0000000000000000000000000000000000000000000000000000000000000000","width":3840,"height":2160}]}
+{
+  "rows": [
+    {
+      "status": "ok",
+      "absolute_path": "D:\\Wallpapers\\lake.jpg",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "width": 3840,
+      "height": 2160
+    }
+  ]
+}
 ```
 
-Content and legacy path metadata are the source of truth for batch resume: already-tagged paths
-are skipped unless `--force` is used. The JSONL resume file is an append-only
-audit log of tagged, skipped, and failed paths; failures remain retryable. Use
-`--resume-file` to select a particular log when separate audit trails are useful.
-Single-image playlist apply and batch `--force` replace all metadata for that
-path; ordinary batch runs leave existing metadata untouched.
+Existing content metadata and backward-compatible playlist metadata drive
+resume. Images that already carry either are skipped unless `--force` is used.
+The append-only JSONL resume file records tagged, skipped, and failed paths;
+failed items remain retryable.
 
-## Status
+## Configuration and storage
 
-Under active development.
+Aurora keeps its state together under `%APPDATA%\aurora`:
 
-## Pairs with
+| File | Purpose |
+| --- | --- |
+| `config.kdl` | Sources, scheduling, transitions, monitors, metrics, and cache limits |
+| `playlists.kdl` | Playlist membership, order, shuffle, frequency, and compatibility metadata copies |
+| `content.json` | Versioned tags, ratings, dimensions, filters, aliases, and autotag provenance |
+| `index-cache.json` | Validated photo index used for fast restart and reload |
+| `bans.txt` | Exact content hashes that Aurora must not display |
+| `autotag-batch.jsonl` | Default append-only batch audit trail |
 
-- [`wiri`](https://github.com/jolionlands/wiri) — Windows tiling window manager. Aurora subscribes to wiri's IPC event stream for workspace-change triggers.
-- [`crest`](https://github.com/jolionlands/crest) — modular status bar.
+`aurora-ctl reload` refreshes configured sources, playlists, content metadata,
+and bans together. Schedule, transition, monitor, cache-budget, metrics, and
+log-level changes require a daemon restart.
+
+## Development
+
+The same checks run locally and in GitHub Actions:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+Aurora is Windows-only and under active development.
+
+## Companion projects
+
+- [`wiri`](https://github.com/jolionlands/wiri) - Windows tiling window manager;
+  Aurora can rotate on wiri workspace changes.
+- [`crest`](https://github.com/jolionlands/crest) - modular status bar.
