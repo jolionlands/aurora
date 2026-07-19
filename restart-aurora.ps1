@@ -14,7 +14,7 @@ Run from a normal (non-admin) shell. Idempotent.
 #>
 param(
     [string]$AuroraDir,
-    [int]$ReadyTimeoutSec = 300
+    [int]$ReadyTimeoutSec = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,13 +51,16 @@ Start-Sleep -Seconds 1
 
 # 2. Relaunch (detached, non-elevated).
 Write-Host "Launching aurora..."
-Start-Process -FilePath $exe -WorkingDirectory $AuroraDir | Out-Null
+$process = Start-Process -FilePath $exe -WorkingDirectory $AuroraDir -PassThru
 
 # 3. Wait for the control pipe to answer (daemon indexes its library on boot).
 $deadline = (Get-Date).AddSeconds($ReadyTimeoutSec)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 2
+    if ($process.HasExited) {
+        throw "aurora exited before its control pipe became ready."
+    }
     try {
         $status = & $ctl status 2>$null | Out-String
         if ($status -match '"running"\s*:\s*true') { $ready = $true; break }
