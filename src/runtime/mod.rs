@@ -201,8 +201,16 @@ fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
                 .context("collect wallpaper apply helper output");
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                if child.try_wait().ok().flatten().is_none() {
+                    anyhow::bail!(
+                        "wallpaper apply timed out after {} milliseconds and helper could not be terminated: {error}",
+                        timeout.as_millis()
+                    );
+                }
+            } else {
+                let _ = child.wait();
+            }
             anyhow::bail!(
                 "wallpaper apply timed out after {} milliseconds",
                 timeout.as_millis()
@@ -486,7 +494,7 @@ impl Runtime {
                     continue;
                 }
             }
-            if let Err(e) = self.handle_swap(req).await {
+            if let Err(e) = self.handle_swap(req) {
                 warn!("swap failed: {}", e);
             }
             // Sync shared state snapshot for IPC queries.
@@ -499,7 +507,7 @@ impl Runtime {
         info!("runtime: swap channel closed — exiting");
     }
 
-    async fn handle_swap(&mut self, req: SwapRequest) -> Result<()> {
+    fn handle_swap(&mut self, req: SwapRequest) -> Result<()> {
         // Pick target path and retain the already-indexed hash when available.
         let (new_path, known_hash) = if req.reason == SwapReason::Previous {
             (
@@ -783,6 +791,10 @@ fn playlist_show_wire_len(result: &serde_json::Value) -> anyhow::Result<usize> {
         "result": result,
     }))?
     .len())
+}
+
+fn playlist_show_fits_frame(result: &serde_json::Value) -> anyhow::Result<bool> {
+    Ok(playlist_show_wire_len(result)? <= MAX_FRAME_SIZE)
 }
 
 fn playlist_path_has_autotag_metadata(store: &PlaylistStore, name: &str, path: &str) -> bool {
@@ -1148,7 +1160,7 @@ impl RuntimeHandle {
                 (next < total).then_some(next),
                 &items,
             );
-            if playlist_show_wire_len(&candidate)? < MAX_FRAME_SIZE {
+            if playlist_show_fits_frame(&candidate)? {
                 continue;
             }
 
@@ -1162,7 +1174,7 @@ impl RuntimeHandle {
                 (single_next < total).then_some(single_next),
                 std::slice::from_ref(&item),
             );
-            if playlist_show_wire_len(&single)? >= MAX_FRAME_SIZE {
+            if !playlist_show_fits_frame(&single)? {
                 anyhow::bail!(
                     "playlist item at offset {index} exceeds the IPC response limit; reduce its tag metadata before retrying"
                 );
@@ -1179,7 +1191,7 @@ impl RuntimeHandle {
         let next = offset.saturating_add(items.len());
         let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
         let result = playlist_show_result_json(&summary, total, offset, limit, next_offset, &items);
-        if playlist_show_wire_len(&result)? >= MAX_FRAME_SIZE {
+        if !playlist_show_fits_frame(&result)? {
             anyhow::bail!(
                 "playlist summary exceeds the IPC response limit; shorten the playlist name"
             );
@@ -1734,6 +1746,18 @@ mod tests {
         assert!(handle.playlist_show("focus", 0, 0).is_err());
         assert!(handle.playlist_show("focus", 0, 257).is_err());
         assert!(handle.playlist_show("missing", 0, 1).is_err());
+    }
+
+    #[test]
+    fn playlist_show_wire_limit_is_inclusive() {
+        let empty = serde_json::json!({ "padding": "" });
+        let overhead = playlist_show_wire_len(&empty).unwrap();
+        let exact = serde_json::json!({ "padding": "x".repeat(MAX_FRAME_SIZE - overhead) });
+        let oversized = serde_json::json!({ "padding": "x".repeat(MAX_FRAME_SIZE + 1 - overhead) });
+
+        assert_eq!(playlist_show_wire_len(&exact).unwrap(), MAX_FRAME_SIZE);
+        assert!(playlist_show_fits_frame(&exact).unwrap());
+        assert!(!playlist_show_fits_frame(&oversized).unwrap());
     }
 
     #[test]
