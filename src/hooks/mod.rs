@@ -1,30 +1,22 @@
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
 use windows::core::{Owned, PCWSTR};
-use windows::Win32::Foundation::ERROR_MORE_DATA;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA};
 use windows::Win32::System::Registry::{
     RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, KEY_WRITE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
-pub struct StartupManager {
-    exe_path: PathBuf,
-}
-
-impl Default for StartupManager {
-    fn default() -> Self {
-        let exe_path = std::env::current_exe().unwrap_or_default();
-
-        Self { exe_path }
-    }
-}
+pub struct StartupManager;
 
 impl StartupManager {
     pub fn is_registered(&self) -> bool {
+        let Ok(exe_path) = std::env::current_exe() else {
+            return false;
+        };
         self.get_registered_command()
-            .is_some_and(|command| registration_matches(&command, self.exe_path.as_os_str()))
+            .is_some_and(|command| registration_matches(&command, exe_path.as_os_str()))
     }
 
     pub fn get_registered_path(&self) -> Option<String> {
@@ -57,9 +49,10 @@ impl StartupManager {
     }
 
     pub fn register(&self) -> Result<()> {
+        let exe_path = std::env::current_exe().context("locate current executable")?;
         unsafe {
             let hkey = open_run_key(KEY_WRITE).context("open Windows Run key")?;
-            let path_bytes: Vec<u8> = quoted_executable_command(self.exe_path.as_os_str())
+            let path_bytes: Vec<u8> = quoted_executable_command(exe_path.as_os_str())
                 .into_iter()
                 .chain(std::iter::once(0))
                 .flat_map(|c| c.to_le_bytes())
@@ -82,9 +75,10 @@ impl StartupManager {
     pub fn unregister(&self) -> Result<()> {
         unsafe {
             let hkey = open_run_key(KEY_WRITE).context("open Windows Run key")?;
-            RegDeleteValueW(*hkey, windows::core::w!("aurora"))
-                .ok()
-                .context("delete Aurora Windows Run value")?;
+            let result = RegDeleteValueW(*hkey, windows::core::w!("aurora"));
+            if result != ERROR_FILE_NOT_FOUND {
+                result.ok().context("delete Aurora Windows Run value")?;
+            }
         }
 
         Ok(())

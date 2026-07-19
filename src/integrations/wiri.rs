@@ -14,7 +14,6 @@ use crate::scheduler::{SwapReason, SwapRequest};
 const PIPE_NAME: &str = r"\\.\pipe\wiri_control";
 const RETRY_SECS: u64 = 30;
 const MAX_LINE_BYTES: usize = 64 * 1024;
-const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Subscribe to wiri workspace events and forward them as SwapRequests.
 ///
@@ -63,8 +62,12 @@ async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
 
     // Read events line by line
     let mut reader = BufReader::new(pipe);
+    let ack = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("wiri closed before subscription acknowledgement"))?;
+    verify_subscription_ack(&ack)?;
 
-    while let Some(line) = read_wiri_line(&mut reader, MAX_LINE_BYTES, READ_TIMEOUT).await? {
+    while let Some(line) = read_bounded_line(&mut reader, MAX_LINE_BYTES).await? {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -83,6 +86,20 @@ async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Event parsing
 // ---------------------------------------------------------------------------
+
+fn verify_subscription_ack(line: &[u8]) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(line)?;
+    if value.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    bail!(
+        "wiri subscription rejected: {}",
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("invalid acknowledgement")
+    )
+}
 
 fn parse_event(line: &[u8]) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_slice(line)?;
@@ -104,16 +121,6 @@ fn enqueue_workspace(swap_tx: &mpsc::Sender<SwapRequest>) -> bool {
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
-}
-
-async fn read_wiri_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-    timeout: Duration,
-) -> Result<Option<Vec<u8>>> {
-    tokio::time::timeout(timeout, read_bounded_line(reader, max_bytes))
-        .await
-        .map_err(|_| anyhow::anyhow!("wiri IPC read timed out"))?
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
@@ -176,27 +183,35 @@ mod tests {
     use tokio::io::{AsyncWriteExt, BufReader};
 
     #[test]
-    fn parses_workspace_events_and_rejects_malformed_json() {
+    fn validates_ack_and_parses_workspace_events() {
+        assert!(verify_subscription_ack(br#"{"success":true,"subscription_id":1}"#).is_ok());
+        assert!(verify_subscription_ack(br#"{"success":false,"error":"unsupported"}"#).is_err());
         assert!(parse_event(br#"{"type":"workspace_switched"}"#).unwrap());
         assert!(!parse_event(br#"{"type":"other"}"#).unwrap());
         assert!(parse_event(b"{").is_err());
     }
 
     #[tokio::test]
-    async fn rejects_oversized_and_stalled_lines() {
+    async fn rejects_oversized_and_waits_for_complete_lines() {
         let (mut writer, reader) = tokio::io::duplex(32);
         writer.write_all(b"123456789\n").await.unwrap();
         drop(writer);
-        let error = read_wiri_line(&mut BufReader::new(reader), 8, Duration::from_secs(1))
+        let error = read_bounded_line(&mut BufReader::new(reader), 8)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeds 8 bytes"));
 
-        let (_writer, reader) = tokio::io::duplex(32);
-        let error = read_wiri_line(&mut BufReader::new(reader), 8, Duration::from_millis(10))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let read = tokio::spawn(async move {
+            read_bounded_line(&mut BufReader::new(reader), 8)
+                .await
+                .unwrap()
+        });
+        writer.write_all(b"1234").await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!read.is_finished());
+        writer.write_all(b"567\n").await.unwrap();
+        assert_eq!(read.await.unwrap().unwrap(), b"1234567\n");
     }
 
     #[test]

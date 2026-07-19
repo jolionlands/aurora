@@ -1141,15 +1141,26 @@ fn collect_manifest_candidates(path: &Path) -> anyhow::Result<Vec<BatchCandidate
             })?;
         out.push(BatchCandidate {
             path: path.to_string(),
-            content_hash: row
-                .get("sha256")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string()),
+            content_hash: manifest_sha256(row.get("sha256"), index)?,
             width: row.get("width").and_then(Value::as_u64),
             height: row.get("height").and_then(Value::as_u64),
         });
     }
     Ok(out)
+}
+
+fn manifest_sha256(value: Option<&Value>, index: usize) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let hash = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("manifest row {index} sha256 must be a string"))?
+        .trim();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("manifest row {index} sha256 must be exactly 64 hexadecimal characters");
+    }
+    Ok(Some(hash.to_ascii_lowercase()))
 }
 
 fn read_at_most(reader: impl std::io::Read, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -2197,15 +2208,12 @@ fn print_response(bytes: &[u8], as_json: bool) -> Result<()> {
 /// Keep the pipe open and print each event as a JSON line.
 async fn stream_events(types: Vec<String>) -> Result<()> {
     use aurora::ipc::{
-        pipe_path, read_frame, read_frame_with_timeout, write_frame_with_timeout, IpcMessage,
-        FRAME_IO_TIMEOUT,
+        open_pipe_client, pipe_path, read_frame, read_frame_with_timeout, write_frame_with_timeout,
+        IpcMessage, FRAME_IO_TIMEOUT,
     };
-    use tokio::net::windows::named_pipe::ClientOptions;
 
     let path = pipe_path()?;
-    let mut client = ClientOptions::new()
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("Cannot connect to aurora daemon: {}", e))?;
+    let mut client = open_pipe_client(&path, FRAME_IO_TIMEOUT).await?;
 
     let msg = IpcMessage::SubscribeEvents { types };
     write_frame_with_timeout(&mut client, &serde_json::to_vec(&msg)?, FRAME_IO_TIMEOUT).await?;
@@ -2769,6 +2777,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("manifest row 0 must be a JSON object"));
+    }
+
+    #[test]
+    fn manifest_hashes_are_validated_and_normalized() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let uppercase = "A".repeat(64);
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"{{"rows":[{{"status":"ok","absolute_path":"one.jpg","sha256":" {uppercase} "}}]}}"#
+            ),
+        )
+        .unwrap();
+        let candidates = collect_manifest_candidates(file.path()).unwrap();
+        let lowercase = "a".repeat(64);
+        assert_eq!(
+            candidates[0].content_hash.as_deref(),
+            Some(lowercase.as_str())
+        );
+
+        std::fs::write(
+            file.path(),
+            r#"{"rows":[{"status":"ok","absolute_path":"one.jpg","sha256":""}]}"#,
+        )
+        .unwrap();
+        let error = collect_manifest_candidates(file.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest row 0 sha256"));
+        assert!(error.contains("64 hexadecimal"));
     }
 
     #[test]

@@ -61,11 +61,12 @@ aurora-ctl autotag-batch --manifest scan.json --playlist catalog --base-url "htt
 
 Batch input is either a folder or a manifest, not both. A manifest is a JSON
 object with a `rows` array. Only rows whose `status` is `"ok"` are processed;
-those rows require `absolute_path` and may include `sha256`, `width`, and
-`height` for duplicate and small-image filtering:
+those rows require `absolute_path` and may include a 64-hex-digit `sha256`
+(normalized to lowercase), `width`, and `height` for duplicate and small-image
+filtering:
 
 ```json
-{"rows":[{"status":"ok","absolute_path":"D:\\Wallpapers\\lake.jpg","sha256":"...","width":3840,"height":2160}]}
+{"rows":[{"status":"ok","absolute_path":"D:\\Wallpapers\\lake.jpg","sha256":"0000000000000000000000000000000000000000000000000000000000000000","width":3840,"height":2160}]}
 ```
 
 Playlist metadata is the source of truth for batch resume: already-tagged paths

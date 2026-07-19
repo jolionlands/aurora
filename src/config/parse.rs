@@ -334,8 +334,30 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
         bail!("unclosed section {:?}", section_stack.join("."));
     }
 
-    validate_schedule(&mut config.schedule)?;
+    validate_config(&mut config)?;
     Ok(config)
+}
+
+fn validate_config(config: &mut Config) -> Result<()> {
+    validate_schedule(&mut config.schedule)?;
+    if config
+        .sources
+        .iter()
+        .any(|source| source.path.as_os_str().is_empty())
+    {
+        bail!("every source requires a path");
+    }
+    if config
+        .monitors
+        .iter()
+        .any(|monitor| monitor.name.trim().is_empty())
+    {
+        bail!("every monitor override requires a name");
+    }
+    if config.metrics.enabled && config.metrics.port == 0 {
+        bail!("enabled metrics requires a non-zero port");
+    }
+    Ok(())
 }
 
 fn validate_schedule(schedule: &mut ScheduleConfig) -> Result<()> {
@@ -352,6 +374,9 @@ fn validate_schedule(schedule: &mut ScheduleConfig) -> Result<()> {
     }
     if schedule.mode == "at" && schedule.at_times.is_empty() {
         bail!("schedule mode \"at\" requires at least one `at \"HH:MM\"` entry");
+    }
+    if schedule.mode == "interval" && schedule.interval_secs == 0 {
+        bail!("schedule mode \"interval\" requires interval-secs greater than zero");
     }
     Ok(())
 }
@@ -613,6 +638,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid schedule time"));
+        assert!(parse_kdl_config("schedule {\ninterval-secs 0\n}")
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
         assert_eq!(
             parse_kdl_config("schedule {\nmode \"AT\"\nat \"09:30\"\n}")
                 .unwrap()
@@ -646,6 +675,26 @@ mod tests {
                 .transitions
                 .enabled
         );
+    }
+
+    #[test]
+    fn rejects_inert_source_monitor_and_metrics_config() {
+        for (input, expected) in [
+            ("source {\n}", "source requires a path"),
+            ("monitor {\n}", "monitor override requires a name"),
+            (
+                "metrics {\nenabled true\nport 0\n}",
+                "metrics requires a non-zero port",
+            ),
+        ] {
+            assert!(
+                parse_kdl_config(input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "{input:?} should mention {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -764,7 +813,7 @@ source "//server/share/壁紙" { // quoted slashes are not a comment
     #[test]
     fn accepts_existing_runtime_enum_aliases_case_insensitively() {
         let config = parse_kdl_config(
-            "monitor {\nfit CENTRE\n}\ntransitions {\nstyle SLIDE_LEFT\nrenderer GPU\n}",
+            "monitor \"display\" {\nfit CENTRE\n}\ntransitions {\nstyle SLIDE_LEFT\nrenderer GPU\n}",
         )
         .unwrap();
 

@@ -216,7 +216,7 @@ impl IpcServer {
                     ),
                 }
             }
-            message => (self.process_message(message), None),
+            message => (self.process_message(message).await, None),
         };
         let bytes = bounded_response_bytes(&response, is_playlist_list)?;
         write_frame_with_timeout(&mut pipe, &bytes, FRAME_IO_TIMEOUT).await?;
@@ -227,7 +227,7 @@ impl IpcServer {
         Ok(())
     }
 
-    fn process_message(&self, message: IpcMessage) -> serde_json::Value {
+    async fn process_message(&self, message: IpcMessage) -> serde_json::Value {
         // Helper: get a clone of the runtime handle, or return not-ready error.
         macro_rules! runtime {
             () => {
@@ -262,9 +262,10 @@ impl IpcServer {
 
             IpcMessage::Reload => {
                 info!("IPC: Reload config requested");
-                if let Some(handle) = self.runtime.lock().clone() {
-                    match handle.reload_from_disk() {
-                        Ok(()) => {
+                let handle = { self.runtime.lock().clone() };
+                if let Some(handle) = handle {
+                    match tokio::task::spawn_blocking(move || handle.reload_from_disk()).await {
+                        Ok(Ok(())) => {
                             self.broadcast_event(IpcEvent::ConfigReloaded);
                             serde_json::json!({
                                 "success": true,
@@ -274,7 +275,13 @@ impl IpcServer {
                                 }
                             })
                         }
-                        Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+                        Ok(Err(error)) => {
+                            serde_json::json!({ "success": false, "error": error.to_string() })
+                        }
+                        Err(error) => serde_json::json!({
+                            "success": false,
+                            "error": format!("reload task failed: {error}")
+                        }),
                     }
                 } else {
                     serde_json::json!({ "success": false, "error": "runtime not initialised" })
@@ -309,8 +316,19 @@ impl IpcServer {
             }
 
             IpcMessage::SetFolder { path } => {
-                if let Some(handle) = self.runtime.lock().clone() {
-                    command_response(handle.set_folder(std::path::PathBuf::from(path)))
+                let handle = { self.runtime.lock().clone() };
+                if let Some(handle) = handle {
+                    match tokio::task::spawn_blocking(move || {
+                        handle.set_folder(std::path::PathBuf::from(path))
+                    })
+                    .await
+                    {
+                        Ok(result) => command_response(result),
+                        Err(error) => serde_json::json!({
+                            "success": false,
+                            "error": format!("set-folder task failed: {error}")
+                        }),
+                    }
                 } else {
                     serde_json::json!({ "success": false, "error": "runtime not initialised" })
                 }
@@ -949,19 +967,19 @@ mod tests {
         assert_eq!(slots.available_permits(), 1);
     }
 
-    #[test]
-    fn next_reports_closed_runtime_channel() {
+    #[tokio::test]
+    async fn next_reports_closed_runtime_channel() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let server = server_with_swap_sender(tx);
 
-        let response = server.process_message(IpcMessage::Next);
+        let response = server.process_message(IpcMessage::Next).await;
         assert_eq!(response["success"], serde_json::json!(false));
         assert_eq!(response["error"], "runtime swap channel is closed");
     }
 
-    #[test]
-    fn next_reports_busy_runtime_queue() {
+    #[tokio::test]
+    async fn next_reports_busy_runtime_queue() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(crate::scheduler::SwapRequest {
             reason: crate::scheduler::SwapReason::Interval,
@@ -970,7 +988,7 @@ mod tests {
         .unwrap();
         let server = server_with_swap_sender(tx);
 
-        let response = server.process_message(IpcMessage::Next);
+        let response = server.process_message(IpcMessage::Next).await;
         assert_eq!(response["success"], serde_json::json!(false));
         assert_eq!(response["error"], "runtime swap queue is busy");
     }

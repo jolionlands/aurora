@@ -66,8 +66,15 @@ pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 /// Bound frame setup and writes so a peer cannot hold an IPC task forever.
 pub const FRAME_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Commands such as source reloads may legitimately take much longer than frame I/O.
-pub const COMMAND_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Source-changing commands may legitimately take several minutes.
+pub const COMMAND_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn command_response_timeout(msg: &IpcMessage) -> std::time::Duration {
+    match msg {
+        IpcMessage::Reload | IpcMessage::SetFolder { .. } => COMMAND_RESPONSE_TIMEOUT,
+        _ => FRAME_IO_TIMEOUT,
+    }
+}
 
 /// Read one length-prefixed IPC frame. A clean EOF before the header is
 /// returned as `Ok(None)`; partial/truncated frames are errors.
@@ -153,21 +160,61 @@ where
         })?
 }
 
-/// Send a single `IpcMessage` to a running aurora daemon and return the
-/// raw JSON response bytes.  Used by `aurora-ctl`.
-pub async fn send_message(msg: &IpcMessage) -> anyhow::Result<Vec<u8>> {
+/// Wait briefly for a free server instance when Windows reports a busy pipe.
+pub async fn open_pipe_client(
+    path: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
+    let connect = async {
+        loop {
+            match ClientOptions::new().open(path) {
+                Ok(client) => return Ok(client),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, connect)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Cannot connect to aurora daemon at {path}: IPC remained busy for {} ms",
+                timeout.as_millis()
+            )
+        })?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "Cannot connect to aurora daemon at {path}: aurora is not running in this Windows session ({error})"
+                )
+            } else {
+                anyhow::anyhow!("Cannot connect to aurora daemon at {path}: {error}")
+            }
+        })
+}
+
+/// Send a single `IpcMessage` to a running aurora daemon and return the
+/// raw JSON response bytes. Used by `aurora-ctl`.
+pub async fn send_message(msg: &IpcMessage) -> anyhow::Result<Vec<u8>> {
     let path = pipe_path()?;
-    let mut client = ClientOptions::new()
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("Cannot connect to aurora daemon at {}: {}", path, e))?;
+    let mut client = open_pipe_client(&path, FRAME_IO_TIMEOUT).await?;
 
     let bytes = serde_json::to_vec(msg)?;
     write_frame_with_timeout(&mut client, &bytes, FRAME_IO_TIMEOUT).await?;
-    read_frame_with_timeout(&mut client, COMMAND_RESPONSE_TIMEOUT)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("aurora daemon closed IPC pipe without a response"))
+    let response = read_frame_with_timeout(&mut client, command_response_timeout(msg))
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "aurora daemon at {path} accepted the IPC request but did not complete a response; it may still be starting"
+            ))
+        })?;
+    response.ok_or_else(|| anyhow::anyhow!("aurora daemon closed IPC pipe without a response"))
 }
 
 #[cfg(test)]
@@ -187,6 +234,78 @@ mod tests {
         let name = format!(r"Local\Aurora-test-{}", std::process::id());
         let _owner = acquire_named_singleton(&name).expect("acquire singleton");
         assert!(acquire_named_singleton(&name).is_err());
+    }
+
+    #[test]
+    fn only_source_commands_use_the_long_response_timeout() {
+        assert_eq!(
+            command_response_timeout(&IpcMessage::Reload),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(
+            command_response_timeout(&IpcMessage::SetFolder {
+                path: "C:\\wallpapers".to_string()
+            }),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(
+            command_response_timeout(&IpcMessage::Status),
+            FRAME_IO_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn pipe_client_retries_busy_instances_and_explains_failures() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing = format!(r"\\.\pipe\aurora-test-missing-{suffix}");
+        let error = open_pipe_client(&missing, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not running"));
+
+        let path = format!(r"\\.\pipe\aurora-test-busy-{suffix}");
+        let first_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path)
+            .unwrap();
+        let mut first_client = open_pipe_client(&path, std::time::Duration::from_millis(100))
+            .await
+            .unwrap();
+        write_frame(&mut first_client, b"startup").await.unwrap();
+        first_server.connect().await.unwrap();
+        let mut first_server = first_server;
+        assert_eq!(
+            read_frame(&mut first_server).await.unwrap().unwrap(),
+            b"startup"
+        );
+        write_frame(&mut first_server, b"ready").await.unwrap();
+        assert_eq!(
+            read_frame(&mut first_client).await.unwrap().unwrap(),
+            b"ready"
+        );
+
+        let error = open_pipe_client(&path, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("IPC remained busy"));
+
+        let waiting = tokio::spawn({
+            let path = path.clone();
+            async move { open_pipe_client(&path, std::time::Duration::from_secs(1)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(!waiting.is_finished());
+
+        let second_server = ServerOptions::new().create(&path).unwrap();
+        let second_client = waiting.await.unwrap().unwrap();
+        second_server.connect().await.unwrap();
+
+        drop((first_client, first_server, second_client, second_server));
     }
 
     #[tokio::test]

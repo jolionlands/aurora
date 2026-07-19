@@ -165,13 +165,15 @@ fn needs_transition_decode(enabled: bool, has_previous: bool) -> bool {
     enabled && has_previous
 }
 
-fn apply_direct_in_child(path: &Path) -> Result<()> {
+fn apply_direct_in_child(path: &Path, fit: Option<&str>) -> Result<()> {
     use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
+    command.arg("--apply-once").arg(path);
+    if let Some(fit) = fit {
+        command.arg("--apply-fit").arg(fit);
+    }
     command
-        .arg("--apply-once")
-        .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -570,8 +572,13 @@ impl Runtime {
         }
 
         let (successful_monitors, failures, total_monitors) = if !self.config.transitions.enabled {
+            let fit = self
+                .config
+                .monitors
+                .first()
+                .map(|monitor| monitor.fit.as_str());
             self.ban_gate
-                .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path))?
+                .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path, fit))?
                 .ok_or_else(|| {
                     anyhow::anyhow!("wallpaper was banned during swap: {}", new_path.display())
                 })?;
@@ -703,6 +710,8 @@ pub struct RuntimeHandle {
     paused: Arc<Mutex<PauseState>>,
     /// Path to the config file on disk, used by reload_from_disk().
     config_path: Arc<std::path::PathBuf>,
+    /// Serializes source scans without delaying unrelated ban updates.
+    source_updates: Arc<Mutex<()>>,
     /// Serializes ban persistence and gates the final wallpaper apply.
     ban_gate: BanGate,
     /// Shared playlist store.  IPC commands mutate this and persist to disk.
@@ -836,13 +845,15 @@ fn resolve_playlist_entry_path(
                 std::fs::canonicalize(stored_path).is_ok_and(|path| path == *incoming)
             })
         } else {
-            source_roots.iter().any(|root| {
-                let candidate = root.join(stored_path);
-                canonical_incoming.as_ref().is_some_and(|incoming| {
-                    std::fs::canonicalize(&candidate).is_ok_and(|path| path == *incoming)
-                }) || lexical_incoming.as_ref().is_some_and(|incoming| {
-                    std::path::absolute(&candidate).is_ok_and(|path| path == *incoming)
-                })
+            let candidate = source_roots
+                .iter()
+                .map(|root| root.join(stored_path))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| source_roots[0].join(stored_path));
+            canonical_incoming.as_ref().is_some_and(|incoming| {
+                std::fs::canonicalize(&candidate).is_ok_and(|path| path == *incoming)
+            }) || lexical_incoming.as_ref().is_some_and(|incoming| {
+                std::path::absolute(&candidate).is_ok_and(|path| path == *incoming)
             })
         };
         if !equivalent {
@@ -883,6 +894,7 @@ impl RuntimeHandle {
                 pause_until: None,
             })),
             config_path: Arc::new(config_path),
+            source_updates: Arc::new(Mutex::new(())),
             ban_gate: shared.2,
             playlist_store,
             playlists_path: Arc::new(playlists_path),
@@ -1022,11 +1034,12 @@ impl RuntimeHandle {
     /// Schedule, transition, monitor, cache, metrics, and log-level changes
     /// require a full daemon restart.
     pub fn reload_from_disk(&self) -> anyhow::Result<()> {
-        let _update = self.ban_gate.0.updates.lock();
+        let _source_update = self.source_updates.lock();
         let src = std::fs::read_to_string(self.config_path.as_ref())
             .with_context(|| format!("read config {}", self.config_path.display()))?;
         let config = crate::config::parse::parse_kdl_config(&src)
             .with_context(|| format!("parse config {}", self.config_path.display()))?;
+        let _com = ComApartment::initialize().context("initialize COM for source reload")?;
         let new_roots = config
             .sources
             .iter()
@@ -1040,6 +1053,8 @@ impl RuntimeHandle {
             PhotoIndex::scan_sources(&config.sources)
                 .context("scanning photo sources during reload")?
         };
+
+        let _ban_update = self.ban_gate.0.updates.lock();
         let bans = load_bans(&bans_path(self.config_path.as_ref()))?;
         new_index.apply_bans(&bans);
 
@@ -1069,7 +1084,8 @@ impl RuntimeHandle {
         std::fs::read_dir(&path)
             .with_context(|| format!("set_folder: read directory {}", path.display()))?;
 
-        let _update = self.ban_gate.0.updates.lock();
+        let _source_update = self.source_updates.lock();
+        let _com = ComApartment::initialize().context("initialize COM for folder scan")?;
         let extensions: Vec<String> = DEFAULT_IMAGE_EXTENSIONS
             .iter()
             .map(|extension| (*extension).to_string())
@@ -1080,6 +1096,8 @@ impl RuntimeHandle {
             PhotoIndex::scan(std::slice::from_ref(&path), &extensions, true)
                 .with_context(|| format!("set_folder: scan {:?}", path))?
         };
+
+        let _ban_update = self.ban_gate.0.updates.lock();
         let bans = load_bans(&bans_path(self.config_path.as_ref()))?;
         new_index.apply_bans(&bans);
 
@@ -1907,6 +1925,35 @@ mod tests {
     }
 
     #[test]
+    fn absolute_request_does_not_alias_a_shadowed_relative_entry() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        std::fs::write(root_a.path().join("photo.jpg"), b"first").unwrap();
+        let second = root_b.path().join("photo.jpg");
+        std::fs::write(&second, b"second").unwrap();
+
+        let mut initial = PlaylistStore::default();
+        initial.create("roots").unwrap();
+        initial.add_path("roots", "photo.jpg").unwrap();
+        let store = Arc::new(Mutex::new(initial));
+        let handle = make_playlist_handle(root_a.path().join("playlists.kdl"), Arc::clone(&store));
+        *handle.source_roots.write() =
+            vec![root_a.path().to_path_buf(), root_b.path().to_path_buf()];
+        let second = std::fs::canonicalize(second)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let error = handle
+            .playlist_tag("roots", &second, "theme", vec!["night".to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not in playlist"), "{error}");
+        assert!(store.lock().get("roots").unwrap().tag_groups.is_empty());
+    }
+
+    #[test]
     fn absolute_request_rejects_ambiguous_relative_entries() {
         let directory = tempfile::tempdir().unwrap();
         let photo = directory.path().join("photo.jpg");
@@ -2219,6 +2266,39 @@ mod tests {
     }
 
     #[test]
+    fn reload_initializes_com_for_wic_only_extensions() {
+        use image::{ImageBuffer, ImageFormat, Rgb};
+
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("wallpaper.heic");
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(16, 16, Rgb([255, 0, 0]));
+        image
+            .save_with_format(&image_path, ImageFormat::Bmp)
+            .unwrap();
+        let config_path = directory.path().join("config.kdl");
+        std::fs::write(
+            &config_path,
+            format!(
+                "source {{\npath \"{}\"\nextensions \"heic\"\nmin-width 0\nmin-height 0\n}}\n",
+                directory.path().display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let index = Arc::new(RwLock::new(PhotoIndex::default()));
+        let handle = make_source_handle(
+            config_path,
+            Arc::clone(&index),
+            Arc::new(RwLock::new(Vec::new())),
+            Metrics::new(),
+        );
+
+        handle.reload_from_disk().unwrap();
+
+        assert_eq!(index.read().len(), 1);
+    }
+
+    #[test]
     fn failed_source_updates_leave_index_and_roots_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.kdl");
@@ -2248,6 +2328,42 @@ mod tests {
         assert_eq!(index.read().photos[0].path, PathBuf::from("sentinel.jpg"));
         assert_eq!(*roots.read(), vec![PathBuf::from("sentinel-root")]);
         assert_eq!(metrics.index_size.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reload_preparation_does_not_wait_for_ban_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.kdl");
+        std::fs::write(
+            &config_path,
+            source_config(&directory.path().join("missing-source")),
+        )
+        .unwrap();
+        let handle = make_source_handle(
+            config_path,
+            Arc::new(RwLock::new(PhotoIndex::default())),
+            Arc::new(RwLock::new(Vec::new())),
+            Metrics::new(),
+        );
+        let ban_update = handle.ban_gate.0.updates.lock();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let result = std::thread::scope(|scope| {
+            let handle = handle.clone();
+            scope.spawn(move || {
+                result_tx
+                    .send(handle.reload_from_disk().map_err(|error| error.to_string()))
+                    .unwrap();
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(1));
+            drop(ban_update);
+            result
+        });
+
+        assert!(
+            matches!(&result, Ok(Err(error)) if error.contains("scanning photo sources")),
+            "source scan waited for the ban update lock: {result:?}"
+        );
     }
 
     #[test]

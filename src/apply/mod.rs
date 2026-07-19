@@ -3,6 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
 use windows::Win32::UI::Shell::{
     DesktopWallpaper, IDesktopWallpaper, DESKTOP_WALLPAPER_POSITION, DWPOS_CENTER, DWPOS_FILL,
@@ -108,18 +109,9 @@ impl WallpaperApplier {
                 id
             };
             let rect = rect.with_context(|| format!("GetMonitorRECT({})", id))?;
-            let width = rect.right.saturating_sub(rect.left);
-            let height = rect.bottom.saturating_sub(rect.top);
-            if width <= 0 || height <= 0 {
-                anyhow::bail!("GetMonitorRECT({}) returned an empty rectangle", id);
+            if let Some(monitor) = attached_monitor(id, rect) {
+                monitors.push(monitor);
             }
-            monitors.push(MonitorInfo {
-                id,
-                x: rect.left,
-                y: rect.top,
-                width: width as u32,
-                height: height as u32,
-            });
         }
         Ok(monitors)
     }
@@ -202,6 +194,22 @@ impl WallpaperApplier {
     }
 }
 
+fn attached_monitor(id: String, rect: RECT) -> Option<MonitorInfo> {
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+    if width <= 0 || height <= 0 {
+        tracing::debug!(monitor = %id, "skipping detached monitor");
+        return None;
+    }
+    Some(MonitorInfo {
+        id,
+        x: rect.left,
+        y: rect.top,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
 pub fn configured_global_fit(config: &Config, monitors: &[MonitorInfo]) -> WallpaperFit {
     let fit_for = |monitor_id: &str| {
         config
@@ -222,4 +230,27 @@ pub fn configured_global_fit(config: &Config, monitors: &[MonitorInfo]) -> Wallp
         );
     }
     fit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_enumeration_skips_detached_rectangles() {
+        assert!(attached_monitor("detached".to_string(), RECT::default()).is_none());
+
+        let attached = attached_monitor(
+            "attached".to_string(),
+            RECT {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+            },
+        )
+        .unwrap();
+        assert_eq!((attached.x, attached.y), (-1920, 0));
+        assert_eq!((attached.width, attached.height), (1920, 1080));
+    }
 }

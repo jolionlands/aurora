@@ -202,13 +202,16 @@ fn is_fullscreen_active() -> bool {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetShellWindow, GetWindowRect,
+    };
 
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
             return false;
         }
+        let is_shell_desktop = hwnd == GetShellWindow();
 
         let mut win_rect = RECT::default();
         if GetWindowRect(hwnd, &mut win_rect).is_err() {
@@ -225,11 +228,20 @@ fn is_fullscreen_active() -> bool {
         }
 
         let mr = mi.rcMonitor;
-        win_rect.left == mr.left
-            && win_rect.top == mr.top
-            && win_rect.right == mr.right
-            && win_rect.bottom == mr.bottom
+        should_pause_for_window(is_shell_desktop, &win_rect, &mr)
     }
+}
+
+fn should_pause_for_window(
+    is_shell_desktop: bool,
+    window: &windows::Win32::Foundation::RECT,
+    monitor: &windows::Win32::Foundation::RECT,
+) -> bool {
+    !is_shell_desktop
+        && window.left <= monitor.left
+        && window.top <= monitor.top
+        && window.right >= monitor.right
+        && window.bottom >= monitor.bottom
 }
 
 /// Returns how many seconds the system has been idle (no keyboard/mouse input).
@@ -323,6 +335,42 @@ mod tests {
         let (hour, minute) = local_hour_minute();
         assert!(hour < 24);
         assert!(minute < 60);
+    }
+
+    #[test]
+    fn fullscreen_pause_ignores_desktop_and_allows_invisible_borders() {
+        use windows::Win32::Foundation::RECT;
+
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let bordered_fullscreen = RECT {
+            left: -8,
+            top: -8,
+            right: 1928,
+            bottom: 1088,
+        };
+        assert!(should_pause_for_window(
+            false,
+            &bordered_fullscreen,
+            &monitor
+        ));
+        assert!(!should_pause_for_window(
+            true,
+            &bordered_fullscreen,
+            &monitor
+        ));
+
+        let inset_window = RECT {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1080,
+        };
+        assert!(!should_pause_for_window(false, &inset_window, &monitor));
     }
 
     #[test]

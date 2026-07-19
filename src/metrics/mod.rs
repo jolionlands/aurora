@@ -177,11 +177,17 @@ fn escape_label_value(value: &str) -> String {
 // HTTP server
 // ---------------------------------------------------------------------------
 
-/// Serve Prometheus `/metrics` and `/healthz` on the given port.
-/// Never returns (runs until task is cancelled).
-pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>) -> Result<()> {
+pub async fn bind_metrics(port: u16) -> Result<TcpListener> {
     let addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&addr).await?;
+    TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))
+}
+
+/// Serve Prometheus `/metrics` and `/healthz` on a bound listener.
+/// Never returns (runs until task is cancelled).
+pub async fn serve_metrics(listener: TcpListener, metrics: Arc<Metrics>) -> Result<()> {
+    let addr = listener.local_addr()?;
     tracing::info!("metrics server listening on http://{addr}/metrics");
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
@@ -354,6 +360,18 @@ mod tests {
             Some("/metrics")
         );
         assert_eq!(get_request_path("POST /metrics HTTP/1.1"), None);
+    }
+
+    #[tokio::test]
+    async fn metrics_bind_reports_an_occupied_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let error = bind_metrics(port)
+            .await
+            .expect_err("an occupied metrics port must fail");
+
+        assert!(error.to_string().contains("bind 127.0.0.1"));
     }
 
     #[tokio::test]

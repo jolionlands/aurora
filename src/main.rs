@@ -10,12 +10,12 @@ use tokio::task::JoinHandle;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use aurora::apply::WallpaperApplier;
+use aurora::apply::{WallpaperApplier, WallpaperFit};
 use aurora::config::parse::{default_config_path, parse_kdl_config};
 use aurora::hooks::StartupManager;
 use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
-use aurora::metrics::{serve_metrics, Metrics};
+use aurora::metrics::{bind_metrics, serve_metrics, Metrics};
 use aurora::playlist::default_playlists_path;
 use aurora::runtime::{ComApartment, Runtime, RuntimeHandle, RuntimeStateSnapshot};
 use aurora::scheduler::Scheduler;
@@ -37,6 +37,9 @@ struct Args {
     #[arg(long, hide = true, value_name = "PATH")]
     apply_once: Option<PathBuf>,
 
+    #[arg(long, hide = true, requires = "apply_once", value_name = "FIT")]
+    apply_fit: Option<String>,
+
     /// Register aurora in the Windows Run key so it starts with Windows.
     #[arg(long)]
     register_autostart: bool,
@@ -55,14 +58,14 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     let args = Args::parse();
     if let Some(path) = args.apply_once {
-        return apply_once(&path);
+        return apply_once(&path, args.apply_fit.as_deref());
     }
     if args.register_autostart || args.unregister_autostart {
         init_logging("info")?;
     }
 
     if args.register_autostart {
-        let mgr = StartupManager::default();
+        let mgr = StartupManager;
         match mgr.register() {
             Ok(()) => {
                 info!(
@@ -80,7 +83,7 @@ async fn main() -> Result<()> {
     }
 
     if args.unregister_autostart {
-        let mgr = StartupManager::default();
+        let mgr = StartupManager;
         match mgr.unregister() {
             Ok(()) => {
                 info!("autostart: removed aurora from Windows Run key");
@@ -133,7 +136,7 @@ async fn main() -> Result<()> {
 
     // Log autostart status.
     {
-        let mgr = StartupManager::default();
+        let mgr = StartupManager;
         if mgr.is_registered() {
             info!(
                 "autostart: registered (path: {})",
@@ -148,6 +151,15 @@ async fn main() -> Result<()> {
     // 5. Build metrics, applier, runtime
     // ---------------------------------------------------------------------------
     let metrics = Metrics::new();
+    let metrics_listener = if config.metrics.enabled {
+        Some(
+            bind_metrics(config.metrics.port)
+                .await
+                .context("initialize metrics server")?,
+        )
+    } else {
+        None
+    };
 
     let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
 
@@ -222,11 +234,10 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     // 10. Metrics HTTP server (optional)
     // ---------------------------------------------------------------------------
-    if config.metrics.enabled {
-        let port = config.metrics.port;
+    if let Some(listener) = metrics_listener {
         let m = Arc::clone(&metrics);
         tokio::spawn(async move {
-            if let Err(e) = serve_metrics(port, m).await {
+            if let Err(e) = serve_metrics(listener, m).await {
                 tracing::warn!("metrics server: {}", e);
             }
         });
@@ -246,15 +257,13 @@ async fn main() -> Result<()> {
     .await
 }
 
-fn apply_once(path: &Path) -> Result<()> {
+fn apply_once(path: &Path, fit: Option<&str>) -> Result<()> {
     let _com = ComApartment::initialize()?;
-    let config_path = default_config_path();
-    let config = parse_kdl_config(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("read config {}", config_path.display()))?,
-    )
-    .with_context(|| format!("parse config {}", config_path.display()))?;
-    WallpaperApplier::new()?.apply_all(&config, path)
+    let applier = WallpaperApplier::new()?;
+    if let Some(fit) = fit {
+        applier.set_fit(WallpaperFit::parse(fit))?;
+    }
+    applier.set_for_all_monitors(path)
 }
 
 fn init_logging(default_filter: &str) -> Result<()> {
@@ -334,6 +343,21 @@ fn enable_dpi_awareness() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_helper_fit_requires_an_apply_path() {
+        assert!(Args::try_parse_from(["aurora", "--apply-fit", "fill"]).is_err());
+
+        let args = Args::try_parse_from([
+            "aurora",
+            "--apply-once",
+            r"C:\wallpapers\one.jpg",
+            "--apply-fit",
+            "contain",
+        ])
+        .unwrap();
+        assert_eq!(args.apply_fit.as_deref(), Some("contain"));
+    }
 
     #[tokio::test]
     async fn ipc_exit_wakes_supervisor() {

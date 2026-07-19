@@ -1,6 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{HashSet, VecDeque};
+use std::io::BufReader;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
 
 use crate::config::types::SourceConfig;
 use rand::Rng;
@@ -319,8 +322,15 @@ fn build_entry(
 
 /// Blake3 hash of the entire file, returned as lowercase hex.
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("cannot open {:?} for hashing", path))?;
+    // ponytail: fixed read-ahead; retune only from cold-library scan measurements.
+    const READ_BUFFER_BYTES: usize = 1024 * 1024;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN.0)
+        .open(path)
+        .with_context(|| format!("cannot open {:?} for hashing", path))?;
+    let mut file = BufReader::with_capacity(READ_BUFFER_BYTES, file);
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(&mut file).context("read error")?;
     Ok(hasher.finalize().to_hex().to_string())

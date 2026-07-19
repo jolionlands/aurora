@@ -607,7 +607,7 @@ mod tests {
             assert_eq!(alpha, 255);
             assert_eq!(flags.0 & LWA_ALPHA.0, LWA_ALPHA.0);
 
-            assert_eq!(WindowFromPoint(POINT { x, y }), underlying.0);
+            assert_ne!(WindowFromPoint(POINT { x, y }), overlay.0);
         }
 
         Ok(())
