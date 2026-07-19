@@ -104,6 +104,15 @@ pub enum IpcMessage {
     /// Enable or disable shuffled selection for a playlist.
     PlaylistShuffle { name: String, shuffle: bool },
 
+    /// Replace the active include/exclude tag filters for a playlist.
+    PlaylistFilter {
+        name: String,
+        #[serde(default)]
+        include: std::collections::BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        exclude: std::collections::BTreeMap<String, Vec<String>>,
+    },
+
     /// Check whether one playlist path already has autotag metadata.
     PlaylistAutotagStatus { name: String, path: String },
 
@@ -259,6 +268,35 @@ mod tests {
                 limit: DEFAULT_PLAYLIST_SHOW_LIMIT,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn playlist_filter_roundtrip() {
+        let message = IpcMessage::PlaylistFilter {
+            name: "focus".to_string(),
+            include: std::collections::BTreeMap::from([(
+                "theme".to_string(),
+                vec!["night".to_string()],
+            )]),
+            exclude: std::collections::BTreeMap::from([(
+                "safety".to_string(),
+                vec!["nsfw".to_string()],
+            )]),
+        };
+
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded: IpcMessage = serde_json::from_str(&encoded).unwrap();
+
+        assert!(matches!(
+            decoded,
+            IpcMessage::PlaylistFilter {
+                name,
+                include,
+                exclude
+            } if name == "focus"
+                && include["theme"] == ["night"]
+                && exclude["safety"] == ["nsfw"]
         ));
     }
 

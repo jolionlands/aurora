@@ -223,6 +223,34 @@ impl PlaylistStore {
         recent_paths: &VecDeque<PathBuf>,
         excluded_paths: &HashSet<PathBuf>,
     ) -> Option<PathBuf> {
+        self.pick_resolved(
+            cursor,
+            recent_window,
+            recent_paths,
+            excluded_paths,
+            |_, stored| {
+                let path = PathBuf::from(stored);
+                let resolved = if path.is_absolute() || source_roots.is_empty() {
+                    path
+                } else {
+                    source_roots
+                        .iter()
+                        .map(|root| root.join(&path))
+                        .find(|candidate| candidate.is_file())?
+                };
+                resolved.is_file().then_some((resolved, None))
+            },
+        )
+    }
+
+    pub(crate) fn pick_resolved(
+        &self,
+        cursor: &mut HashMap<String, usize>,
+        recent_window: usize,
+        recent_paths: &VecDeque<PathBuf>,
+        excluded_paths: &HashSet<PathBuf>,
+        mut resolve: impl FnMut(&Playlist, &str) -> Option<(PathBuf, Option<u8>)>,
+    ) -> Option<PathBuf> {
         let pl = self.active_playlist()?;
 
         // Resolve all existing paths with their configured weights.
@@ -230,20 +258,15 @@ impl PlaylistStore {
             .paths
             .iter()
             .filter_map(|s| {
-                let p = PathBuf::from(s);
-                let resolved = if p.is_absolute() || source_roots.is_empty() {
-                    p
-                } else {
-                    source_roots
-                        .iter()
-                        .map(|root| root.join(&p))
-                        .find(|candidate| candidate.is_file())?
-                };
+                let (resolved, content_rating) = resolve(pl, s)?;
                 if !resolved.is_file() || excluded_paths.contains(&resolved) {
                     return None;
                 }
                 let frequency = pl.frequencies.get(s).copied().unwrap_or(1).max(1) as u64;
-                let rating_weight = pl.ratings.get(s).map(|r| *r as u64 + 1).unwrap_or(1);
+                let rating_weight = content_rating
+                    .or_else(|| pl.ratings.get(s).copied())
+                    .map(|rating| u64::from(rating) + 1)
+                    .unwrap_or(1);
                 Some((resolved, frequency.saturating_mul(rating_weight).max(1)))
             })
             .collect();
@@ -804,7 +827,7 @@ fn normalize_custom_kind(kind: &str) -> String {
         .join("-")
 }
 
-fn canonical_tag_kind(kind: &str) -> Result<String> {
+pub(crate) fn canonical_tag_kind(kind: &str) -> Result<String> {
     validate_tag_kind(kind)?;
     if let Some(kind) = normalized_tag_kind(kind) {
         return Ok(kind.to_string());

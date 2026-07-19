@@ -52,6 +52,7 @@ pub fn run_transition(
     new: &DecodedImage,
     style: &TransitionStyle,
     duration_ms: u32,
+    commit: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HINSTANCE;
@@ -215,6 +216,7 @@ pub fn run_transition(
         let h = monitor_bounds.height as f32;
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let mut committed = false;
 
         loop {
             let elapsed = start.elapsed();
@@ -456,6 +458,10 @@ pub fn run_transition(
             }
 
             rt.EndDraw(None, None).context("Direct2D EndDraw failed")?;
+            if !committed {
+                commit().context("commit wallpaper behind GPU transition overlay")?;
+                committed = true;
+            }
 
             // Pump messages
             let mut msg = MSG::default();

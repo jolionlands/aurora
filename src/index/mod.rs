@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
-use std::collections::{HashSet, VecDeque};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
 
@@ -27,6 +28,41 @@ pub struct PhotoIndex {
     pub photos: Vec<PhotoEntry>,
 }
 
+const INDEX_CACHE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedPhoto {
+    path: String,
+    size: u64,
+    creation_time: u64,
+    last_write_time: u64,
+    width: u32,
+    height: u32,
+    hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexCacheFile {
+    version: u32,
+    entries: Vec<CachedPhoto>,
+}
+
+#[derive(Default)]
+struct CacheLookup {
+    entries: Vec<CachedPhoto>,
+    by_path: HashMap<PathBuf, usize>,
+}
+
+#[derive(Default)]
+struct ScanState {
+    index: PhotoIndex,
+    admitted_files: HashSet<PathBuf>,
+    cache: CacheLookup,
+    refreshed: HashMap<PathBuf, CachedPhoto>,
+    cache_hits: usize,
+    cache_misses: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Scan
 // ---------------------------------------------------------------------------
@@ -35,10 +71,9 @@ impl PhotoIndex {
     /// Scan one or more root directories and build the index.
     /// WIC-only formats require COM to be initialized on the current thread.
     pub fn scan(roots: &[PathBuf], extensions: &[String], recursive: bool) -> Result<Self> {
-        let mut index = PhotoIndex::default();
         let exts: Vec<String> = extensions.iter().map(|e| e.to_lowercase()).collect();
         let mut visited_dirs = HashSet::new();
-        let mut admitted_files = HashSet::new();
+        let mut state = ScanState::default();
 
         for root in roots {
             collect_files(
@@ -47,45 +82,42 @@ impl PhotoIndex {
                 recursive,
                 (0, 0),
                 &mut visited_dirs,
-                &mut admitted_files,
-                &mut index,
+                &mut state,
             );
         }
 
-        Ok(index)
+        Ok(state.index)
     }
 
     /// Scan configured sources, preserving each source's extension, recursion,
     /// and minimum-dimension rules. WIC-only formats require COM to be
     /// initialized on the current thread.
     pub fn scan_sources(sources: &[SourceConfig]) -> Result<Self> {
-        let mut index = PhotoIndex::default();
-        let mut admitted_files = HashSet::new();
-        let mut accessible_roots = 0usize;
+        Ok(scan_sources_with_cache(sources, CacheLookup::default())?.0)
+    }
 
-        for source in sources {
-            let mut visited_dirs = HashSet::new();
-            let exts: Vec<String> = source.extensions.iter().map(|e| e.to_lowercase()).collect();
-            if collect_files(
-                &source.path,
-                &exts,
-                source.recursive,
-                (source.min_width, source.min_height),
-                &mut visited_dirs,
-                &mut admitted_files,
-                &mut index,
-            ) {
-                accessible_roots += 1;
+    /// Scan configured sources while reusing previously validated image facts.
+    /// Cache I/O is best-effort: bad state falls back to a full scan and a
+    /// persistence failure never prevents wallpapers from loading.
+    pub fn scan_sources_cached(sources: &[SourceConfig], cache_path: &Path) -> Result<Self> {
+        let cache = match load_index_cache(cache_path) {
+            Ok(cache) => cache,
+            Err(error) => {
+                tracing::warn!(
+                    "ignoring photo index cache {}: {error:#}",
+                    cache_path.display()
+                );
+                CacheLookup::default()
             }
-        }
-
-        if !sources.is_empty() && accessible_roots == 0 {
-            bail!(
-                "none of the {} configured photo source roots could be read",
-                sources.len()
+        };
+        let (index, refreshed, hits, misses) = scan_sources_with_cache(sources, cache)?;
+        if let Err(error) = persist_index_cache(cache_path, refreshed) {
+            tracing::warn!(
+                "could not persist photo index cache {}: {error:#}",
+                cache_path.display()
             );
         }
-
+        tracing::info!("photo index cache: {hits} reused, {misses} validated");
         Ok(index)
     }
 
@@ -180,6 +212,43 @@ impl PhotoIndex {
     }
 }
 
+fn scan_sources_with_cache(
+    sources: &[SourceConfig],
+    cache: CacheLookup,
+) -> Result<(PhotoIndex, Vec<CachedPhoto>, usize, usize)> {
+    let mut state = ScanState {
+        cache,
+        ..ScanState::default()
+    };
+    let mut accessible_roots = 0usize;
+
+    for source in sources {
+        let mut visited_dirs = HashSet::new();
+        let exts: Vec<String> = source.extensions.iter().map(|e| e.to_lowercase()).collect();
+        if collect_files(
+            &source.path,
+            &exts,
+            source.recursive,
+            (source.min_width, source.min_height),
+            &mut visited_dirs,
+            &mut state,
+        ) {
+            accessible_roots += 1;
+        }
+    }
+
+    if !sources.is_empty() && accessible_roots == 0 {
+        bail!(
+            "none of the {} configured photo source roots could be read",
+            sources.len()
+        );
+    }
+
+    let mut refreshed: Vec<_> = state.refreshed.into_values().collect();
+    refreshed.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((state.index, refreshed, state.cache_hits, state.cache_misses))
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -190,8 +259,7 @@ fn collect_files(
     recursive: bool,
     min_dimensions: (u32, u32),
     visited_dirs: &mut HashSet<PathBuf>,
-    admitted_files: &mut HashSet<PathBuf>,
-    index: &mut PhotoIndex,
+    state: &mut ScanState,
 ) -> bool {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(path) => path,
@@ -235,15 +303,7 @@ fn collect_files(
 
         if meta.is_dir() {
             if recursive {
-                collect_files(
-                    &path,
-                    extensions,
-                    true,
-                    min_dimensions,
-                    visited_dirs,
-                    admitted_files,
-                    index,
-                );
+                collect_files(&path, extensions, true, min_dimensions, visited_dirs, state);
             }
             continue;
         }
@@ -269,14 +329,21 @@ fn collect_files(
                 continue;
             }
         };
-        if admitted_files.contains(&canonical_file) {
+        if state.admitted_files.contains(&canonical_file) {
             continue;
         }
 
-        match build_entry(&path, &meta, min_dimensions.0, min_dimensions.1) {
+        match build_entry_cached(
+            &path,
+            &canonical_file,
+            &meta,
+            min_dimensions.0,
+            min_dimensions.1,
+            state,
+        ) {
             Ok(Some(photo)) => {
-                index.photos.push(photo);
-                admitted_files.insert(canonical_file);
+                state.index.photos.push(photo);
+                state.admitted_files.insert(canonical_file);
             }
             Ok(None) => {}
             Err(e) => {
@@ -288,36 +355,159 @@ fn collect_files(
     true
 }
 
-fn build_entry(
+fn build_entry_cached(
     path: &Path,
+    canonical_path: &Path,
     meta: &std::fs::Metadata,
     min_width: u32,
     min_height: u32,
+    state: &mut ScanState,
 ) -> Result<Option<PhotoEntry>> {
-    let size_bytes = meta.len();
-    if size_bytes > crate::decode::MAX_IMAGE_FILE_BYTES {
+    if meta.len() > crate::decode::MAX_IMAGE_FILE_BYTES {
         tracing::warn!(
             "skipping oversized image {}: {} bytes exceeds {} byte limit",
             path.display(),
-            size_bytes,
+            meta.len(),
             crate::decode::MAX_IMAGE_FILE_BYTES
         );
         return Ok(None);
     }
-    let (verified_width, verified_height) = crate::decode::validate_image_file(path)
-        .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
-    if verified_width < min_width || verified_height < min_height {
+
+    let cached = state.cache.find(canonical_path, meta).cloned();
+    let mut fact = if let Some(mut cached) = cached {
+        state.cache_hits += 1;
+        cached.path = canonical_path.to_string_lossy().into_owned();
+        cached
+    } else {
+        state.cache_misses += 1;
+        let (width, height) = crate::decode::validate_image_file(path)
+            .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
+        CachedPhoto::new(canonical_path, meta, width, height)
+    };
+
+    if fact.width < min_width || fact.height < min_height {
+        state.refreshed.insert(canonical_path.to_path_buf(), fact);
         return Ok(None);
     }
 
-    let hash = hash_file(path)?;
+    let hash = match &fact.hash {
+        Some(hash) => hash.clone(),
+        None => {
+            let hash = hash_file(path)?;
+            fact.hash = Some(hash.clone());
+            hash
+        }
+    };
+    let (width, height) = (fact.width, fact.height);
+    state.refreshed.insert(canonical_path.to_path_buf(), fact);
     Ok(Some(PhotoEntry {
         path: path.to_path_buf(),
-        width: Some(verified_width),
-        height: Some(verified_height),
+        width: Some(width),
+        height: Some(height),
         hash,
         banned: false,
     }))
+}
+
+impl CachedPhoto {
+    fn new(path: &Path, meta: &std::fs::Metadata, width: u32, height: u32) -> Self {
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            size: meta.len(),
+            creation_time: meta.creation_time(),
+            last_write_time: meta.last_write_time(),
+            width,
+            height,
+            hash: None,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.size <= crate::decode::MAX_IMAGE_FILE_BYTES
+            && self.width > 0
+            && self.height > 0
+            && u64::from(self.width) * u64::from(self.height) <= crate::decode::MAX_IMAGE_PIXELS
+            && self.hash.as_deref().is_none_or(valid_blake3_hash)
+    }
+
+    fn matches(&self, meta: &std::fs::Metadata) -> bool {
+        self.size == meta.len()
+            && self.creation_time == meta.creation_time()
+            && self.last_write_time == meta.last_write_time()
+    }
+}
+
+impl CacheLookup {
+    fn from_entries(entries: Vec<CachedPhoto>) -> Self {
+        let mut lookup = Self {
+            entries,
+            ..Self::default()
+        };
+        for (index, entry) in lookup.entries.iter().enumerate() {
+            lookup.by_path.insert(PathBuf::from(&entry.path), index);
+        }
+        lookup
+    }
+
+    fn find(&self, path: &Path, meta: &std::fs::Metadata) -> Option<&CachedPhoto> {
+        let by_path = self
+            .by_path
+            .get(path)
+            .and_then(|index| self.entries.get(*index));
+        if by_path.is_some_and(|entry| entry.matches(meta)) {
+            return by_path;
+        }
+        None
+    }
+}
+
+fn valid_blake3_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn load_index_cache(path: &Path) -> Result<CacheLookup> {
+    if !path.exists() {
+        return Ok(CacheLookup::default());
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read photo index cache {}", path.display()))?;
+    let cache: IndexCacheFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse photo index cache {}", path.display()))?;
+    if cache.version != INDEX_CACHE_VERSION {
+        tracing::info!(
+            "photo index cache {} uses version {}, rebuilding version {}",
+            path.display(),
+            cache.version,
+            INDEX_CACHE_VERSION
+        );
+        return Ok(CacheLookup::default());
+    }
+    Ok(CacheLookup::from_entries(
+        cache
+            .entries
+            .into_iter()
+            .filter(CachedPhoto::is_valid)
+            .collect(),
+    ))
+}
+
+fn persist_index_cache(path: &Path, entries: Vec<CachedPhoto>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create photo index cache directory {}", parent.display()))?;
+    }
+    let cache = IndexCacheFile {
+        version: INDEX_CACHE_VERSION,
+        entries,
+    };
+    let bytes = serde_json::to_vec(&cache).context("serialize photo index cache")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("write photo index cache temp file {}", tmp.display()))?;
+    crate::playlist::replace_file(&tmp, path)
 }
 
 /// Blake3 hash of the entire file, returned as lowercase hex.
@@ -365,6 +555,16 @@ mod tests {
             hash_file(file.path()).unwrap(),
             blake3::hash(b"aurora").to_hex().to_string()
         );
+    }
+
+    fn scan_with_test_cache(
+        sources: &[SourceConfig],
+        cache_path: &Path,
+    ) -> (PhotoIndex, usize, usize) {
+        let cache = load_index_cache(cache_path).unwrap();
+        let (index, refreshed, hits, misses) = scan_sources_with_cache(sources, cache).unwrap();
+        persist_index_cache(cache_path, refreshed).unwrap();
+        (index, hits, misses)
     }
 
     fn source(
@@ -458,8 +658,9 @@ mod tests {
             .set_len(crate::decode::MAX_IMAGE_FILE_BYTES + 1)
             .unwrap();
 
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert!(build_entry(&path, &metadata, 0, 0).unwrap().is_none());
+        let index =
+            PhotoIndex::scan(&[dir.path().to_path_buf()], &["jpg".to_string()], false).unwrap();
+        assert!(index.is_empty());
     }
 
     #[test]
@@ -614,6 +815,81 @@ mod tests {
         let index = PhotoIndex::scan_sources(&sources).unwrap();
 
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn persistent_cache_reuses_unchanged_validation_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        make_temp_jpg(dir.path(), "cached.jpg");
+        let cache_path = dir.path().join("index-cache.json");
+        let sources = [source(dir.path().to_path_buf(), false, &["jpg"], 0, 0)];
+
+        let (first, first_hits, first_misses) = scan_with_test_cache(&sources, &cache_path);
+        let (second, second_hits, second_misses) = scan_with_test_cache(&sources, &cache_path);
+
+        assert_eq!((first_hits, first_misses), (0, 1));
+        assert_eq!((second_hits, second_misses), (1, 0));
+        assert_eq!(second.photos[0].hash, first.photos[0].hash);
+        assert_eq!(second.photos[0].width, Some(16));
+        assert_eq!(second.photos[0].height, Some(16));
+    }
+
+    #[test]
+    fn persistent_cache_invalidates_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = make_temp_jpg(dir.path(), "changed.jpg");
+        let cache_path = dir.path().join("index-cache.json");
+        let sources = [source(dir.path().to_path_buf(), false, &["jpg"], 0, 0)];
+        let (first, _, _) = scan_with_test_cache(&sources, &cache_path);
+
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(24, 24, |_, _| Rgb([0u8, 0, 255]));
+        image.save(&image_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2)),
+            )
+            .unwrap();
+
+        let (second, hits, misses) = scan_with_test_cache(&sources, &cache_path);
+
+        assert_eq!((hits, misses), (0, 1));
+        assert_ne!(second.photos[0].hash, first.photos[0].hash);
+        assert_eq!(second.photos[0].width, Some(24));
+        assert_eq!(second.photos[0].height, Some(24));
+    }
+
+    #[test]
+    fn cached_dimensions_still_obey_current_source_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        make_temp_jpg(dir.path(), "small.jpg");
+        let cache_path = dir.path().join("index-cache.json");
+        let permissive = [source(dir.path().to_path_buf(), false, &["jpg"], 0, 0)];
+        scan_with_test_cache(&permissive, &cache_path);
+        let strict = [source(dir.path().to_path_buf(), false, &["jpg"], 32, 32)];
+
+        let (index, hits, misses) = scan_with_test_cache(&strict, &cache_path);
+
+        assert!(index.is_empty());
+        assert_eq!((hits, misses), (1, 0));
+    }
+
+    #[test]
+    fn malformed_persistent_cache_falls_back_to_a_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        make_temp_jpg(dir.path(), "valid.jpg");
+        let cache_path = dir.path().join("index-cache.json");
+        std::fs::write(&cache_path, b"{ definitely not json").unwrap();
+        let sources = [source(dir.path().to_path_buf(), false, &["jpg"], 0, 0)];
+
+        let index = PhotoIndex::scan_sources_cached(&sources, &cache_path).unwrap();
+
+        assert_eq!(index.len(), 1);
+        assert!(load_index_cache(&cache_path).is_ok());
     }
 
     #[test]

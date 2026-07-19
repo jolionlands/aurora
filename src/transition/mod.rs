@@ -173,32 +173,106 @@ impl TransitionRenderer {
     /// `monitor_bounds` — screen-space rect of the target monitor.
     /// `old` / `new` — BGRA32 decoded images.
     ///
-    /// After this returns, the caller should commit the new wallpaper via
-    /// `IDesktopWallpaper::SetWallpaper`.
+    /// This compatibility entry point does not commit a desktop wallpaper.
     pub fn run(&self, monitor_bounds: Rect, old: &DecodedImage, new: &DecodedImage) -> Result<()> {
+        self.run_with_commit(monitor_bounds, old, new, || Ok(()))
+    }
+
+    /// Show the first overlay frame, commit the desktop behind it, then finish
+    /// the animation before the overlay is destroyed.
+    pub fn run_with_commit(
+        &self,
+        monitor_bounds: Rect,
+        old: &DecodedImage,
+        new: &DecodedImage,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut commit = CommitOnce::new(commit);
         if self.style == TransitionStyle::None || self.duration_ms == 0 {
-            return Ok(());
+            return commit.call();
         }
 
-        let run_cpu = || {
-            // For GPU-only styles, degrade gracefully to crossfade
-            let effective_style = if self.style.cpu_capable() {
-                &self.style
-            } else {
-                &TransitionStyle::Crossfade
+        if matches!(self.resolved, ResolvedBackend::Gpu) {
+            let result = {
+                let mut callback = || commit.call();
+                gpu::run_transition(
+                    monitor_bounds,
+                    old,
+                    new,
+                    &self.style,
+                    self.duration_ms,
+                    &mut callback,
+                )
             };
-            cpu::run_transition(monitor_bounds, old, new, effective_style, self.duration_ms)
-        };
+            match result {
+                Ok(()) => {
+                    commit.call()?;
+                    return Ok(());
+                }
+                Err(error) if self.requested == Backend::Auto => {
+                    tracing::warn!(%error, "GPU transition failed; falling back to CPU");
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
-        run_selected_backend(
-            &self.requested,
-            &self.resolved,
-            || gpu::run_transition(monitor_bounds, old, new, &self.style, self.duration_ms),
-            run_cpu,
-        )
+        let effective_style = if self.style.cpu_capable() {
+            &self.style
+        } else {
+            &TransitionStyle::Crossfade
+        };
+        {
+            let mut callback = || commit.call();
+            cpu::run_transition(
+                monitor_bounds,
+                old,
+                new,
+                effective_style,
+                self.duration_ms,
+                &mut callback,
+            )?;
+        }
+        commit.call()
     }
 }
 
+struct CommitOnce<F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    action: Option<F>,
+    failure: Option<String>,
+}
+
+impl<F> CommitOnce<F>
+where
+    F: FnOnce() -> Result<()>,
+{
+    fn new(action: F) -> Self {
+        Self {
+            action: Some(action),
+            failure: None,
+        }
+    }
+
+    fn call(&mut self) -> Result<()> {
+        if let Some(failure) = &self.failure {
+            anyhow::bail!("wallpaper commit previously failed: {failure}");
+        }
+        let Some(action) = self.action.take() else {
+            return Ok(());
+        };
+        match action() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failure = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn run_selected_backend<G, C>(
     requested: &Backend,
     resolved: &ResolvedBackend,
@@ -224,8 +298,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        run_selected_backend, scale_to_cover, Backend, Rect, ResolvedBackend, TransitionRenderer,
-        TransitionStyle,
+        run_selected_backend, scale_to_cover, Backend, CommitOnce, Rect, ResolvedBackend,
+        TransitionRenderer, TransitionStyle,
     };
     use crate::decode::DecodedImage;
     use anyhow::anyhow;
@@ -280,6 +354,80 @@ mod tests {
                 &image,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn disabled_transition_still_commits_exactly_once() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0, 0, 0, 255],
+        };
+        let commits = Cell::new(0);
+
+        TransitionRenderer::new(TransitionStyle::None, 500, Backend::Cpu)
+            .run_with_commit(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                &image,
+                &image,
+                || {
+                    commits.set(commits.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(commits.get(), 1);
+    }
+
+    #[test]
+    fn wallpaper_commit_failure_is_propagated() {
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0, 0, 0, 255],
+        };
+
+        let error = TransitionRenderer::new(TransitionStyle::None, 0, Backend::Cpu)
+            .run_with_commit(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                &image,
+                &image,
+                || Err(anyhow!("desktop commit failed")),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "desktop commit failed");
+    }
+
+    #[test]
+    fn failed_commit_cannot_be_hidden_by_backend_fallback() {
+        let attempts = Cell::new(0);
+        let mut commit = CommitOnce::new(|| {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow!("desktop commit failed"))
+        });
+
+        assert_eq!(
+            commit.call().unwrap_err().to_string(),
+            "desktop commit failed"
+        );
+        assert!(commit
+            .call()
+            .unwrap_err()
+            .to_string()
+            .contains("previously failed"));
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::RECT;
@@ -108,7 +108,17 @@ impl WallpaperApplier {
                 CoTaskMemFree(Some(pwstr.0.cast()));
                 id
             };
-            let rect = rect.with_context(|| format!("GetMonitorRECT({})", id))?;
+            let rect = match rect {
+                Ok(rect) => rect,
+                Err(error) => {
+                    tracing::debug!(
+                        monitor = %id,
+                        %error,
+                        "skipping monitor no longer attached to the desktop"
+                    );
+                    continue;
+                }
+            };
             if let Some(monitor) = attached_monitor(id, rect) {
                 monitors.push(monitor);
             }
@@ -142,6 +152,33 @@ impl WallpaperApplier {
                     )
                 })
         }
+    }
+
+    /// Read the wallpaper currently registered for one monitor.
+    pub fn current_for_monitor(&self, monitor_id: &str) -> Result<Option<PathBuf>> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+
+        let monitor_wide: Vec<u16> = monitor_id
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .collect();
+        let value = unsafe {
+            let value = self
+                .desktop
+                .GetWallpaper(PCWSTR::from_raw(monitor_wide.as_ptr()))
+                .with_context(|| {
+                    format!("IDesktopWallpaper::GetWallpaper(monitor={monitor_id})")
+                })?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            let decoded = value
+                .to_string()
+                .context("desktop wallpaper path is not valid UTF-16");
+            CoTaskMemFree(Some(value.0.cast()));
+            decoded?
+        };
+        Ok((!value.is_empty()).then(|| PathBuf::from(value)))
     }
 
     pub fn set_for_all_monitors(&self, path: &Path) -> Result<()> {

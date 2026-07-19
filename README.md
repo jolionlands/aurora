@@ -10,6 +10,7 @@ Efficient desktop background swapper for Windows.
 - KDL config at `%APPDATA%\aurora\config.kdl`
 - Prometheus `/metrics` endpoint (opt-in) for monitoring
 - Bounded LRU decode cache
+- Persistent validated photo index cache for fast restarts and reloads
 - Single-instance check, autostart hook
 
 ## Playlists and tagging
@@ -26,6 +27,7 @@ aurora-ctl playlist tag favorites current --kind artist studio-name
 aurora-ctl playlist rate favorites current 4
 aurora-ctl playlist frequency favorites current 2
 aurora-ctl playlist shuffle favorites true
+aurora-ctl playlist filter favorites --include theme=night --include color=blue --exclude safety=nsfw
 aurora-ctl playlist activate favorites
 aurora-ctl playlist show favorites --offset 0 --limit 100
 aurora-ctl playlist deactivate
@@ -34,14 +36,29 @@ aurora-ctl playlist deactivate
 The built-in tag groups are `general`, `theme`, `content`, `color`, `source`,
 `medium`, `safety`, `franchise`, and `character`; any other non-empty kebab-case
 group is stored as custom metadata. Omit the tags to clear one group, for example
-`aurora-ctl playlist tag favorites current --kind artist`. Tags are metadata,
-not selection rules. Rating and frequency affect selection with effective weight
-`frequency * (rating + 1)`; both default to weight 1 when unset.
+`aurora-ctl playlist tag favorites current --kind artist`.
+
+Tag filters are optional selection rules. Repeat `--include` or `--exclude` with
+`KIND=TAG`; includes are OR within one kind and AND across kinds, while any
+excluded tag rejects an image. Run `aurora-ctl playlist filter favorites` with
+no rules to clear the filter. An active filtered playlist never falls back to
+the full library when no item matches.
+
+Tags, dimensions, and the default rating are keyed by the image's exact BLAKE3
+content ID. Exact duplicate files therefore share metadata, renamed content can
+be found again, and replacement bytes at the same path do not inherit the old
+image's metadata. Frequency remains playlist-local. Selection weight is
+`frequency * (rating + 1)`; both factors default to 1 when unset.
 
 Playlists are persisted at `%APPDATA%\aurora\playlists.kdl`. Paths supplied
 through `aurora-ctl` are normalized to absolute paths. Legacy or hand-written
 relative entries remain supported and are resolved against each configured
-source root.
+source root. Shared content metadata and playlist filters are stored in the
+versioned `%APPDATA%\aurora\content.json` sidecar. Existing path metadata is
+migrated without changing the backward-readable playlist file.
+`aurora-ctl reload` refreshes the configured sources, playlists, and content
+metadata together; schedule, transition, monitor, cache-budget, metrics, and
+log-level changes still require a daemon restart.
 
 Autotagging uses an OpenAI-compatible vision endpoint. Pass the API base URL,
 without `/chat/completions`; Aurora appends that path. HTTPS is required unless
@@ -69,7 +86,7 @@ filtering:
 {"rows":[{"status":"ok","absolute_path":"D:\\Wallpapers\\lake.jpg","sha256":"0000000000000000000000000000000000000000000000000000000000000000","width":3840,"height":2160}]}
 ```
 
-Playlist metadata is the source of truth for batch resume: already-tagged paths
+Content and legacy path metadata are the source of truth for batch resume: already-tagged paths
 are skipped unless `--force` is used. The JSONL resume file is an append-only
 audit log of tagged, skipped, and failed paths; failures remain retryable. Use
 `--resume-file` to select a particular log when separate audit trails are useful.

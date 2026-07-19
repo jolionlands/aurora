@@ -17,7 +17,7 @@ use aurora::integrations::wiri::subscribe_wiri_events;
 use aurora::ipc::IpcServer;
 use aurora::metrics::{bind_metrics, serve_metrics, Metrics};
 use aurora::playlist::default_playlists_path;
-use aurora::runtime::{ComApartment, Runtime, RuntimeHandle, RuntimeStateSnapshot};
+use aurora::runtime::{ComApartment, Runtime, RuntimeHandle};
 use aurora::scheduler::Scheduler;
 
 /// Bundled default configuration — written to disk on first run.
@@ -163,28 +163,30 @@ async fn main() -> Result<()> {
 
     let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
 
-    let mut runtime = Runtime::new(&config, &config_path, applier, Arc::clone(&metrics))
-        .context("initialise Runtime")?;
+    let (scheduler, swap_rx) = Scheduler::new(config.schedule.clone());
+    let mut runtime = Runtime::new(
+        &config,
+        &config_path,
+        applier,
+        Arc::clone(&metrics),
+        scheduler.progress(),
+    )
+    .context("initialise Runtime")?;
 
     // ---------------------------------------------------------------------------
     // 6. Scheduler — owns the swap channel sender
     // ---------------------------------------------------------------------------
-    let (scheduler, swap_rx) = Scheduler::new(config.schedule.clone());
     let swap_tx = scheduler.sender();
     let scheduler = Arc::new(scheduler);
 
     // Build shared snapshot state for IPC queries.
-    let snap_state = Arc::new(parking_lot::Mutex::new(RuntimeStateSnapshot::default()));
+    let snap_state = Arc::new(parking_lot::Mutex::new(runtime.state_snapshot()));
 
     // Build RuntimeHandle (for IPC).
     let runtime_handle = RuntimeHandle::new(
         swap_tx.clone(),
         Arc::clone(&snap_state),
-        (
-            runtime.index_arc(),
-            runtime.source_roots_arc(),
-            runtime.ban_gate(),
-        ),
+        runtime.shared(),
         Arc::clone(&metrics),
         config_path.clone(),
         runtime.playlist_arc(),

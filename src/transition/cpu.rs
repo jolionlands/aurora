@@ -225,6 +225,7 @@ pub fn run_transition(
     new: &DecodedImage,
     style: &TransitionStyle,
     duration_ms: u32,
+    commit: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
@@ -335,6 +336,7 @@ pub fn run_transition(
 
         let screen_dc = ScreenDc::acquire()?;
         let surface = MemorySurface::create(screen_dc.handle(), width, height)?;
+        let mut committed = false;
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -408,6 +410,10 @@ pub fn run_transition(
                 ULW_ALPHA,
             )
             .context("UpdateLayeredWindow failed for CPU transition frame")?;
+            if !committed {
+                commit().context("commit wallpaper behind CPU transition overlay")?;
+                committed = true;
+            }
 
             // Pump messages so the window stays responsive
             let mut msg = MSG::default();

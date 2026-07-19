@@ -404,6 +404,12 @@ impl IpcServer {
                 command_response(runtime!().playlist_shuffle(&name, shuffle))
             }
 
+            IpcMessage::PlaylistFilter {
+                name,
+                include,
+                exclude,
+            } => command_response(runtime!().playlist_filter(&name, include, exclude)),
+
             IpcMessage::PlaylistAutotagStatus { name, path } => {
                 let h = runtime!();
                 match h.playlist_autotag_status(&name, &path) {
@@ -685,10 +691,13 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(
                 crate::runtime::RuntimeStateSnapshot::default(),
             )),
-            (
+            crate::runtime::RuntimeShared::new(
                 Arc::new(parking_lot::RwLock::new(crate::index::PhotoIndex::default())),
                 Arc::new(parking_lot::RwLock::new(Vec::new())),
                 crate::runtime::BanGate::default(),
+                Arc::new(parking_lot::Mutex::new(
+                    crate::content::ContentStore::default(),
+                )),
             ),
             crate::metrics::Metrics::new(),
             "config.kdl".into(),

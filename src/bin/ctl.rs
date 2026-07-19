@@ -263,6 +263,22 @@ enum PlaylistCommand {
         shuffle: bool,
     },
 
+    /// Select only content matching tag rules.
+    ///
+    /// Repeat --include/--exclude with KIND=TAG. Includes are OR within one
+    /// kind and AND across kinds; any excluded tag rejects the image. Omit all
+    /// rules to clear the filter.
+    Filter {
+        /// Name of the playlist.
+        name: String,
+        /// Required tag rule in KIND=TAG form.
+        #[arg(long, value_name = "KIND=TAG")]
+        include: Vec<String>,
+        /// Rejected tag rule in KIND=TAG form.
+        #[arg(long, value_name = "KIND=TAG")]
+        exclude: Vec<String>,
+    },
+
     /// Remove a path from a playlist.
     Remove {
         /// Name of the playlist.
@@ -338,6 +354,24 @@ fn parse_playlist_show_limit(value: &str) -> std::result::Result<usize, String> 
         ));
     }
     Ok(limit)
+}
+
+fn parse_tag_filter_rules(values: Vec<String>) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for value in values {
+        let (kind, tag) = value
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("tag filter must use KIND=TAG, got {value:?}"))?;
+        let (kind, tag) = (kind.trim(), tag.trim());
+        if kind.is_empty() || tag.is_empty() {
+            anyhow::bail!("tag filter kind and tag must not be empty: {value:?}");
+        }
+        groups
+            .entry(kind.to_string())
+            .or_default()
+            .push(tag.to_string());
+    }
+    Ok(groups)
 }
 
 fn ipc_path_from(path: &Path, current_dir: &Path) -> Result<String> {
@@ -682,6 +716,21 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                     "{}{} - {} file(s), shuffle: {}",
                     playlist_name, marker, total, shuffle
                 );
+                for (label, field) in [("include", "include_tags"), ("exclude", "exclude_tags")] {
+                    if let Some(groups) = playlist.get(field).and_then(Value::as_object) {
+                        for (kind, tags) in groups {
+                            let tags: Vec<&str> = tags
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .collect();
+                            if !tags.is_empty() {
+                                println!("{} {}: {}", label, kind, tags.join(", "));
+                            }
+                        }
+                    }
+                }
                 println!("offset {}: {} item(s)", page_offset, items.len());
                 for item in items {
                     println!(
@@ -706,6 +755,20 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                     }
                     if let Some(frequency) = item.get("frequency").and_then(Value::as_u64) {
                         println!("  frequency: {}", frequency);
+                    }
+                    if let Some(content_id) = item.get("content_id").and_then(Value::as_str) {
+                        println!("  content: {}", content_id);
+                    }
+                    if let (Some(width), Some(height)) = (
+                        item.get("width").and_then(Value::as_u64),
+                        item.get("height").and_then(Value::as_u64),
+                    ) {
+                        println!("  dimensions: {}x{}", width, height);
+                    }
+                    if let Some(resolved) = item.get("resolved_path").and_then(Value::as_str) {
+                        if item.get("path").and_then(Value::as_str) != Some(resolved) {
+                            println!("  resolved: {}", resolved);
+                        }
                     }
                 }
                 if let Some(next_offset) = result.get("next_offset").and_then(Value::as_u64) {
@@ -784,6 +847,20 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
 
         PlaylistCommand::Shuffle { name, shuffle } => {
             let resp = send_message(&IpcMessage::PlaylistShuffle { name, shuffle }).await?;
+            print_response(&resp, as_json)?;
+        }
+
+        PlaylistCommand::Filter {
+            name,
+            include,
+            exclude,
+        } => {
+            let resp = send_message(&IpcMessage::PlaylistFilter {
+                name,
+                include: parse_tag_filter_rules(include)?,
+                exclude: parse_tag_filter_rules(exclude)?,
+            })
+            .await?;
             print_response(&resp, as_json)?;
         }
 
@@ -2260,6 +2337,59 @@ mod tests {
                 }
             } if name == "focus"
         ));
+    }
+
+    #[test]
+    fn playlist_filter_cli_parses_repeatable_rules_and_empty_clear() {
+        let cli = Cli::try_parse_from([
+            "aurora-ctl",
+            "playlist",
+            "filter",
+            "focus",
+            "--include",
+            "theme=night",
+            "--include",
+            "theme=city",
+            "--exclude",
+            "safety=nsfw",
+        ])
+        .unwrap();
+        let Command::Playlist {
+            action:
+                PlaylistCommand::Filter {
+                    name,
+                    include,
+                    exclude,
+                },
+        } = cli.command
+        else {
+            panic!("expected playlist filter command");
+        };
+        assert_eq!(name, "focus");
+        assert_eq!(
+            parse_tag_filter_rules(include).unwrap()["theme"],
+            ["night", "city"]
+        );
+        assert_eq!(parse_tag_filter_rules(exclude).unwrap()["safety"], ["nsfw"]);
+
+        let clear = Cli::try_parse_from(["aurora-ctl", "playlist", "filter", "focus"]).unwrap();
+        assert!(matches!(
+            clear.command,
+            Command::Playlist {
+                action: PlaylistCommand::Filter {
+                    include,
+                    exclude,
+                    ..
+                }
+            } if include.is_empty() && exclude.is_empty()
+        ));
+    }
+
+    #[test]
+    fn tag_filter_rules_require_nonempty_kind_and_tag() {
+        for invalid in ["theme", "=night", "theme="] {
+            assert!(parse_tag_filter_rules(vec![invalid.to_string()]).is_err());
+        }
     }
 
     #[test]

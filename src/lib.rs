@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod config;
+pub mod content;
 pub mod decode;
 pub mod hooks;
 pub mod index;
