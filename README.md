@@ -44,7 +44,8 @@ excluded tag rejects an image. Run `aurora-ctl playlist filter favorites` with
 no rules to clear the filter. An active filtered playlist never falls back to
 the full library when no item matches.
 
-Tags, dimensions, and the default rating are keyed by the image's exact BLAKE3
+Tags, dimensions, the default rating, and bounded autotag provenance (model,
+confidence, and normalized raw output) are keyed by the image's exact BLAKE3
 content ID. Exact duplicate files therefore share metadata, renamed content can
 be found again, and replacement bytes at the same path do not inherit the old
 image's metadata. Frequency remains playlist-local. Selection weight is

@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 use crate::apply::{configured_global_fit, WallpaperApplier};
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::content::{
-    content_path, load_content, persist_content, ContentMetadata, ContentStore, TagFilters,
+    content_path, load_content, persist_content, AutoTagProvenance, ContentMetadata, ContentStore,
+    TagFilters,
 };
 use crate::decode::SharedDecodeCache;
 use crate::index::{PhotoEntry, PhotoIndex};
@@ -1110,6 +1111,7 @@ fn playlist_item_json(
         "frequency": playlist.frequencies.get(path).copied().unwrap_or(1),
         "width": identity.and_then(|identity| identity.width),
         "height": identity.and_then(|identity| identity.height),
+        "autotag": metadata.and_then(|metadata| metadata.autotag.as_ref()),
     })
 }
 
@@ -1683,10 +1685,14 @@ impl RuntimeHandle {
         include: BTreeMap<String, Vec<String>>,
         exclude: BTreeMap<String, Vec<String>>,
     ) -> anyhow::Result<()> {
-        if self.playlist_store.lock().get(name).is_none() {
+        let playlists = self.playlist_store.lock();
+        if playlists.get(name).is_none() {
             anyhow::bail!("playlist '{}' not found", name);
         }
-        self.update_content(|content| content.set_playlist_filters(name, include, exclude))
+        let result =
+            self.update_content(|content| content.set_playlist_filters(name, include, exclude));
+        drop(playlists);
+        result
     }
 
     /// Return whether one path already has tags or a rating without serializing
@@ -1720,6 +1726,7 @@ impl RuntimeHandle {
         mut groups: BTreeMap<String, Vec<String>>,
         rating: Option<u8>,
         frequency: Option<u32>,
+        provenance: Option<AutoTagProvenance>,
         create_playlist: bool,
         overwrite_existing: bool,
     ) -> anyhow::Result<bool> {
@@ -1730,104 +1737,127 @@ impl RuntimeHandle {
         if frequency == Some(0) {
             anyhow::bail!("autotag frequency must be at least 1");
         }
+        if let Some(provenance) = &provenance {
+            provenance.validate()?;
+        }
+        let has_provenance = provenance.is_some();
         if groups.keys().any(|kind| kind.trim().is_empty()) {
             anyhow::bail!("autotag tag kind must not be empty");
         }
         groups.retain(|_, tags| tags.iter().any(|tag| !tag.trim().is_empty()));
-        if groups.is_empty() && rating.is_none() && frequency.is_none() {
-            anyhow::bail!("autotag update contains no tags, rating, or frequency");
+        if groups.is_empty() && rating.is_none() && frequency.is_none() && !has_provenance {
+            anyhow::bail!(
+                "autotag update contains no tags, rating, or frequency and no provenance"
+            );
         }
 
-        let (is_member, has_metadata, identity) = {
-            let index = self.index.read();
-            let source_roots = self.source_roots.read();
-            let store = self.playlist_store.lock();
-            if store.get(name).is_none() && !create_playlist {
-                anyhow::bail!("playlist '{}' not found", name);
+        // Keep the existing index -> roots -> playlists -> content lock order.
+        let index = self.index.read();
+        let source_roots = self.source_roots.read();
+        let mut current_playlists = self.playlist_store.lock();
+        if current_playlists.get(name).is_none() && !create_playlist {
+            anyhow::bail!("playlist '{}' not found", name);
+        }
+        let stored = resolve_playlist_entry_path(&current_playlists, name, path, &source_roots)?;
+        let is_member = current_playlists
+            .get(name)
+            .is_some_and(|playlist| playlist.paths.iter().any(|path| path == &stored));
+        let local =
+            is_member && playlist_path_has_autotag_metadata(&current_playlists, name, &stored);
+        let mut current_content = self.content_store.lock();
+        let identity = match resolve_content(&index, &current_content, &stored, &source_roots, true)
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                debug!("using legacy autotag metadata because content identity failed: {error:#}");
+                None
             }
-            let stored = resolve_playlist_entry_path(&store, name, path, &source_roots)?;
-            let is_member = store
-                .get(name)
-                .is_some_and(|playlist| playlist.paths.iter().any(|path| path == &stored));
-            let local = is_member && playlist_path_has_autotag_metadata(&store, name, &stored);
-            let content = self.content_store.lock();
-            let identity = match resolve_content(&index, &content, &stored, &source_roots, true) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    debug!(
-                        "using legacy autotag metadata because content identity failed: {error:#}"
-                    );
-                    None
-                }
-            };
-            let global = is_member
-                && identity
-                    .as_ref()
-                    .is_some_and(|identity| content.has_autotag_metadata(&identity.hash));
-            (is_member, local || global, identity)
         };
-        if is_member && !overwrite_existing && has_metadata {
+        let global = is_member
+            && identity
+                .as_ref()
+                .is_some_and(|identity| current_content.has_autotag_metadata(&identity.hash));
+        if is_member && !overwrite_existing && (local || global) {
             return Ok(false);
         }
-
-        if let Some(identity) = &identity {
-            if overwrite_existing || !groups.is_empty() || rating.is_some() {
-                self.update_content(|content| {
-                    if overwrite_existing {
-                        content.clear_metadata(&identity.hash)?;
-                    }
-                    for (kind, tags) in &groups {
-                        content.set_tag_group(
-                            &identity.hash,
-                            &identity.aliases,
-                            kind,
-                            tags.clone(),
-                            (identity.width, identity.height),
-                        )?;
-                    }
-                    if let Some(rating) = rating {
-                        content.set_rating(
-                            &identity.hash,
-                            &identity.aliases,
-                            rating,
-                            (identity.width, identity.height),
-                        )?;
-                    }
-                    Ok(())
-                })?;
-            }
+        if identity.is_none() && groups.is_empty() && rating.is_none() && frequency.is_none() {
+            anyhow::bail!("cannot store autotag provenance without an identifiable image");
         }
 
-        self.update_playlist_entry(name, path, |store, path| {
-            if store.get(name).is_none() {
-                if !create_playlist {
-                    anyhow::bail!("playlist '{}' not found", name);
-                }
-                store.create(name)?;
-            }
-            if !store
-                .get(name)
-                .expect("playlist was checked or created")
-                .paths
-                .iter()
-                .any(|stored| stored == path)
-            {
-                store.add_path(name, path)?;
-            }
+        let mut next_content = current_content.clone();
+        let content_changed = identity.is_some()
+            && (overwrite_existing || !groups.is_empty() || rating.is_some() || has_provenance);
+        if let Some(identity) = &identity {
             if overwrite_existing {
-                store.clear_path_metadata(name, path)?;
+                next_content.clear_metadata(&identity.hash)?;
             }
-            for (kind, tags) in groups {
-                store.set_tag_group(name, path, &kind, tags)?;
+            for (kind, tags) in &groups {
+                next_content.set_tag_group(
+                    &identity.hash,
+                    &identity.aliases,
+                    kind,
+                    tags.clone(),
+                    (identity.width, identity.height),
+                )?;
             }
             if let Some(rating) = rating {
-                store.set_rating(name, path, rating)?;
+                next_content.set_rating(
+                    &identity.hash,
+                    &identity.aliases,
+                    rating,
+                    (identity.width, identity.height),
+                )?;
             }
-            if let Some(frequency) = frequency {
-                store.set_frequency(name, path, frequency)?;
+            if let Some(provenance) = provenance {
+                next_content.set_autotag(
+                    &identity.hash,
+                    &identity.aliases,
+                    provenance,
+                    (identity.width, identity.height),
+                )?;
             }
-            Ok(true)
-        })
+        } else if has_provenance {
+            debug!("autotag provenance omitted because content identity is unavailable");
+        }
+
+        let mut next_playlists = current_playlists.clone();
+        if next_playlists.get(name).is_none() {
+            next_playlists.create(name)?;
+        }
+        if !next_playlists
+            .get(name)
+            .expect("playlist was checked or created")
+            .paths
+            .iter()
+            .any(|path| path == &stored)
+        {
+            next_playlists.add_path(name, &stored)?;
+        }
+        if overwrite_existing {
+            next_playlists.clear_path_metadata(name, &stored)?;
+        }
+        for (kind, tags) in groups {
+            next_playlists.set_tag_group(name, &stored, &kind, tags)?;
+        }
+        if let Some(rating) = rating {
+            next_playlists.set_rating(name, &stored, rating)?;
+        }
+        if let Some(frequency) = frequency {
+            next_playlists.set_frequency(name, &stored, frequency)?;
+        }
+
+        self.persist_playlist_and_content(
+            &current_content,
+            &next_content,
+            &next_playlists,
+            content_changed,
+        )?;
+
+        *current_playlists = next_playlists;
+        if content_changed {
+            *current_content = next_content;
+        }
+        Ok(true)
     }
 
     /// Remove a path from a playlist and persist.
@@ -1857,12 +1887,22 @@ impl RuntimeHandle {
 
     /// Delete a playlist and persist.
     pub fn playlist_delete(&self, name: &str) -> anyhow::Result<()> {
-        self.update_playlists(|store| store.delete(name))?;
-        if self.content_store.lock().playlist_filters(name).is_some() {
-            self.update_content(|content| {
-                content.remove_playlist_filters(name);
-                Ok(())
-            })?;
+        let mut current_playlists = self.playlist_store.lock();
+        let mut current_content = self.content_store.lock();
+        let mut next_playlists = current_playlists.clone();
+        let mut next_content = current_content.clone();
+        next_playlists.delete(name)?;
+        let content_changed = next_content.playlist_filters(name).is_some();
+        next_content.remove_playlist_filters(name);
+        self.persist_playlist_and_content(
+            &current_content,
+            &next_content,
+            &next_playlists,
+            content_changed,
+        )?;
+        *current_playlists = next_playlists;
+        if content_changed {
+            *current_content = next_content;
         }
         Ok(())
     }
@@ -1905,6 +1945,42 @@ impl RuntimeHandle {
         persist_content(&next, self.content_path.as_ref())?;
         *current = next;
         Ok(result)
+    }
+
+    fn persist_playlist_and_content(
+        &self,
+        current_content: &ContentStore,
+        next_content: &ContentStore,
+        next_playlists: &PlaylistStore,
+        content_changed: bool,
+    ) -> anyhow::Result<()> {
+        let content_existed = self.content_path.exists();
+        if content_changed {
+            persist_content(next_content, self.content_path.as_ref())?;
+        }
+        if let Err(error) = persist_playlists(next_playlists, self.playlists_path.as_ref()) {
+            if content_changed {
+                let rollback = if content_existed {
+                    persist_content(current_content, self.content_path.as_ref())
+                } else if self.content_path.exists() {
+                    std::fs::remove_file(self.content_path.as_ref()).with_context(|| {
+                        format!(
+                            "remove new content metadata {}",
+                            self.content_path.display()
+                        )
+                    })
+                } else {
+                    Ok(())
+                };
+                if let Err(rollback) = rollback {
+                    anyhow::bail!(
+                        "persist playlists failed: {error:#}; content rollback also failed: {rollback:#}"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn update_playlists<T>(
@@ -2518,6 +2594,17 @@ mod tests {
             handle.playlist_list()["playlists"][0]["include_tags"]["theme"][0],
             "day"
         );
+
+        handle.playlist_delete("focus").unwrap();
+        assert!(handle
+            .content_store
+            .lock()
+            .playlist_filters("focus")
+            .is_none());
+        assert!(load_content(handle.content_path.as_ref())
+            .unwrap()
+            .playlist_filters("focus")
+            .is_none());
     }
 
     #[test]
@@ -2747,6 +2834,7 @@ mod tests {
                 ]),
                 Some(4),
                 Some(2),
+                None,
                 false,
                 true,
             )
@@ -2879,7 +2967,16 @@ mod tests {
         ]);
 
         assert!(handle
-            .playlist_autotag_upsert("auto", "photo.jpg", first, Some(4), Some(2), true, false,)
+            .playlist_autotag_upsert(
+                "auto",
+                "photo.jpg",
+                first,
+                Some(4),
+                Some(2),
+                None,
+                true,
+                false,
+            )
             .unwrap());
         assert!(handle.playlist_autotag_status("auto", "photo.jpg").unwrap());
 
@@ -2894,12 +2991,22 @@ mod tests {
                 replacement.clone(),
                 Some(5),
                 Some(3),
+                None,
                 false,
                 false,
             )
             .unwrap());
         assert!(handle
-            .playlist_autotag_upsert("auto", "photo.jpg", replacement, None, None, false, true,)
+            .playlist_autotag_upsert(
+                "auto",
+                "photo.jpg",
+                replacement,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
             .unwrap());
 
         let persisted = load_playlists(&playlists_path).unwrap();
@@ -2934,6 +3041,7 @@ mod tests {
                 BTreeMap::from([("theme".to_string(), Vec::new())]),
                 None,
                 None,
+                None,
                 false,
                 true,
             )
@@ -2964,23 +3072,107 @@ mod tests {
     }
 
     #[test]
-    fn playlist_autotag_persist_failure_keeps_memory_unchanged() {
+    fn playlist_autotag_failure_rolls_back_content_and_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("photo.bmp");
+        write_test_bmp(&image, [255, 0, 0]);
         let blocker = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Mutex::new(PlaylistStore::default()));
-        let handle = make_playlist_handle(blocker.path().join("playlists.kdl"), Arc::clone(&store));
+        let content = Arc::new(Mutex::new(ContentStore::default()));
+        let index = PhotoIndex::scan(
+            &[directory.path().to_path_buf()],
+            &["bmp".to_string()],
+            false,
+        )
+        .unwrap();
+        let hash = index.photos[0].hash.clone();
+        let (tx, _rx) = mpsc::channel(4);
+        let config_path = directory.path().join("config.kdl");
+        let handle = RuntimeHandle::new(
+            tx,
+            Arc::new(Mutex::new(RuntimeStateSnapshot::default())),
+            RuntimeShared::new(
+                Arc::new(RwLock::new(index)),
+                Arc::new(RwLock::new(vec![directory.path().to_path_buf()])),
+                BanGate::default(),
+                Arc::clone(&content),
+            ),
+            Metrics::new(),
+            config_path.clone(),
+            Arc::clone(&store),
+            blocker.path().join("playlists.kdl"),
+        );
 
         assert!(handle
             .playlist_autotag_upsert(
                 "auto",
-                "photo.jpg",
+                &image.to_string_lossy(),
                 BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
                 None,
                 None,
+                Some(AutoTagProvenance {
+                    model: "model".to_string(),
+                    confidence: Some(0.8),
+                    raw: serde_json::json!({"theme": ["night"]}),
+                }),
                 true,
                 false,
             )
             .is_err());
         assert!(store.lock().get("auto").is_none());
+        assert!(content.lock().get(&hash).is_none());
+        assert!(!content_path(&config_path).exists());
+    }
+
+    #[test]
+    fn playlist_autotag_persists_content_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("photo.bmp");
+        write_test_bmp(&image, [255, 0, 0]);
+        let playlists_path = directory.path().join("playlists.kdl");
+        let handle = make_playlist_handle(
+            playlists_path,
+            Arc::new(Mutex::new(PlaylistStore::default())),
+        );
+        *handle.index.write() = PhotoIndex::scan(
+            &[directory.path().to_path_buf()],
+            &["bmp".to_string()],
+            false,
+        )
+        .unwrap();
+
+        handle
+            .playlist_autotag_upsert(
+                "auto",
+                &image.to_string_lossy(),
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                Some(4),
+                None,
+                Some(AutoTagProvenance {
+                    model: "vision-model".to_string(),
+                    confidence: Some(0.9),
+                    raw: serde_json::json!({"identity": {"theme": ["night"]}}),
+                }),
+                true,
+                false,
+            )
+            .unwrap();
+
+        let item = handle.playlist_show("auto", 0, 1).unwrap()["items"][0].clone();
+        assert_eq!(item["autotag"]["model"], "vision-model");
+        assert_eq!(item["autotag"]["confidence"], 0.9);
+        let hash = handle.index.read().photos[0].hash.clone();
+        assert_eq!(
+            load_content(handle.content_path.as_ref())
+                .unwrap()
+                .get(&hash)
+                .unwrap()
+                .autotag
+                .as_ref()
+                .unwrap()
+                .model,
+            "vision-model"
+        );
     }
 
     #[test]
@@ -2994,13 +3186,31 @@ mod tests {
 
         assert!(handle.playlist_autotag_status("", "photo.jpg").is_err());
         assert!(handle
-            .playlist_autotag_upsert("auto", "", tags(), None, None, true, false)
+            .playlist_autotag_upsert("auto", "", tags(), None, None, None, true, false)
             .is_err());
         assert!(handle
-            .playlist_autotag_upsert("auto", "photo.jpg", tags(), Some(6), None, true, false,)
+            .playlist_autotag_upsert(
+                "auto",
+                "photo.jpg",
+                tags(),
+                Some(6),
+                None,
+                None,
+                true,
+                false,
+            )
             .is_err());
         assert!(handle
-            .playlist_autotag_upsert("auto", "photo.jpg", tags(), None, Some(0), true, false,)
+            .playlist_autotag_upsert(
+                "auto",
+                "photo.jpg",
+                tags(),
+                None,
+                Some(0),
+                None,
+                true,
+                false,
+            )
             .is_err());
     }
 

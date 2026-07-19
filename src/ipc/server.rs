@@ -427,6 +427,7 @@ impl IpcServer {
                 groups,
                 rating,
                 frequency,
+                provenance,
                 create_playlist,
                 overwrite_existing,
             } => {
@@ -437,6 +438,7 @@ impl IpcServer {
                     groups,
                     rating,
                     frequency,
+                    provenance,
                     create_playlist,
                     overwrite_existing,
                 ) {

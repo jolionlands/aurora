@@ -126,6 +126,8 @@ pub enum IpcMessage {
         #[serde(default)]
         frequency: Option<u32>,
         #[serde(default)]
+        provenance: Option<crate::content::AutoTagProvenance>,
+        #[serde(default)]
         create_playlist: bool,
         #[serde(default)]
         overwrite_existing: bool,

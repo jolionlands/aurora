@@ -3,10 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const CONTENT_SCHEMA_VERSION: u32 = 1;
+const CONTENT_SCHEMA_VERSION: u32 = 2;
 const CONTENT_FILENAME: &str = "content.json";
+const MAX_AUTOTAG_RAW_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoTagProvenance {
+    pub model: String,
+    pub confidence: Option<f64>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContentMetadata {
     /// Known path spellings for this exact byte sequence.
@@ -21,6 +30,8 @@ pub struct ContentMetadata {
     pub rating_conflicted: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autotag: Option<AutoTagProvenance>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +43,7 @@ pub struct TagFilters {
     pub exclude: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContentStore {
     entries: BTreeMap<String, ContentMetadata>,
     legacy_migrated: bool,
@@ -62,9 +73,9 @@ pub fn load_content(path: &Path) -> Result<ContentStore> {
         std::fs::read(path).with_context(|| format!("read content metadata {}", path.display()))?;
     let stored: StoredContent = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse content metadata {}", path.display()))?;
-    if stored.schema != CONTENT_SCHEMA_VERSION {
+    if !(1..=CONTENT_SCHEMA_VERSION).contains(&stored.schema) {
         anyhow::bail!(
-            "unsupported content metadata schema {} in {}; expected {}",
+            "unsupported content metadata schema {} in {}; supported versions are 1 through {}",
             stored.schema,
             path.display(),
             CONTENT_SCHEMA_VERSION
@@ -181,7 +192,9 @@ impl ContentStore {
 
     pub fn has_autotag_metadata(&self, hash: &str) -> bool {
         self.get(hash).is_some_and(|metadata| {
-            metadata.rating.is_some() || metadata.tag_groups.values().any(|tags| !tags.is_empty())
+            metadata.autotag.is_some()
+                || metadata.rating.is_some()
+                || metadata.tag_groups.values().any(|tags| !tags.is_empty())
         })
     }
 
@@ -260,12 +273,29 @@ impl ContentStore {
         Ok(())
     }
 
+    pub fn set_autotag(
+        &mut self,
+        hash: &str,
+        aliases: &[String],
+        mut provenance: AutoTagProvenance,
+        dimensions: (Option<u32>, Option<u32>),
+    ) -> Result<()> {
+        validate_hash(hash)?;
+        provenance.normalize()?;
+        let metadata = self.entries.entry(hash.to_string()).or_default();
+        merge_aliases(&mut metadata.aliases, aliases);
+        metadata.autotag = Some(provenance);
+        update_dimensions(metadata, dimensions);
+        Ok(())
+    }
+
     pub fn clear_metadata(&mut self, hash: &str) -> Result<()> {
         validate_hash(hash)?;
         if let Some(metadata) = self.entries.get_mut(hash) {
             metadata.tag_groups.clear();
             metadata.rating = None;
             metadata.rating_conflicted = false;
+            metadata.autotag = None;
         }
         Ok(())
     }
@@ -310,6 +340,9 @@ impl ContentStore {
             if metadata.rating_conflicted && metadata.rating.is_some() {
                 anyhow::bail!("content {hash} has both a shared and conflicted rating");
             }
+            if let Some(provenance) = &mut metadata.autotag {
+                provenance.normalize()?;
+            }
         }
         let filters = std::mem::take(&mut self.playlist_filters);
         for (name, filters) in filters {
@@ -322,6 +355,38 @@ impl ContentStore {
                 self.playlist_filters
                     .insert(name, TagFilters { include, exclude });
             }
+        }
+        Ok(())
+    }
+}
+
+impl AutoTagProvenance {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut normalized = self.clone();
+        normalized.normalize()
+    }
+
+    fn normalize(&mut self) -> Result<()> {
+        self.model = self.model.trim().to_string();
+        if self.model.is_empty()
+            || self.model.len() > 256
+            || self.model.chars().any(char::is_control)
+        {
+            anyhow::bail!("autotag model must be 1 to 256 printable characters");
+        }
+        if self
+            .confidence
+            .is_some_and(|confidence| !confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
+        {
+            anyhow::bail!("autotag confidence must be between 0 and 1");
+        }
+        let raw_len = serde_json::to_vec(&self.raw)
+            .context("serialize raw autotag provenance")?
+            .len();
+        if raw_len > MAX_AUTOTAG_RAW_BYTES {
+            anyhow::bail!(
+                "raw autotag provenance is {raw_len} bytes; maximum is {MAX_AUTOTAG_RAW_BYTES}"
+            );
         }
         Ok(())
     }
@@ -437,6 +502,18 @@ mod tests {
             .set_rating(&hash('a'), &["new.jpg".to_string()], 4, (None, None))
             .unwrap();
         store
+            .set_autotag(
+                &hash('a'),
+                &[],
+                AutoTagProvenance {
+                    model: " vision-model ".to_string(),
+                    confidence: Some(0.9),
+                    raw: serde_json::json!({"identity": {"theme": ["night"]}}),
+                },
+                (None, None),
+            )
+            .unwrap();
+        store
             .set_playlist_filters(
                 "focus",
                 BTreeMap::from([("themes".to_string(), vec![" night ".to_string()])]),
@@ -452,11 +529,62 @@ mod tests {
         assert_eq!(metadata.tag_groups["theme"], ["night"]);
         assert_eq!(metadata.rating, Some(4));
         assert_eq!((metadata.width, metadata.height), (Some(3840), Some(2160)));
+        assert_eq!(metadata.autotag.as_ref().unwrap().model, "vision-model");
+        assert_eq!(metadata.autotag.as_ref().unwrap().confidence, Some(0.9));
         assert_eq!(
             loaded.playlist_filters("focus").unwrap().include["theme"],
             ["night"]
         );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+                ["schema"],
+            2
+        );
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn schema_one_loads_and_upgrades_on_the_next_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("content.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema":1,"entries":{{"{}":{{"aliases":["old.jpg"]}}}}}}"#,
+                hash('f')
+            ),
+        )
+        .unwrap();
+
+        let store = load_content(&path).unwrap();
+        assert_eq!(store.get(&hash('f')).unwrap().aliases, ["old.jpg"]);
+
+        persist_content(&store, &path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+                ["schema"],
+            2
+        );
+    }
+
+    #[test]
+    fn invalid_autotag_provenance_does_not_mutate_content() {
+        let mut store = ContentStore::default();
+        let before = store.clone();
+
+        assert!(store
+            .set_autotag(
+                &hash('a'),
+                &[],
+                AutoTagProvenance {
+                    model: "model".to_string(),
+                    confidence: Some(1.1),
+                    raw: serde_json::Value::Null,
+                },
+                (None, None),
+            )
+            .is_err());
+        assert_eq!(store, before);
     }
 
     #[test]

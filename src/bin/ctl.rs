@@ -770,6 +770,15 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                             println!("  resolved: {}", resolved);
                         }
                     }
+                    if let Some(autotag) = item.get("autotag").and_then(Value::as_object) {
+                        if let Some(model) = autotag.get("model").and_then(Value::as_str) {
+                            println!("  autotag model: {}", model);
+                        }
+                        if let Some(confidence) = autotag.get("confidence").and_then(Value::as_f64)
+                        {
+                            println!("  autotag confidence: {:.2}", confidence);
+                        }
+                    }
                 }
                 if let Some(next_offset) = result.get("next_offset").and_then(Value::as_u64) {
                     println!("next offset: {}", next_offset);
@@ -2204,6 +2213,11 @@ fn autotag_upsert_message(
         groups: result.groups.clone(),
         rating: result.rating,
         frequency: result.frequency,
+        provenance: Some(aurora::content::AutoTagProvenance {
+            model: result.model.clone(),
+            confidence: result.confidence,
+            raw: result.raw.clone(),
+        }),
         create_playlist,
         overwrite_existing,
     }
@@ -2947,8 +2961,8 @@ mod tests {
             groups: BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
             rating: Some(4),
             frequency: Some(2),
-            confidence: None,
-            raw: Value::Null,
+            confidence: Some(0.9),
+            raw: json!({"identity": {"theme": ["night"]}}),
         };
         let message = autotag_upsert_message("auto", "photo.jpg", &result, true, false);
         assert!(matches!(
@@ -2957,6 +2971,8 @@ mod tests {
         ));
         let wire = serde_json::to_string(&message).unwrap();
         assert!(wire.contains("playlist_autotag_upsert"));
+        assert!(wire.contains("\"model\":\"model\""));
+        assert!(wire.contains("\"confidence\":0.9"));
         assert!(!wire.contains("playlist_list"));
     }
 
