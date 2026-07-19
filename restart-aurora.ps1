@@ -14,7 +14,7 @@ Run from a normal (non-admin) shell. Idempotent.
 #>
 param(
     [string]$AuroraDir = (Join-Path $PSScriptRoot 'target\release'),
-    [int]$ReadyTimeoutSec = 120
+    [int]$ReadyTimeoutSec = 300
 )
 
 $ErrorActionPreference = 'Stop'
