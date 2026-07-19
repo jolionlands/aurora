@@ -653,8 +653,7 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
             if as_json {
                 print_response(&resp, true)?;
             } else {
-                ensure_success(&resp)?;
-                let response: Value = serde_json::from_slice(&resp)?;
+                let response = ensure_success(&resp)?;
                 let result = response
                     .get("result")
                     .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist page"))?;
@@ -1237,8 +1236,7 @@ async fn playlist_path_has_metadata(playlist: &str, path: &str) -> anyhow::Resul
         path: path.to_string(),
     })
     .await?;
-    ensure_success(&resp)?;
-    let response: Value = serde_json::from_slice(&resp)?;
+    let response = ensure_success(&resp)?;
     response
         .pointer("/result/has_metadata")
         .and_then(Value::as_bool)
@@ -1763,7 +1761,7 @@ fn normalize_autotag_json(
             _ => {
                 let tags = value_to_tags(value);
                 if !tags.is_empty() {
-                    groups.entry(kind).or_insert_with(Vec::new).extend(tags);
+                    groups.entry(kind).or_default().extend(tags);
                 }
             }
         }
@@ -1885,7 +1883,7 @@ fn http_post_json(
     allow_http: bool,
 ) -> anyhow::Result<Value> {
     use std::ffi::c_void;
-    use windows::core::PCWSTR;
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Networking::WinHttp::{
         WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData,
         WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
@@ -1903,15 +1901,15 @@ fn http_post_json(
     )
     .encode_utf16()
     .collect();
-    let agent = wide("aurora-ctl/0.1");
-    let host = wide(&parsed.host);
-    let path = wide(&parsed.path);
+    let agent = HSTRING::from(concat!("aurora-ctl/", env!("CARGO_PKG_VERSION")));
+    let host = HSTRING::from(&parsed.host);
+    let path = HSTRING::from(&parsed.path);
     let timeout_ms = timeout_secs.saturating_mul(1000).clamp(1, i32::MAX as u64) as i32;
 
     unsafe {
         let session = WinHttpHandle::new(
             WinHttpOpen(
-                PCWSTR(agent.as_ptr()),
+                &agent,
                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                 PCWSTR::null(),
                 PCWSTR::null(),
@@ -1921,7 +1919,7 @@ fn http_post_json(
         )?;
         WinHttpSetTimeouts(session.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms)?;
         let connection = WinHttpHandle::new(
-            WinHttpConnect(session.0, PCWSTR(host.as_ptr()), parsed.port, 0),
+            WinHttpConnect(session.0, &host, parsed.port, 0),
             "connect to model gateway",
         )?;
         let flags = if parsed.secure {
@@ -1933,7 +1931,7 @@ fn http_post_json(
             WinHttpOpenRequest(
                 connection.0,
                 windows::core::w!("POST"),
-                PCWSTR(path.as_ptr()),
+                &path,
                 PCWSTR::null(),
                 PCWSTR::null(),
                 std::ptr::null(),
@@ -2002,10 +2000,6 @@ struct ParsedHttpUrl {
     host: String,
     port: u16,
     path: String,
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 struct WinHttpHandle(*mut std::ffi::c_void);
@@ -2102,8 +2096,7 @@ async fn apply_autotags_to_playlist(
         overwrite_existing,
     ))
     .await?;
-    ensure_success(&response)?;
-    let response: Value = serde_json::from_slice(&response)?;
+    let response = ensure_success(&response)?;
     response
         .pointer("/result/applied")
         .and_then(Value::as_bool)
@@ -2128,14 +2121,14 @@ fn autotag_upsert_message(
     }
 }
 
-fn ensure_success(resp: &[u8]) -> anyhow::Result<()> {
+fn ensure_success(resp: &[u8]) -> anyhow::Result<Value> {
     let value: Value = serde_json::from_slice(resp)?;
     if value
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        Ok(())
+        Ok(value)
     } else {
         let error = value
             .get("error")
@@ -2311,6 +2304,15 @@ mod tests {
         let error =
             print_response(br#"{"success":false,"error":"playlist missing"}"#, true).unwrap_err();
         assert_eq!(error.to_string(), "playlist missing");
+    }
+
+    #[test]
+    fn successful_response_is_returned_after_validation() {
+        let response = ensure_success(br#"{"success":true,"result":{"applied":true}}"#).unwrap();
+        assert_eq!(
+            response.pointer("/result/applied"),
+            Some(&Value::Bool(true))
+        );
     }
 
     fn write_test_bmp(path: &Path, color: [u8; 3]) {

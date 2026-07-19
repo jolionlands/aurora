@@ -226,7 +226,7 @@ impl PlaylistStore {
         let pl = self.active_playlist()?;
 
         // Resolve all existing paths with their configured weights.
-        let existing: Vec<(String, PathBuf, u64)> = pl
+        let existing: Vec<(PathBuf, u64)> = pl
             .paths
             .iter()
             .filter_map(|s| {
@@ -244,11 +244,7 @@ impl PlaylistStore {
                 }
                 let frequency = pl.frequencies.get(s).copied().unwrap_or(1).max(1) as u64;
                 let rating_weight = pl.ratings.get(s).map(|r| *r as u64 + 1).unwrap_or(1);
-                Some((
-                    s.clone(),
-                    resolved,
-                    frequency.saturating_mul(rating_weight).max(1),
-                ))
+                Some((resolved, frequency.saturating_mul(rating_weight).max(1)))
             })
             .collect();
 
@@ -256,58 +252,40 @@ impl PlaylistStore {
             return None;
         }
 
+        let recent_set: HashSet<&PathBuf> = recent_paths.iter().rev().take(recent_window).collect();
+        let all: Vec<usize> = (0..existing.len()).collect();
+        let candidates: Vec<usize> = all
+            .iter()
+            .copied()
+            .filter(|i| !recent_set.contains(&existing[*i].0))
+            .collect();
+        let pool = if candidates.is_empty() {
+            all
+        } else {
+            candidates
+        };
+        let total = pool
+            .iter()
+            .map(|i| existing[*i].1)
+            .fold(0, u64::saturating_add);
+        if total == 0 {
+            return None;
+        }
+
         if pl.shuffle {
-            let recent_set: std::collections::HashSet<&PathBuf> =
-                recent_paths.iter().rev().take(recent_window).collect();
-            let candidates: Vec<usize> = existing
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, p, _))| !recent_set.contains(p))
-                .map(|(i, _)| i)
-                .collect();
-            let pool: Vec<usize> = if candidates.is_empty() {
-                (0..existing.len()).collect()
-            } else {
-                candidates
-            };
-            let total: u64 = pool
-                .iter()
-                .map(|i| existing[*i].2)
-                .fold(0, u64::saturating_add);
-            let fallback = existing[*pool.last()?].1.clone();
+            let fallback = existing[*pool.last()?].0.clone();
             let mut pick = rand::thread_rng().gen_range(0..total);
             for idx in pool {
-                let weight = existing[idx].2;
+                let weight = existing[idx].1;
                 if pick < weight {
-                    return Some(existing[idx].1.clone());
+                    return Some(existing[idx].0.clone());
                 }
                 pick -= weight;
             }
             Some(fallback)
         } else {
-            let recent_set: std::collections::HashSet<&PathBuf> =
-                recent_paths.iter().rev().take(recent_window).collect();
-            let all: Vec<usize> = (0..existing.len()).collect();
-            let candidates: Vec<usize> = all
-                .iter()
-                .copied()
-                .filter(|i| !recent_set.contains(&existing[*i].1))
-                .collect();
-            let pool = if candidates.is_empty() {
-                all
-            } else {
-                candidates
-            };
-
             // Avoid expanding weights into a potentially enormous temporary vector.
             let cur = cursor.entry(pl.name.clone()).or_insert(0);
-            let total: u64 = pool
-                .iter()
-                .map(|i| existing[*i].2)
-                .fold(0, u64::saturating_add);
-            if total == 0 {
-                return None;
-            }
             let mut slot = (*cur as u64) % total;
             let next = slot + 1;
             *cur = if next >= total {
@@ -316,13 +294,13 @@ impl PlaylistStore {
                 next.min(usize::MAX as u64) as usize
             };
             for idx in &pool {
-                let weight = existing[*idx].2;
+                let weight = existing[*idx].1;
                 if slot < weight {
-                    return Some(existing[*idx].1.clone());
+                    return Some(existing[*idx].0.clone());
                 }
                 slot -= weight;
             }
-            Some(existing[*pool.last()?].1.clone())
+            Some(existing[*pool.last()?].0.clone())
         }
     }
 }
@@ -513,10 +491,10 @@ pub fn serialize_playlists(store: &PlaylistStore) -> String {
                     continue;
                 };
                 match kind.as_str() {
-                    "general" => write_tag_lines(&mut out, "tag", path, Some(tags)),
+                    "general" => write_tag_lines(&mut out, "tag", path, tags),
                     "theme" | "content" | "color" | "source" | "medium" | "safety"
                     | "franchise" | "character" => {
-                        write_tag_lines(&mut out, kind, path, Some(tags));
+                        write_tag_lines(&mut out, kind, path, tags);
                     }
                     _ => {
                         for tag in tags {
@@ -871,16 +849,14 @@ fn push_group_tag(pl: &mut Playlist, path: &str, kind: &str, tag: &str) -> Resul
     Ok(())
 }
 
-fn write_tag_lines(out: &mut String, key: &str, path: &str, tags: Option<&Vec<String>>) {
-    if let Some(tags) = tags {
-        for tag in tags {
-            out.push_str(&format!(
-                "    {} \"{}\" \"{}\"\n",
-                key,
-                escape_kdl(path),
-                escape_kdl(tag)
-            ));
-        }
+fn write_tag_lines(out: &mut String, key: &str, path: &str, tags: &[String]) {
+    for tag in tags {
+        out.push_str(&format!(
+            "    {} \"{}\" \"{}\"\n",
+            key,
+            escape_kdl(path),
+            escape_kdl(tag)
+        ));
     }
 }
 
@@ -1254,7 +1230,7 @@ playlist "legacy" {
     }
 
     #[test]
-    fn test_pick_uses_all_roots_and_avoids_recent_sequential_items() {
+    fn test_pick_uses_all_roots_and_avoids_recent_items() {
         let mut store = PlaylistStore::default();
         store.create("seq").unwrap();
         store.activate("seq").unwrap();
@@ -1280,6 +1256,12 @@ playlist "legacy" {
             .pick_from_roots(&roots, &mut cursor, 1, &recent, &HashSet::new())
             .unwrap();
         assert_eq!(second, root_b.path().join("second.jpg"));
+
+        store.set_shuffle("seq", true).unwrap();
+        let shuffled = store
+            .pick_from_roots(&roots, &mut cursor, 1, &recent, &HashSet::new())
+            .unwrap();
+        assert_eq!(shuffled, root_b.path().join("second.jpg"));
     }
 
     #[test]
