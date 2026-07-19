@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parse config {}", config_path.display()))?;
 
     init_logging(&config.log_level)?;
-    info!("aurora 0.1.0 starting");
+    info!("aurora {} starting", env!("CARGO_PKG_VERSION"));
     if wrote_default_config {
         info!("Wrote default config to {}", config_path.display());
     }

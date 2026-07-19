@@ -107,7 +107,7 @@ pub struct TransitionConfig {
 impl Default for TransitionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             duration_ms: 800,
             style: "crossfade".to_string(),
             renderer: "auto".to_string(),

@@ -13,8 +13,8 @@ aurora-ctl gets AccessDenied on the pipe.
 Run from a normal (non-admin) shell. Idempotent.
 #>
 param(
-    [string]$AuroraDir = 'C:\Users\kalli\Development\tools\WM\aurora\target\release',
-    [int]$ReadyTimeoutSec = 40
+    [string]$AuroraDir = (Join-Path $PSScriptRoot 'target\release'),
+    [int]$ReadyTimeoutSec = 120
 )
 
 $ErrorActionPreference = 'Stop'

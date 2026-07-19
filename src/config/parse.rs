@@ -638,6 +638,17 @@ mod tests {
     }
 
     #[test]
+    fn transitions_are_opt_in() {
+        assert!(!parse_kdl_config("").unwrap().transitions.enabled);
+        assert!(
+            parse_kdl_config("transitions {\nenabled true\n}")
+                .unwrap()
+                .transitions
+                .enabled
+        );
+    }
+
+    #[test]
     fn test_parse_strips_bom() {
         // PowerShell 5.1 Out-File -Encoding utf8 prepends a UTF-8 BOM (U+FEFF).
         // Verify the parser silently strips it and returns Ok.
