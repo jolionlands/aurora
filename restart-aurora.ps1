@@ -13,11 +13,14 @@ aurora-ctl gets AccessDenied on the pipe.
 Run from a normal (non-admin) shell. Idempotent.
 #>
 param(
-    [string]$AuroraDir = (Join-Path $PSScriptRoot 'target\release'),
+    [string]$AuroraDir,
     [int]$ReadyTimeoutSec = 300
 )
 
 $ErrorActionPreference = 'Stop'
+if ([String]::IsNullOrWhiteSpace($AuroraDir)) {
+    $AuroraDir = Join-Path $PSScriptRoot 'target\release'
+}
 $exe = [IO.Path]::GetFullPath((Join-Path $AuroraDir 'aurora.exe'))
 $ctl = Join-Path $AuroraDir 'aurora-ctl.exe'
 if (-not (Test-Path $exe)) { throw "aurora.exe not found: $exe" }
