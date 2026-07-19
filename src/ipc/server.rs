@@ -375,8 +375,8 @@ impl IpcServer {
                 }
             }
 
-            IpcMessage::PlaylistCreate { name } => {
-                command_response(runtime!().playlist_create(&name))
+            IpcMessage::PlaylistCreate { name, dynamic } => {
+                command_response(runtime!().playlist_create(&name, dynamic))
             }
 
             IpcMessage::PlaylistAdd { name, path } => {
@@ -462,6 +462,40 @@ impl IpcServer {
 
             IpcMessage::PlaylistDelete { name } => {
                 command_response(runtime!().playlist_delete(&name))
+            }
+
+            // ------------------------------------------------------------------
+            // Content metadata
+            // ------------------------------------------------------------------
+            IpcMessage::ContentList {
+                offset,
+                limit,
+                include,
+                exclude,
+            } => match runtime!().content_list(offset, limit, include, exclude) {
+                Ok(result) => serde_json::json!({ "success": true, "result": result }),
+                Err(error) => {
+                    serde_json::json!({ "success": false, "error": error.to_string() })
+                }
+            },
+
+            IpcMessage::ContentShow { target } => match runtime!().content_show(&target) {
+                Ok(result) => serde_json::json!({ "success": true, "result": result }),
+                Err(error) => {
+                    serde_json::json!({ "success": false, "error": error.to_string() })
+                }
+            },
+
+            IpcMessage::ContentTag { target, kind, tags } => {
+                command_response(runtime!().content_tag(&target, &kind, tags))
+            }
+
+            IpcMessage::ContentRate { target, rating } => {
+                command_response(runtime!().content_rate(&target, rating))
+            }
+
+            IpcMessage::ContentClear { target } => {
+                command_response(runtime!().content_clear(&target))
             }
         }
     }
@@ -732,6 +766,28 @@ mod tests {
             command_response(Err(anyhow::anyhow!("failed"))),
             serde_json::json!({ "success": false, "error": "failed" })
         );
+    }
+
+    #[tokio::test]
+    async fn content_list_routes_filters_and_pagination() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let server = server_with_swap_sender(tx);
+        let response = server
+            .process_message(IpcMessage::ContentList {
+                offset: 0,
+                limit: 12,
+                include: std::collections::BTreeMap::from([(
+                    "theme".to_string(),
+                    vec!["night".to_string()],
+                )]),
+                exclude: std::collections::BTreeMap::new(),
+            })
+            .await;
+
+        assert_eq!(response["success"], serde_json::json!(true));
+        assert_eq!(response["result"]["offset"], serde_json::json!(0));
+        assert_eq!(response["result"]["limit"], serde_json::json!(12));
+        assert_eq!(response["result"]["total"], serde_json::json!(0));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::config::types::Config;
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MonitorInfo {
     /// Device path string, e.g. `\\.\DISPLAY1\Monitor0`.
     pub id: String,
@@ -28,6 +28,12 @@ pub struct MonitorInfo {
     pub width: u32,
     /// Physical monitor height in pixels.
     pub height: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MonitorSnapshot {
+    pub monitor: MonitorInfo,
+    pub current_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +56,17 @@ impl WallpaperFit {
             "stretch" => WallpaperFit::Stretch,
             "span" => WallpaperFit::Span,
             _ => WallpaperFit::Fill,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WallpaperFit::Fill => "fill",
+            WallpaperFit::Contain => "contain",
+            WallpaperFit::Tile => "tile",
+            WallpaperFit::Center => "center",
+            WallpaperFit::Stretch => "stretch",
+            WallpaperFit::Span => "span",
         }
     }
 

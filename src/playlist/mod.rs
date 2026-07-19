@@ -271,60 +271,78 @@ impl PlaylistStore {
             })
             .collect();
 
-        if existing.is_empty() {
-            return None;
-        }
+        pick_weighted_path(
+            &pl.name,
+            pl.shuffle,
+            &existing,
+            cursor,
+            recent_window,
+            recent_paths,
+        )
+    }
+}
 
-        let recent_set: HashSet<&PathBuf> = recent_paths.iter().rev().take(recent_window).collect();
-        let all: Vec<usize> = (0..existing.len()).collect();
-        let candidates: Vec<usize> = all
-            .iter()
-            .copied()
-            .filter(|i| !recent_set.contains(&existing[*i].0))
-            .collect();
-        let pool = if candidates.is_empty() {
-            all
+pub(crate) fn pick_weighted_path(
+    playlist_name: &str,
+    shuffle: bool,
+    existing: &[(PathBuf, u64)],
+    cursor: &mut HashMap<String, usize>,
+    recent_window: usize,
+    recent_paths: &VecDeque<PathBuf>,
+) -> Option<PathBuf> {
+    if existing.is_empty() {
+        return None;
+    }
+
+    let recent_set: HashSet<&PathBuf> = recent_paths.iter().rev().take(recent_window).collect();
+    let all: Vec<usize> = (0..existing.len()).collect();
+    let candidates: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|i| !recent_set.contains(&existing[*i].0))
+        .collect();
+    let pool = if candidates.is_empty() {
+        all
+    } else {
+        candidates
+    };
+    let total = pool
+        .iter()
+        .map(|i| existing[*i].1)
+        .fold(0, u64::saturating_add);
+    if total == 0 {
+        return None;
+    }
+
+    if shuffle {
+        let fallback = existing[*pool.last()?].0.clone();
+        let mut pick = rand::thread_rng().gen_range(0..total);
+        for idx in pool {
+            let weight = existing[idx].1;
+            if pick < weight {
+                return Some(existing[idx].0.clone());
+            }
+            pick -= weight;
+        }
+        Some(fallback)
+    } else {
+        // Avoid expanding weights into a potentially enormous temporary vector.
+        let cur = cursor.entry(playlist_name.to_string()).or_insert(0);
+        let mut slot = (*cur as u64) % total;
+        let next = slot + 1;
+        *cur = if next >= total {
+            0
         } else {
-            candidates
+            next.min(usize::MAX as u64) as usize
         };
-        let total = pool
-            .iter()
-            .map(|i| existing[*i].1)
-            .fold(0, u64::saturating_add);
-        if total == 0 {
-            return None;
-        }
-
-        if pl.shuffle {
-            let fallback = existing[*pool.last()?].0.clone();
-            let mut pick = rand::thread_rng().gen_range(0..total);
-            for idx in pool {
-                let weight = existing[idx].1;
-                if pick < weight {
-                    return Some(existing[idx].0.clone());
-                }
-                pick -= weight;
+        for idx in &pool {
+            let weight = existing[*idx].1;
+            if slot < weight {
+                return Some(existing[*idx].0.clone());
             }
-            Some(fallback)
-        } else {
-            // Avoid expanding weights into a potentially enormous temporary vector.
-            let cur = cursor.entry(pl.name.clone()).or_insert(0);
-            let mut slot = (*cur as u64) % total;
-            let next = slot + 1;
-            *cur = if next >= total {
-                0
-            } else {
-                next.min(usize::MAX as u64) as usize
-            };
-            for idx in &pool {
-                let weight = existing[*idx].1;
-                if slot < weight {
-                    return Some(existing[*idx].0.clone());
-                }
-                slot -= weight;
-            }
-            Some(existing[*pool.last()?].0.clone())
+            slot -= weight;
         }
+        Some(existing[*pool.last()?].0.clone())
     }
 }
 
@@ -556,26 +574,41 @@ pub fn serialize_playlists(store: &PlaylistStore) -> String {
     out
 }
 
+pub(crate) fn serialize_playlists_checked(store: &PlaylistStore) -> Result<String> {
+    validate_store(store).context("validate playlists before persist")?;
+    Ok(serialize_playlists(store))
+}
+
 // ---------------------------------------------------------------------------
 // Atomic write
 // ---------------------------------------------------------------------------
 
 /// Write `store` to `path` atomically via a `.tmp` sibling + rename.
 pub fn persist_playlists(store: &PlaylistStore, path: &Path) -> Result<()> {
-    validate_store(store).context("validate playlists before persist")?;
-    let content = serialize_playlists(store);
-
-    // Ensure the parent directory exists.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create playlists dir {}", parent.display()))?;
-    }
-
+    let content = serialize_playlists_checked(store)?;
     let tmp = path.with_extension("kdl.tmp");
-    std::fs::write(&tmp, content.as_bytes())
-        .with_context(|| format!("write playlists tmp {}", tmp.display()))?;
+    write_synced(&tmp, content.as_bytes())?;
     replace_file(&tmp, path)?;
     Ok(())
+}
+
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open temporary file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write temporary file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flush temporary file {}", path.display()))
 }
 
 pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
@@ -1285,6 +1318,48 @@ playlist "legacy" {
             .pick_from_roots(&roots, &mut cursor, 1, &recent, &HashSet::new())
             .unwrap();
         assert_eq!(shuffled, root_b.path().join("second.jpg"));
+    }
+
+    #[test]
+    fn weighted_picker_preserves_weights_and_recent_fallback() {
+        let first = PathBuf::from("first.jpg");
+        let second = PathBuf::from("second.jpg");
+        let candidates = vec![(first.clone(), 2), (second.clone(), 1)];
+        let mut cursor = HashMap::new();
+
+        assert_eq!(
+            pick_weighted_path(
+                "dynamic",
+                false,
+                &candidates,
+                &mut cursor,
+                0,
+                &VecDeque::new()
+            ),
+            Some(first.clone())
+        );
+        assert_eq!(
+            pick_weighted_path(
+                "dynamic",
+                false,
+                &candidates,
+                &mut cursor,
+                0,
+                &VecDeque::new()
+            ),
+            Some(first.clone())
+        );
+        assert_eq!(
+            pick_weighted_path(
+                "dynamic",
+                false,
+                &candidates,
+                &mut cursor,
+                1,
+                &VecDeque::from([first])
+            ),
+            Some(second)
+        );
     }
 
     #[test]

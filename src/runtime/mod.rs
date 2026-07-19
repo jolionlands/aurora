@@ -2,7 +2,7 @@
 //! picks a photo from the index, decodes it (with cache), runs the configured
 //! transition, applies the new wallpaper via IDesktopWallpaper, updates metrics.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -15,19 +15,20 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::apply::{configured_global_fit, WallpaperApplier};
+use crate::apply::{configured_global_fit, MonitorSnapshot};
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::content::{
-    content_path, load_content, persist_content, AutoTagProvenance, ContentMetadata, ContentStore,
-    TagFilters,
+    content_path, load_content, parse_content, persist_content, serialize_content,
+    AutoTagProvenance, ContentMetadata, ContentStore, TagFilters,
 };
 use crate::decode::SharedDecodeCache;
 use crate::index::{PhotoEntry, PhotoIndex};
-use crate::ipc::messages::{IpcEvent, MAX_PLAYLIST_SHOW_LIMIT};
+use crate::ipc::messages::{IpcEvent, MAX_CONTENT_LIST_LIMIT, MAX_PLAYLIST_SHOW_LIMIT};
 use crate::ipc::MAX_FRAME_SIZE;
 use crate::metrics::Metrics;
 use crate::playlist::{
-    default_playlists_path, load_playlists, persist_playlists, Playlist, PlaylistStore,
+    default_playlists_path, load_playlists, parse_playlists, persist_playlists, pick_weighted_path,
+    serialize_playlists_checked, write_synced, Playlist, PlaylistStore,
 };
 use crate::scheduler::{checked_pause_deadline, SchedulerProgress, SwapReason, SwapRequest};
 use crate::transition::{Backend, Rect, TransitionRenderer, TransitionStyle};
@@ -65,7 +66,6 @@ pub struct Runtime {
     source_roots: Arc<RwLock<Vec<PathBuf>>>,
     cache: SharedDecodeCache,
     transitions: TransitionRenderer,
-    applier: WallpaperApplier,
     metrics: Arc<Metrics>,
     state: RuntimeState,
     config: Config,
@@ -82,7 +82,18 @@ const HISTORY_CAP: usize = 50;
 const BYTES_PER_4K_BGRA: usize = 3840 * 2160 * 4;
 const BANS_FILENAME: &str = "bans.txt";
 const INDEX_CACHE_FILENAME: &str = "index-cache.json";
+const PLAYLIST_CONTENT_TRANSACTION_FILENAME: &str = "playlist-content.txn.json";
+const PLAYLIST_CONTENT_TRANSACTION_VERSION: u32 = 1;
 const DIRECT_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const ALL_MONITORS_ID: &str = "all";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistContentTransaction {
+    version: u32,
+    content_json: String,
+    playlists_kdl: String,
+}
 
 #[derive(Default)]
 struct BanCoordinator {
@@ -180,21 +191,25 @@ fn cache_capacity(decoded_bytes: usize) -> usize {
 
 fn monitor_results(successful: usize, failures: &[String]) -> Result<()> {
     if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "wallpaper updated on {successful} monitor(s), failed on {}: {}",
-            failures.len(),
-            failures.join("; ")
-        ))
+        return Ok(());
     }
+    let message = format!(
+        "wallpaper updated on {successful} monitor(s), failed on {}: {}",
+        failures.len(),
+        failures.join("; ")
+    );
+    if successful > 0 {
+        warn!("{message}");
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(message))
 }
 
 fn needs_transition_decode(enabled: bool, has_previous: bool) -> bool {
     enabled && has_previous
 }
 
-fn apply_direct_in_child(path: &Path, fit: Option<&str>) -> Result<()> {
+fn apply_direct_in_child(path: &Path, fit: Option<&str>, monitor_id: Option<&str>) -> Result<()> {
     use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
@@ -202,13 +217,16 @@ fn apply_direct_in_child(path: &Path, fit: Option<&str>) -> Result<()> {
     if let Some(fit) = fit {
         command.arg("--apply-fit").arg(fit);
     }
+    if let Some(monitor_id) = monitor_id {
+        command.arg("--apply-monitor").arg(monitor_id);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW.0);
     let child = command.spawn().context("start wallpaper apply helper")?;
-    let output = wait_for_apply_child(child, DIRECT_APPLY_TIMEOUT)?;
+    let output = wait_for_helper_child(child, DIRECT_APPLY_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!(
             "wallpaper apply helper failed: {}",
@@ -218,7 +236,30 @@ fn apply_direct_in_child(path: &Path, fit: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
+fn inspect_wallpapers_in_child() -> Result<Vec<MonitorSnapshot>> {
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
+    command
+        .arg("--inspect-wallpapers")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW.0);
+    let child = command
+        .spawn()
+        .context("start wallpaper inspection helper")?;
+    let output = wait_for_helper_child(child, DIRECT_APPLY_TIMEOUT)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "wallpaper inspection helper failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse wallpaper inspection helper output")
+}
+
+fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Result<Output> {
     let started = Instant::now();
 
     loop {
@@ -235,7 +276,7 @@ fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
             if let Err(error) = child.kill() {
                 if child.try_wait().ok().flatten().is_none() {
                     anyhow::bail!(
-                        "wallpaper apply timed out after {} milliseconds and helper could not be terminated: {error}",
+                        "wallpaper helper timed out after {} milliseconds and could not be terminated: {error}",
                         timeout.as_millis()
                     );
                 }
@@ -243,7 +284,7 @@ fn wait_for_apply_child(mut child: Child, timeout: Duration) -> Result<Output> {
                 let _ = child.wait();
             }
             anyhow::bail!(
-                "wallpaper apply timed out after {} milliseconds",
+                "wallpaper helper timed out after {} milliseconds",
                 timeout.as_millis()
             );
         }
@@ -281,6 +322,42 @@ fn banned_paths(index: &PhotoIndex) -> HashSet<PathBuf> {
         .collect()
 }
 
+fn dynamic_playlist_entries<'a>(
+    index: &'a PhotoIndex,
+    content: &'a ContentStore,
+    filters: Option<&'a TagFilters>,
+) -> impl Iterator<Item = &'a PhotoEntry> {
+    index.photos.iter().filter(move |entry| {
+        !entry.banned
+            && filters.is_none_or(|filters| {
+                filters.accepts(
+                    content
+                        .get(&entry.hash)
+                        .map(|metadata| &metadata.tag_groups),
+                )
+            })
+    })
+}
+
+fn dynamic_playlist_candidates(
+    index: &PhotoIndex,
+    content: &ContentStore,
+    filters: Option<&TagFilters>,
+    excluded_paths: &HashSet<PathBuf>,
+) -> Vec<(PathBuf, u64)> {
+    dynamic_playlist_entries(index, content, filters)
+        .filter(|entry| !excluded_paths.contains(&entry.path))
+        .map(|entry| {
+            let rating_weight = content
+                .get(&entry.hash)
+                .and_then(|metadata| metadata.rating)
+                .map(|rating| u64::from(rating) + 1)
+                .unwrap_or(1);
+            (entry.path.clone(), rating_weight)
+        })
+        .collect()
+}
+
 fn rotation_target(
     index: &PhotoIndex,
     playlist_active: bool,
@@ -311,6 +388,10 @@ fn commit_successful_monitors(
     recent_window: usize,
     monitor_ids: &[String],
 ) {
+    if monitor_ids.len() == 1 && monitor_ids[0] == ALL_MONITORS_ID {
+        state.current_path.clear();
+        metrics.current_photo.lock().clear();
+    }
     for monitor_id in monitor_ids {
         state
             .current_path
@@ -351,6 +432,52 @@ fn commit_successful_monitors(
     metrics.record_swap();
 }
 
+fn should_suppress_same_target(
+    reason: &SwapReason,
+    current_paths: &HashMap<String, PathBuf>,
+    target: &Path,
+    attached_monitor_ids: &[String],
+) -> bool {
+    if matches!(reason, SwapReason::Manual | SwapReason::Previous)
+        || attached_monitor_ids.is_empty()
+    {
+        return false;
+    }
+    let Ok(target) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    attached_monitor_ids.iter().all(|monitor_id| {
+        current_paths.get(monitor_id).is_some_and(|current| {
+            std::fs::canonicalize(current).is_ok_and(|current| current == target)
+        })
+    })
+}
+
+fn reconcile_attached_monitors(
+    state: &mut RuntimeState,
+    metrics: &Metrics,
+    attached_monitor_ids: &[String],
+) {
+    if let Some(path) = state.current_path.remove(ALL_MONITORS_ID) {
+        metrics.current_photo.lock().remove(ALL_MONITORS_ID);
+        for monitor_id in attached_monitor_ids {
+            state
+                .current_path
+                .entry(monitor_id.clone())
+                .or_insert_with(|| path.clone());
+            metrics.set_current_photo(monitor_id, path.clone());
+        }
+    }
+    let attached: HashSet<&str> = attached_monitor_ids.iter().map(String::as_str).collect();
+    state
+        .current_path
+        .retain(|monitor_id, _| attached.contains(monitor_id.as_str()));
+    metrics
+        .current_photo
+        .lock()
+        .retain(|monitor_id, _| attached.contains(monitor_id.as_str()));
+}
+
 fn previous_path(history: &VecDeque<PathBuf>) -> Option<PathBuf> {
     history.iter().rev().nth(1).cloned()
 }
@@ -372,6 +499,140 @@ fn bans_path(config_path: &Path) -> PathBuf {
 
 fn index_cache_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name(INDEX_CACHE_FILENAME)
+}
+
+fn playlist_content_transaction_path(content_path: &Path) -> PathBuf {
+    content_path.with_file_name(PLAYLIST_CONTENT_TRANSACTION_FILENAME)
+}
+
+fn validate_playlist_content_consistency(
+    playlists: &PlaylistStore,
+    content: &ContentStore,
+) -> Result<()> {
+    for name in content.dynamic_playlists() {
+        let playlist = playlists.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "content metadata marks playlist '{name}' dynamic, but playlists.kdl does not define it"
+            )
+        })?;
+        if !playlist.paths.is_empty()
+            || !playlist.tag_groups.is_empty()
+            || !playlist.ratings.is_empty()
+            || !playlist.frequencies.is_empty()
+        {
+            anyhow::bail!(
+                "dynamic playlist '{name}' must not contain path membership or path-local metadata"
+            );
+        }
+    }
+    for name in content.playlist_filter_names() {
+        if playlists.get(name).is_none() {
+            anyhow::bail!(
+                "content metadata has filters for missing playlist '{name}'; create it or remove the stale filter"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_playlist_content_transaction(transaction: &PlaylistContentTransaction) -> Result<()> {
+    if transaction.version != PLAYLIST_CONTENT_TRANSACTION_VERSION {
+        anyhow::bail!(
+            "unsupported playlist/content transaction version {}; expected {}",
+            transaction.version,
+            PLAYLIST_CONTENT_TRANSACTION_VERSION
+        );
+    }
+    let content = parse_content(transaction.content_json.as_bytes())
+        .context("validate transaction content metadata")?;
+    let playlists =
+        parse_playlists(&transaction.playlists_kdl).context("validate transaction playlists")?;
+    validate_playlist_content_consistency(&playlists, &content)
+        .context("validate transaction playlist/content consistency")
+}
+
+fn stage_playlist_content_transaction(
+    transaction: &PlaylistContentTransaction,
+    playlists_path: &Path,
+    content_path: &Path,
+) -> Result<()> {
+    write_synced(
+        &content_path.with_extension("json.tmp"),
+        transaction.content_json.as_bytes(),
+    )?;
+    write_synced(
+        &playlists_path.with_extension("kdl.tmp"),
+        transaction.playlists_kdl.as_bytes(),
+    )
+}
+
+fn install_playlist_content_transaction(playlists_path: &Path, content_path: &Path) -> Result<()> {
+    crate::playlist::replace_file(&content_path.with_extension("json.tmp"), content_path)?;
+    crate::playlist::replace_file(&playlists_path.with_extension("kdl.tmp"), playlists_path)
+}
+
+fn remove_transaction_marker(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "playlist/content transaction committed but marker {} could not be removed: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn recover_playlist_content_transaction(playlists_path: &Path, content_path: &Path) -> Result<()> {
+    let transaction_path = playlist_content_transaction_path(content_path);
+    if !transaction_path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&transaction_path)
+        .with_context(|| format!("read transaction {}", transaction_path.display()))?;
+    let transaction: PlaylistContentTransaction = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse transaction {}", transaction_path.display()))?;
+    validate_playlist_content_transaction(&transaction)?;
+    stage_playlist_content_transaction(&transaction, playlists_path, content_path)?;
+    install_playlist_content_transaction(playlists_path, content_path)?;
+    remove_transaction_marker(&transaction_path);
+    info!(
+        "recovered committed playlist/content transaction {}",
+        transaction_path.display()
+    );
+    Ok(())
+}
+
+fn commit_playlist_content_transaction(
+    playlists: &PlaylistStore,
+    content: &ContentStore,
+    playlists_path: &Path,
+    content_path: &Path,
+) -> Result<()> {
+    validate_playlist_content_consistency(playlists, content)?;
+    let transaction = PlaylistContentTransaction {
+        version: PLAYLIST_CONTENT_TRANSACTION_VERSION,
+        content_json: String::from_utf8(serialize_content(content)?)
+            .context("content metadata serialization was not UTF-8")?,
+        playlists_kdl: serialize_playlists_checked(playlists)?,
+    };
+    stage_playlist_content_transaction(&transaction, playlists_path, content_path)?;
+
+    let transaction_path = playlist_content_transaction_path(content_path);
+    let transaction_tmp = transaction_path.with_extension("json.tmp");
+    let bytes =
+        serde_json::to_vec(&transaction).context("serialize playlist/content transaction")?;
+    write_synced(&transaction_tmp, &bytes)?;
+    crate::playlist::replace_file(&transaction_tmp, &transaction_path)?;
+
+    if let Err(error) = install_playlist_content_transaction(playlists_path, content_path) {
+        warn!(
+            "playlist/content transaction {} is committed and will be recovered later: {error:#}",
+            transaction_path.display()
+        );
+        return Ok(());
+    }
+    remove_transaction_marker(&transaction_path);
+    Ok(())
 }
 
 fn normalize_ban_hash(hash: &str) -> Result<String> {
@@ -400,10 +661,6 @@ fn load_bans(path: &Path) -> Result<HashSet<String>> {
 }
 
 fn persist_bans(path: &Path, bans: &HashSet<String>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create bans directory {}", parent.display()))?;
-    }
     let mut hashes: Vec<&str> = bans.iter().map(String::as_str).collect();
     hashes.sort_unstable();
     let mut content = hashes.join("\n");
@@ -411,8 +668,7 @@ fn persist_bans(path: &Path, bans: &HashSet<String>) -> Result<()> {
         content.push('\n');
     }
     let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("write bans temp file {}", tmp.display()))?;
+    write_synced(&tmp, content.as_bytes())?;
     crate::playlist::replace_file(&tmp, path)
 }
 
@@ -427,28 +683,37 @@ fn resolved_playlist_path(stored: &str, source_roots: &[PathBuf]) -> Option<Path
         .find(|candidate| candidate.is_file())
 }
 
-fn initial_runtime_state(applier: &WallpaperApplier) -> RuntimeState {
-    let mut state = RuntimeState::new();
-    let monitors = match applier.list_monitors() {
-        Ok(monitors) => monitors,
-        Err(error) => {
-            warn!("could not seed current wallpapers: {error:#}");
-            return state;
-        }
-    };
-    for monitor in monitors {
-        match applier.current_for_monitor(&monitor.id) {
-            Ok(Some(path)) if path.is_file() => {
-                state.current_path.insert(monitor.id, path);
-            }
-            Ok(_) => {}
-            Err(error) => warn!(
-                "could not seed current wallpaper for monitor {}: {error:#}",
-                monitor.id
-            ),
+fn seed_recent_current_paths(state: &mut RuntimeState) {
+    let mut seen = HashSet::new();
+    for path in state.current_path.values() {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if seen.insert(path.clone()) {
+            state.recent_paths.push_back(path);
         }
     }
-    state
+}
+
+fn runtime_state_from_snapshots(snapshots: Vec<MonitorSnapshot>) -> (RuntimeState, bool) {
+    let mut state = RuntimeState::new();
+    let expected_monitors = snapshots.len();
+    for snapshot in snapshots {
+        if let Some(path) = snapshot.current_path.filter(|path| path.is_file()) {
+            state.current_path.insert(snapshot.monitor.id, path);
+        }
+    }
+    seed_recent_current_paths(&mut state);
+    let complete = expected_monitors > 0 && state.current_path.len() == expected_monitors;
+    (state, complete)
+}
+
+fn initial_runtime_state() -> (RuntimeState, bool) {
+    match inspect_wallpapers_in_child() {
+        Ok(snapshots) => runtime_state_from_snapshots(snapshots),
+        Err(error) => {
+            warn!("could not seed current wallpapers: {error:#}");
+            (RuntimeState::new(), false)
+        }
+    }
 }
 
 fn migrate_legacy_content(
@@ -468,62 +733,103 @@ fn migrate_legacy_content(
         .collect();
     let mut changed = false;
 
-    if content.needs_legacy_migration() {
-        for playlist in &playlists.playlists {
-            for stored in &playlist.paths {
-                let Some(resolved) = resolved_playlist_path(stored, source_roots) else {
-                    continue;
-                };
-                let canonical =
-                    std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
-                let identity = if let Some(entry) = indexed.get(&canonical) {
-                    (
-                        entry.hash.clone(),
-                        entry.width,
-                        entry.height,
-                        canonical.clone(),
-                    )
-                } else {
-                    let (width, height) = match crate::decode::validate_image_file(&resolved) {
-                        Ok(dimensions) => dimensions,
-                        Err(error) => {
-                            warn!(
-                                "skipping legacy metadata migration for {}: {error:#}",
-                                resolved.display()
-                            );
-                            continue;
-                        }
-                    };
-                    let hash = match crate::index::hash_file(&resolved) {
-                        Ok(hash) => hash,
-                        Err(error) => {
-                            warn!(
-                                "skipping legacy metadata migration for {}: {error:#}",
-                                resolved.display()
-                            );
-                            continue;
-                        }
-                    };
-                    (hash, Some(width), Some(height), canonical.clone())
-                };
-                let groups = playlist
-                    .tag_groups
+    let first_pass = content.needs_legacy_migration();
+    let reconciliation = content.needs_legacy_reconciliation();
+    let candidates: Vec<(String, String)> = if first_pass || reconciliation {
+        playlists
+            .playlists
+            .iter()
+            .flat_map(|playlist| {
+                playlist
+                    .paths
                     .iter()
-                    .filter_map(|(kind, paths)| {
-                        paths.get(stored).cloned().map(|tags| (kind.clone(), tags))
-                    })
-                    .collect();
-                let aliases = vec![stored.clone(), identity.3.to_string_lossy().into_owned()];
-                changed |= content.merge_legacy(
-                    &identity.0,
-                    &aliases,
-                    &groups,
-                    playlist.ratings.get(stored).copied(),
-                    (identity.1, identity.2),
-                )?;
-            }
+                    .map(|path| (playlist.name.clone(), path.clone()))
+            })
+            .collect()
+    } else {
+        content
+            .pending_legacy()
+            .map(|(playlist, path)| (playlist.to_string(), path.to_string()))
+            .collect()
+    };
+    let mut pending = BTreeSet::new();
+
+    for (playlist_name, stored) in candidates {
+        let Some(playlist) = playlists.get(&playlist_name) else {
+            continue;
+        };
+        if !playlist.paths.iter().any(|path| path == &stored) {
+            continue;
         }
+        let groups = playlist_path_tag_groups(playlist, &stored);
+        let rating = playlist.ratings.get(&stored).copied();
+        let has_metadata = !groups.is_empty() || rating.is_some();
+        let Some(resolved) = resolved_playlist_path(&stored, source_roots) else {
+            if has_metadata {
+                pending.insert((playlist_name, stored));
+            }
+            continue;
+        };
+        let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        let identity = if let Some(entry) = indexed.get(&canonical) {
+            (
+                entry.hash.clone(),
+                entry.width,
+                entry.height,
+                canonical.clone(),
+            )
+        } else {
+            let (width, height) = match crate::decode::validate_image_file(&resolved) {
+                Ok(dimensions) => dimensions,
+                Err(error) => {
+                    warn!(
+                        "deferring legacy metadata migration for {}: {error:#}",
+                        resolved.display()
+                    );
+                    if has_metadata {
+                        pending.insert((playlist_name, stored));
+                    }
+                    continue;
+                }
+            };
+            let hash = match crate::index::hash_file(&resolved) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    warn!(
+                        "deferring legacy metadata migration for {}: {error:#}",
+                        resolved.display()
+                    );
+                    if has_metadata {
+                        pending.insert((playlist_name, stored));
+                    }
+                    continue;
+                }
+            };
+            (hash, Some(width), Some(height), canonical.clone())
+        };
+        let aliases = vec![stored, identity.3.to_string_lossy().into_owned()];
+        let already_migrated = reconciliation
+            && !first_pass
+            && content.get(&identity.0).is_some_and(|metadata| {
+                aliases.iter().any(|alias| metadata.aliases.contains(alias))
+            });
+        if !already_migrated {
+            changed |= content.merge_legacy(
+                &identity.0,
+                &aliases,
+                &groups,
+                rating,
+                (identity.1, identity.2),
+            )?;
+        }
+    }
+
+    changed |= content.replace_pending_legacy(pending)?;
+    if first_pass {
         changed |= content.finish_legacy_migration();
+    }
+    if reconciliation {
+        changed |= content.finish_legacy_reconciliation();
     }
 
     // If a known file moved, keep the new indexed path as another alias for
@@ -539,6 +845,33 @@ fn migrate_legacy_content(
         changed |= content.remember_aliases(&entry.hash, &[alias], (entry.width, entry.height))?;
     }
     Ok(changed)
+}
+
+fn playlist_path_tag_groups(playlist: &Playlist, path: &str) -> BTreeMap<String, Vec<String>> {
+    playlist
+        .tag_groups
+        .iter()
+        .filter_map(|(kind, paths)| paths.get(path).cloned().map(|tags| (kind.clone(), tags)))
+        .collect()
+}
+
+fn effective_tag_groups(
+    playlist: &Playlist,
+    path: &str,
+    metadata: Option<&ContentMetadata>,
+    include_legacy: bool,
+) -> BTreeMap<String, Vec<String>> {
+    let mut groups = if metadata.is_none() || include_legacy {
+        playlist_path_tag_groups(playlist, path)
+    } else {
+        BTreeMap::new()
+    };
+    if let Some(metadata) = metadata {
+        for (kind, tags) in &metadata.tag_groups {
+            groups.insert(kind.clone(), tags.clone());
+        }
+    }
+    groups
 }
 
 #[derive(Debug, Clone)]
@@ -624,14 +957,100 @@ fn resolve_content(
     }))
 }
 
+fn content_id_hash(target: &str) -> Result<Option<String>> {
+    let Some((scheme, hash)) = target.split_once(':') else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("blake3") {
+        return Ok(None);
+    }
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("content ID must be blake3 followed by 64 hexadecimal characters");
+    }
+    Ok(Some(hash.to_ascii_lowercase()))
+}
+
+fn resolved_content_by_hash(
+    index: &PhotoIndex,
+    content: &ContentStore,
+    hash: &str,
+) -> Result<ResolvedContent> {
+    let metadata = content.get(hash);
+    let indexed = index.photos.iter().find(|entry| entry.hash == hash);
+    if metadata.is_none() && indexed.is_none() {
+        anyhow::bail!("content 'blake3:{hash}' not found");
+    }
+
+    let mut aliases = metadata
+        .map(|metadata| metadata.aliases.clone())
+        .unwrap_or_default();
+    if let Some(entry) = indexed {
+        let alias = entry.path.display().to_string();
+        if !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+    let path = indexed
+        .map(|entry| entry.path.clone())
+        .or_else(|| {
+            aliases
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .or_else(|| aliases.first().map(PathBuf::from))
+        .unwrap_or_default();
+    let width = metadata
+        .and_then(|metadata| metadata.width)
+        .or_else(|| indexed.and_then(|entry| entry.width));
+    let height = metadata
+        .and_then(|metadata| metadata.height)
+        .or_else(|| indexed.and_then(|entry| entry.height));
+
+    Ok(ResolvedContent {
+        hash: hash.to_string(),
+        path,
+        aliases,
+        width,
+        height,
+    })
+}
+
+fn resolve_content_target(
+    index: &PhotoIndex,
+    content: &ContentStore,
+    target: &str,
+    source_roots: &[PathBuf],
+) -> Result<ResolvedContent> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("content target must not be empty");
+    }
+    if let Some(hash) = content_id_hash(target)? {
+        return resolved_content_by_hash(index, content, &hash);
+    }
+    if resolved_playlist_path(target, source_roots).is_some() {
+        return resolve_content(index, content, target, source_roots, true)?
+            .ok_or_else(|| anyhow::anyhow!("cannot identify image content for path '{}'", target));
+    }
+    if let Some(hash) = content.hash_for_alias(target)? {
+        return resolved_content_by_hash(index, content, hash);
+    }
+    anyhow::bail!("content target '{}' not found", target)
+}
+
 impl Runtime {
     pub fn new(
         config: &Config,
         config_path: &Path,
-        applier: WallpaperApplier,
         metrics: Arc<Metrics>,
         scheduler_progress: SchedulerProgress,
     ) -> Result<Self> {
+        let playlists_path = default_playlists_path();
+        let metadata_path = content_path(config_path);
+        recover_playlist_content_transaction(&playlists_path, &metadata_path)
+            .context("recover playlist/content transaction during startup")?;
+
         // Build photo index from configured sources.
         let mut index = if config.sources.is_empty() {
             PhotoIndex::default()
@@ -667,7 +1086,6 @@ impl Runtime {
         );
 
         // Load playlist store from disk (creates empty default if file is absent).
-        let playlists_path = default_playlists_path();
         let playlist_store = load_playlists(&playlists_path)
             .with_context(|| format!("load playlists {}", playlists_path.display()))?;
         let source_roots: Vec<PathBuf> = config
@@ -675,9 +1093,10 @@ impl Runtime {
             .iter()
             .map(|source| source.path.clone())
             .collect();
-        let metadata_path = content_path(config_path);
         let mut content_store = load_content(&metadata_path)
             .with_context(|| format!("load content metadata {}", metadata_path.display()))?;
+        validate_playlist_content_consistency(&playlist_store, &content_store)
+            .context("validate loaded playlist/content metadata")?;
         if migrate_legacy_content(&mut content_store, &playlist_store, &index, &source_roots)? {
             persist_content(&content_store, &metadata_path).with_context(|| {
                 format!(
@@ -687,7 +1106,10 @@ impl Runtime {
             })?;
         }
 
-        let state = initial_runtime_state(&applier);
+        let (state, complete_monitor_snapshot) = initial_runtime_state();
+        if complete_monitor_snapshot {
+            scheduler_progress.seed_success();
+        }
         for (monitor, path) in &state.current_path {
             metrics.set_current_photo(monitor, path.clone());
         }
@@ -697,7 +1119,6 @@ impl Runtime {
             source_roots: Arc::new(RwLock::new(source_roots)),
             cache,
             transitions,
-            applier,
             metrics,
             state,
             config: config.clone(),
@@ -790,7 +1211,9 @@ impl Runtime {
             (specific, None)
         } else {
             // When a playlist is active, pick from it; otherwise use the full index.
-            let recent_window = self.config.schedule.min_repeat_window;
+            // A rotation should never immediately re-select the wallpaper that
+            // is already visible, even when the configurable history window is zero.
+            let recent_window = self.config.schedule.min_repeat_window.max(1);
             let mut excluded_paths = banned_paths(&self.index.read());
             // Known index entries are filtered without I/O. If a playlist path
             // is outside the index, hash only selected rejected entries and retry.
@@ -803,39 +1226,67 @@ impl Runtime {
                     let store = self.playlist_store.lock();
                     let content = self.content_store.lock();
                     let active = store.active.is_some();
-                    let pick = if active {
-                        store.pick_resolved(
-                            &mut self.playlist_cursor,
-                            recent_window,
-                            &self.state.recent_paths,
-                            &excluded_paths,
-                            |playlist, stored| {
-                                let identity =
-                                    resolve_content(&index, &content, stored, &source_roots, false)
-                                        .ok()
-                                        .flatten();
-                                if let Some(identity) = identity {
-                                    let metadata = content.get(&identity.hash);
-                                    if !content.playlist_accepts(
-                                        &playlist.name,
-                                        metadata.map(|metadata| &metadata.tag_groups),
-                                    ) {
-                                        return None;
+                    let pick = store.active_playlist().and_then(|playlist| {
+                        if content.is_dynamic_playlist(&playlist.name) {
+                            let candidates = dynamic_playlist_candidates(
+                                &index,
+                                &content,
+                                content.playlist_filters(&playlist.name),
+                                &excluded_paths,
+                            );
+                            pick_weighted_path(
+                                &playlist.name,
+                                playlist.shuffle,
+                                &candidates,
+                                &mut self.playlist_cursor,
+                                recent_window,
+                                &self.state.recent_paths,
+                            )
+                        } else {
+                            store.pick_resolved(
+                                &mut self.playlist_cursor,
+                                recent_window,
+                                &self.state.recent_paths,
+                                &excluded_paths,
+                                |playlist, stored| {
+                                    let identity = resolve_content(
+                                        &index,
+                                        &content,
+                                        stored,
+                                        &source_roots,
+                                        false,
+                                    )
+                                    .ok()
+                                    .flatten();
+                                    if let Some(identity) = identity {
+                                        let metadata = content.get(&identity.hash);
+                                        if content.playlist_filters(&playlist.name).is_some() {
+                                            let groups = effective_tag_groups(
+                                                playlist,
+                                                stored,
+                                                metadata,
+                                                content.is_legacy_pending(&playlist.name, stored),
+                                            );
+                                            if !content
+                                                .playlist_accepts(&playlist.name, Some(&groups))
+                                            {
+                                                return None;
+                                            }
+                                        }
+                                        let rating = metadata.and_then(|metadata| metadata.rating);
+                                        return Some((identity.path, rating));
                                     }
-                                    let rating = metadata.and_then(|metadata| metadata.rating);
-                                    return Some((identity.path, rating));
-                                }
-                                if content.playlist_accepts(&playlist.name, None) {
-                                    resolved_playlist_path(stored, &source_roots)
-                                        .map(|path| (path, None))
-                                } else {
-                                    None
-                                }
-                            },
-                        )
-                    } else {
-                        None
-                    };
+                                    let groups = playlist_path_tag_groups(playlist, stored);
+                                    if content.playlist_accepts(&playlist.name, Some(&groups)) {
+                                        resolved_playlist_path(stored, &source_roots)
+                                            .map(|path| (path, None))
+                                    } else {
+                                        None
+                                    }
+                                },
+                            )
+                        }
+                    });
                     (active, pick)
                 };
                 let Some(path) = pick else {
@@ -861,25 +1312,51 @@ impl Runtime {
             anyhow::bail!("wallpaper is banned: {}", new_path.display());
         }
 
-        let (successful_monitors, failures, total_monitors) = if !self.config.transitions.enabled {
-            let fit = self
-                .config
-                .monitors
-                .first()
-                .map(|monitor| monitor.fit.as_str());
-            self.ban_gate
-                .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path, fit))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("wallpaper was banned during swap: {}", new_path.display())
-                })?;
-            (vec!["all".to_string()], Vec::new(), 1)
-        } else {
-            let monitors = self.applier.list_monitors().context("listing monitors")?;
-            if monitors.is_empty() {
-                anyhow::bail!("no attached monitors found via IDesktopWallpaper");
+        let monitors = match inspect_wallpapers_in_child() {
+            Ok(snapshots) if !snapshots.is_empty() => Some(
+                snapshots
+                    .into_iter()
+                    .map(|snapshot| snapshot.monitor)
+                    .collect::<Vec<_>>(),
+            ),
+            Ok(_) if self.config.transitions.enabled => {
+                anyhow::bail!("no attached monitors found via IDesktopWallpaper")
             }
-            self.applier
-                .set_fit(configured_global_fit(&self.config, &monitors))?;
+            Ok(_) => None,
+            Err(error) if self.config.transitions.enabled => {
+                return Err(error).context("listing monitors");
+            }
+            Err(error) => {
+                warn!(
+                    "could not enumerate monitors; falling back to one all-monitor commit: {error:#}"
+                );
+                None
+            }
+        };
+        let attached_monitor_ids: Vec<String> = monitors
+            .as_ref()
+            .into_iter()
+            .flat_map(|monitors| monitors.iter().map(|monitor| monitor.id.clone()))
+            .collect();
+        if !attached_monitor_ids.is_empty() {
+            reconcile_attached_monitors(&mut self.state, &self.metrics, &attached_monitor_ids);
+        }
+        if should_suppress_same_target(
+            &req.reason,
+            &self.state.current_path,
+            &new_path,
+            &attached_monitor_ids,
+        ) {
+            debug!(
+                path = %new_path.display(),
+                reason = ?req.reason,
+                "wallpaper already active on every attached monitor; suppressing redundant apply"
+            );
+            return Ok(());
+        }
+
+        let (successful_monitors, failures, total_monitors) = if let Some(monitors) = monitors {
+            let fit = configured_global_fit(&self.config, &monitors).as_str();
 
             let mut successful_monitors = Vec::new();
             let mut failures = Vec::new();
@@ -929,7 +1406,7 @@ impl Runtime {
                             old_decoded,
                             new_decoded,
                             || {
-                                self.applier.set_for_monitor(&monitor.id, &new_path)?;
+                                apply_direct_in_child(&new_path, Some(fit), Some(&monitor.id))?;
                                 committed.set(true);
                                 Ok(())
                             },
@@ -947,7 +1424,7 @@ impl Runtime {
                             }
                         }
                     }
-                    self.applier.set_for_monitor(&monitor.id, &new_path)
+                    apply_direct_in_child(&new_path, Some(fit), Some(&monitor.id))
                 }) {
                     Ok(Some(())) => successful_monitors.push(monitor.id.clone()),
                     Ok(None) => {
@@ -966,6 +1443,18 @@ impl Runtime {
             }
             let total_monitors = monitors.len();
             (successful_monitors, failures, total_monitors)
+        } else {
+            let fit = self
+                .config
+                .monitors
+                .first()
+                .map(|monitor| monitor.fit.as_str());
+            self.ban_gate
+                .run_if_allowed(&target_hash, || apply_direct_in_child(&new_path, fit, None))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("wallpaper was banned during swap: {}", new_path.display())
+                })?;
+            (vec![ALL_MONITORS_ID.to_string()], Vec::new(), 1)
         };
 
         let successful = successful_monitors.len();
@@ -1021,6 +1510,8 @@ pub struct RuntimeHandle {
     config_path: Arc<std::path::PathBuf>,
     /// Serializes source scans without delaying unrelated ban updates.
     source_updates: Arc<Mutex<()>>,
+    /// Serializes playlist/content recovery and persistence.
+    persistence: Arc<Mutex<()>>,
     /// Serializes ban persistence and gates the final wallpaper apply.
     ban_gate: BanGate,
     /// Shared playlist store.  IPC commands mutate this and persist to disk.
@@ -1069,12 +1560,15 @@ fn playlist_summary_json(
     playlist: &Playlist,
     active: Option<&str>,
     filters: Option<&TagFilters>,
+    dynamic: bool,
+    path_count: usize,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": playlist.name,
         "shuffle": playlist.shuffle,
-        "path_count": playlist.paths.len(),
+        "path_count": path_count,
         "active": active == Some(playlist.name.as_str()),
+        "dynamic": dynamic,
         "include_tags": filters.map(|filters| filters.include.clone()).unwrap_or_default(),
         "exclude_tags": filters.map(|filters| filters.exclude.clone()).unwrap_or_default(),
     })
@@ -1085,19 +1579,12 @@ fn playlist_item_json(
     path: &str,
     identity: Option<&ResolvedContent>,
     metadata: Option<&ContentMetadata>,
+    include_legacy: bool,
 ) -> serde_json::Value {
     let mut tag_groups = serde_json::Map::new();
-    if let Some(metadata) = metadata {
-        for (kind, tags) in &metadata.tag_groups {
-            if !tags.is_empty() {
-                tag_groups.insert(kind.clone(), serde_json::json!(tags));
-            }
-        }
-    } else {
-        for (kind, group) in &playlist.tag_groups {
-            if let Some(tags) = group.get(path).filter(|tags| !tags.is_empty()) {
-                tag_groups.insert(kind.clone(), serde_json::json!(tags));
-            }
+    for (kind, tags) in effective_tag_groups(playlist, path, metadata, include_legacy) {
+        if !tags.is_empty() {
+            tag_groups.insert(kind, serde_json::json!(tags));
         }
     }
     serde_json::json!({
@@ -1113,6 +1600,158 @@ fn playlist_item_json(
         "height": identity.and_then(|identity| identity.height),
         "autotag": metadata.and_then(|metadata| metadata.autotag.as_ref()),
     })
+}
+
+fn dynamic_playlist_item_json(
+    entry: &PhotoEntry,
+    metadata: Option<&ContentMetadata>,
+) -> serde_json::Value {
+    let path = entry.path.display().to_string();
+    serde_json::json!({
+        "path": path,
+        "resolved_path": path,
+        "content_id": format!("blake3:{}", entry.hash),
+        "tag_groups": metadata.map(|metadata| &metadata.tag_groups).cloned().unwrap_or_default(),
+        "rating": metadata.and_then(|metadata| metadata.rating),
+        "frequency": 1,
+        "width": entry.width,
+        "height": entry.height,
+        "autotag": metadata.and_then(|metadata| metadata.autotag.as_ref()),
+    })
+}
+
+fn content_item_json(
+    index: &PhotoIndex,
+    hash: &str,
+    metadata: Option<&ContentMetadata>,
+    identity: Option<&ResolvedContent>,
+    probe_aliases: bool,
+) -> serde_json::Value {
+    let indexed: Vec<&PhotoEntry> = index
+        .photos
+        .iter()
+        .filter(|entry| entry.hash == hash)
+        .collect();
+    let indexed_paths: Vec<String> = indexed
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect();
+    let mut aliases = metadata
+        .map(|metadata| metadata.aliases.clone())
+        .unwrap_or_default();
+    if let Some(identity) = identity {
+        for alias in &identity.aliases {
+            if !aliases.contains(alias) {
+                aliases.push(alias.clone());
+            }
+        }
+    }
+    let available_aliases: Vec<String> = if probe_aliases {
+        aliases
+            .iter()
+            .filter(|alias| Path::new(alias).is_file())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let orphaned = if indexed.is_empty() {
+        probe_aliases.then_some(available_aliases.is_empty())
+    } else {
+        Some(false)
+    };
+    let dimensions = metadata
+        .and_then(|metadata| metadata.width.zip(metadata.height))
+        .or_else(|| identity.and_then(|identity| identity.width.zip(identity.height)))
+        .or_else(|| {
+            indexed
+                .iter()
+                .find_map(|entry| entry.width.zip(entry.height))
+        });
+    let resolved_path = identity
+        .filter(|identity| !identity.path.as_os_str().is_empty())
+        .map(|identity| identity.path.display().to_string());
+
+    serde_json::json!({
+        "content_id": format!("blake3:{hash}"),
+        "aliases": aliases,
+        "available_aliases": available_aliases,
+        "indexed_paths": indexed_paths,
+        "orphaned": orphaned,
+        "resolved_path": resolved_path,
+        "tag_groups": metadata.map(|metadata| &metadata.tag_groups).cloned().unwrap_or_default(),
+        "rating": metadata.and_then(|metadata| metadata.rating),
+        "rating_conflicted": metadata.is_some_and(|metadata| metadata.rating_conflicted),
+        "width": dimensions.map(|(width, _)| width),
+        "height": dimensions.map(|(_, height)| height),
+        "autotag": metadata.and_then(|metadata| metadata.autotag.as_ref()),
+    })
+}
+
+fn content_list_result_json(
+    total: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    items: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": next_offset,
+        "items": items,
+    })
+}
+
+fn bounded_content_list(
+    total: usize,
+    offset: usize,
+    limit: usize,
+    mut item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut items = Vec::new();
+    let mut overflow_at = None;
+    let end = total.min(offset.saturating_add(limit));
+
+    for index in offset..end {
+        items.push(item_at(index)?);
+        let next = offset.saturating_add(items.len());
+        let candidate =
+            content_list_result_json(total, offset, limit, (next < total).then_some(next), &items);
+        if playlist_show_fits_frame(&candidate)? {
+            continue;
+        }
+        let item = items.pop().expect("the candidate contains the new item");
+        let single_next = index.saturating_add(1);
+        let single = content_list_result_json(
+            total,
+            index,
+            1,
+            (single_next < total).then_some(single_next),
+            std::slice::from_ref(&item),
+        );
+        if !playlist_show_fits_frame(&single)? {
+            anyhow::bail!(
+                "content item at offset {index} exceeds the IPC response limit; reduce its autotag metadata before retrying"
+            );
+        }
+        if items.is_empty() {
+            anyhow::bail!(
+                "content item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce its autotag metadata"
+            );
+        }
+        overflow_at = Some(index);
+        break;
+    }
+
+    let next = offset.saturating_add(items.len());
+    let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
+    let result = content_list_result_json(total, offset, limit, next_offset, &items);
+    if !playlist_show_fits_frame(&result)? {
+        anyhow::bail!("content page exceeds the IPC response limit");
+    }
+    Ok(result)
 }
 
 fn playlist_show_result_json(
@@ -1143,6 +1782,65 @@ fn playlist_show_wire_len(result: &serde_json::Value) -> anyhow::Result<usize> {
 
 fn playlist_show_fits_frame(result: &serde_json::Value) -> anyhow::Result<bool> {
     Ok(playlist_show_wire_len(result)? <= MAX_FRAME_SIZE)
+}
+
+fn bounded_playlist_show(
+    summary: &serde_json::Value,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    mut item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut items = Vec::new();
+    let mut overflow_at = None;
+    let end = total.min(offset.saturating_add(limit));
+
+    for index in offset..end {
+        items.push(item_at(index)?);
+        let next = offset.saturating_add(items.len());
+        let candidate = playlist_show_result_json(
+            summary,
+            total,
+            offset,
+            limit,
+            (next < total).then_some(next),
+            &items,
+        );
+        if playlist_show_fits_frame(&candidate)? {
+            continue;
+        }
+
+        let item = items.pop().expect("the candidate contains the new item");
+        let single_next = index.saturating_add(1);
+        let single = playlist_show_result_json(
+            summary,
+            total,
+            index,
+            1,
+            (single_next < total).then_some(single_next),
+            std::slice::from_ref(&item),
+        );
+        if !playlist_show_fits_frame(&single)? {
+            anyhow::bail!(
+                "playlist item at offset {index} exceeds the IPC response limit; reduce its tag metadata before retrying"
+            );
+        }
+        if items.is_empty() {
+            anyhow::bail!(
+                "playlist item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce its tag metadata"
+            );
+        }
+        overflow_at = Some(index);
+        break;
+    }
+
+    let next = offset.saturating_add(items.len());
+    let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
+    let result = playlist_show_result_json(summary, total, offset, limit, next_offset, &items);
+    if !playlist_show_fits_frame(&result)? {
+        anyhow::bail!("playlist summary exceeds the IPC response limit; shorten the playlist name");
+    }
+    Ok(result)
 }
 
 fn playlist_path_has_autotag_metadata(store: &PlaylistStore, name: &str, path: &str) -> bool {
@@ -1235,6 +1933,7 @@ impl RuntimeHandle {
             })),
             config_path: Arc::new(config_path),
             source_updates: Arc::new(Mutex::new(())),
+            persistence: Arc::new(Mutex::new(())),
             ban_gate: shared.ban_gate,
             playlist_store,
             content_store: shared.content_store,
@@ -1399,6 +2098,12 @@ impl RuntimeHandle {
             .context("scanning photo sources during reload")?
         };
 
+        let _persistence = self.persistence.lock();
+        recover_playlist_content_transaction(
+            self.playlists_path.as_ref(),
+            self.content_path.as_ref(),
+        )
+        .context("recover playlist/content transaction before reload")?;
         let _ban_update = self.ban_gate.0.updates.lock();
         let bans = load_bans(&bans_path(self.config_path.as_ref()))?;
         new_index.apply_bans(&bans);
@@ -1413,6 +2118,8 @@ impl RuntimeHandle {
             .with_context(|| format!("reload playlists {}", self.playlists_path.display()))?;
         let mut reloaded_content = load_content(self.content_path.as_ref())
             .with_context(|| format!("reload content metadata {}", self.content_path.display()))?;
+        validate_playlist_content_consistency(&reloaded_playlists, &reloaded_content)
+            .context("validate reloaded playlist/content metadata")?;
         if migrate_legacy_content(
             &mut reloaded_content,
             &reloaded_playlists,
@@ -1500,16 +2207,26 @@ impl RuntimeHandle {
 
     /// Return a JSON summary of all playlists + the active one.
     pub fn playlist_list(&self) -> serde_json::Value {
+        let index = self.index.read();
         let store = self.playlist_store.lock();
         let content = self.content_store.lock();
         let playlists: Vec<serde_json::Value> = store
             .playlists
             .iter()
             .map(|playlist| {
+                let filters = content.playlist_filters(&playlist.name);
+                let dynamic = content.is_dynamic_playlist(&playlist.name);
+                let path_count = if dynamic {
+                    dynamic_playlist_entries(&index, &content, filters).count()
+                } else {
+                    playlist.paths.len()
+                };
                 playlist_summary_json(
                     playlist,
                     store.active.as_deref(),
-                    content.playlist_filters(&playlist.name),
+                    filters,
+                    dynamic,
+                    path_count,
                 )
             })
             .collect();
@@ -1536,85 +2253,53 @@ impl RuntimeHandle {
         let playlist = store
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
-        let total = playlist.paths.len();
-        let summary = playlist_summary_json(
-            playlist,
-            store.active.as_deref(),
-            content.playlist_filters(&playlist.name),
-        );
-        let mut items = Vec::new();
-        let mut overflow_at = None;
+        let filters = content.playlist_filters(&playlist.name);
+        let dynamic = content.is_dynamic_playlist(&playlist.name);
+        if dynamic {
+            let entries: Vec<&PhotoEntry> =
+                dynamic_playlist_entries(&index_guard, &content, filters).collect();
+            let total = entries.len();
+            let summary =
+                playlist_summary_json(playlist, store.active.as_deref(), filters, true, total);
+            return bounded_playlist_show(&summary, total, offset, limit, |index| {
+                let entry = entries[index];
+                Ok(dynamic_playlist_item_json(entry, content.get(&entry.hash)))
+            });
+        }
 
-        for (page_index, path) in playlist
-            .paths
-            .get(offset..)
-            .unwrap_or(&[])
-            .iter()
-            .take(limit)
-            .enumerate()
-        {
-            let index = offset.saturating_add(page_index);
+        let total = playlist.paths.len();
+        let summary =
+            playlist_summary_json(playlist, store.active.as_deref(), filters, false, total);
+        bounded_playlist_show(&summary, total, offset, limit, |index| {
+            let path = &playlist.paths[index];
             let identity = resolve_content(&index_guard, &content, path, &source_roots, false)?;
             let metadata = identity
                 .as_ref()
                 .and_then(|identity| content.get(&identity.hash));
-            items.push(playlist_item_json(
+            Ok(playlist_item_json(
                 playlist,
                 path,
                 identity.as_ref(),
                 metadata,
-            ));
-            let next = offset.saturating_add(items.len());
-            let candidate = playlist_show_result_json(
-                &summary,
-                total,
-                offset,
-                limit,
-                (next < total).then_some(next),
-                &items,
-            );
-            if playlist_show_fits_frame(&candidate)? {
-                continue;
-            }
-
-            let item = items.pop().expect("the candidate contains the new item");
-            let single_next = index.saturating_add(1);
-            let single = playlist_show_result_json(
-                &summary,
-                total,
-                index,
-                1,
-                (single_next < total).then_some(single_next),
-                std::slice::from_ref(&item),
-            );
-            if !playlist_show_fits_frame(&single)? {
-                anyhow::bail!(
-                    "playlist item at offset {index} exceeds the IPC response limit; reduce its tag metadata before retrying"
-                );
-            }
-            if items.is_empty() {
-                anyhow::bail!(
-                    "playlist item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce its tag metadata"
-                );
-            }
-            overflow_at = Some(index);
-            break;
-        }
-
-        let next = offset.saturating_add(items.len());
-        let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
-        let result = playlist_show_result_json(&summary, total, offset, limit, next_offset, &items);
-        if !playlist_show_fits_frame(&result)? {
-            anyhow::bail!(
-                "playlist summary exceeds the IPC response limit; shorten the playlist name"
-            );
-        }
-        Ok(result)
+                content.is_legacy_pending(&playlist.name, path),
+            ))
+        })
     }
 
-    /// Create an empty playlist and persist.
-    pub fn playlist_create(&self, name: &str) -> anyhow::Result<()> {
-        self.update_playlists(|store| store.create(name))
+    /// Create an empty static or dynamic playlist and persist both stores.
+    pub fn playlist_create(&self, name: &str, dynamic: bool) -> anyhow::Result<()> {
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
+        let mut current_playlists = self.playlist_store.lock();
+        let mut current_content = self.content_store.lock();
+        let mut next_playlists = current_playlists.clone();
+        let mut next_content = current_content.clone();
+        next_playlists.create(name)?;
+        next_content.set_dynamic_playlist(name, dynamic)?;
+        self.persist_playlist_and_content(&next_content, &next_playlists)?;
+        *current_playlists = next_playlists;
+        *current_content = next_content;
+        Ok(())
     }
 
     /// Add a path to a playlist and persist.
@@ -1685,14 +2370,18 @@ impl RuntimeHandle {
         include: BTreeMap<String, Vec<String>>,
         exclude: BTreeMap<String, Vec<String>>,
     ) -> anyhow::Result<()> {
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         let playlists = self.playlist_store.lock();
         if playlists.get(name).is_none() {
             anyhow::bail!("playlist '{}' not found", name);
         }
-        let result =
-            self.update_content(|content| content.set_playlist_filters(name, include, exclude));
-        drop(playlists);
-        result
+        let mut current = self.content_store.lock();
+        let mut next = current.clone();
+        next.set_playlist_filters(name, include, exclude)?;
+        persist_content(&next, self.content_path.as_ref())?;
+        *current = next;
+        Ok(())
     }
 
     /// Return whether one path already has tags or a rating without serializing
@@ -1703,6 +2392,12 @@ impl RuntimeHandle {
         let source_roots = self.source_roots.read();
         let store = self.playlist_store.lock();
         let path = resolve_playlist_entry_path(&store, name, path, &source_roots)?;
+        let content = self.content_store.lock();
+        if content.is_dynamic_playlist(name) {
+            anyhow::bail!(
+                "playlist '{name}' is dynamic; edit shared metadata with `aurora-ctl content` instead"
+            );
+        }
         let local = playlist_path_has_autotag_metadata(&store, name, &path);
         let is_member = store
             .get(name)
@@ -1710,7 +2405,6 @@ impl RuntimeHandle {
         if !is_member {
             return Ok(false);
         }
-        let content = self.content_store.lock();
         let global = resolve_content(&index, &content, &path, &source_roots, false)?
             .is_some_and(|identity| content.has_autotag_metadata(&identity.hash));
         Ok(local || global)
@@ -1751,6 +2445,8 @@ impl RuntimeHandle {
             );
         }
 
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         // Keep the existing index -> roots -> playlists -> content lock order.
         let index = self.index.read();
         let source_roots = self.source_roots.read();
@@ -1759,12 +2455,17 @@ impl RuntimeHandle {
             anyhow::bail!("playlist '{}' not found", name);
         }
         let stored = resolve_playlist_entry_path(&current_playlists, name, path, &source_roots)?;
+        let mut current_content = self.content_store.lock();
+        if current_content.is_dynamic_playlist(name) {
+            anyhow::bail!(
+                "playlist '{name}' is dynamic; edit shared metadata with `aurora-ctl content` instead"
+            );
+        }
         let is_member = current_playlists
             .get(name)
             .is_some_and(|playlist| playlist.paths.iter().any(|path| path == &stored));
         let local =
             is_member && playlist_path_has_autotag_metadata(&current_playlists, name, &stored);
-        let mut current_content = self.content_store.lock();
         let identity = match resolve_content(&index, &current_content, &stored, &source_roots, true)
         {
             Ok(identity) => identity,
@@ -1785,8 +2486,6 @@ impl RuntimeHandle {
         }
 
         let mut next_content = current_content.clone();
-        let content_changed = identity.is_some()
-            && (overwrite_existing || !groups.is_empty() || rating.is_some() || has_provenance);
         if let Some(identity) = &identity {
             if overwrite_existing {
                 next_content.clear_metadata(&identity.hash)?;
@@ -1846,17 +2545,10 @@ impl RuntimeHandle {
             next_playlists.set_frequency(name, &stored, frequency)?;
         }
 
-        self.persist_playlist_and_content(
-            &current_content,
-            &next_content,
-            &next_playlists,
-            content_changed,
-        )?;
+        self.persist_playlist_and_content(&next_content, &next_playlists)?;
 
         *current_playlists = next_playlists;
-        if content_changed {
-            *current_content = next_content;
-        }
+        *current_content = next_content;
         Ok(true)
     }
 
@@ -1887,23 +2579,142 @@ impl RuntimeHandle {
 
     /// Delete a playlist and persist.
     pub fn playlist_delete(&self, name: &str) -> anyhow::Result<()> {
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         let mut current_playlists = self.playlist_store.lock();
         let mut current_content = self.content_store.lock();
         let mut next_playlists = current_playlists.clone();
         let mut next_content = current_content.clone();
         next_playlists.delete(name)?;
-        let content_changed = next_content.playlist_filters(name).is_some();
         next_content.remove_playlist_filters(name);
-        self.persist_playlist_and_content(
-            &current_content,
-            &next_content,
-            &next_playlists,
-            content_changed,
-        )?;
+        next_content.remove_pending_playlist(name);
+        next_content.remove_dynamic_playlist(name);
+        self.persist_playlist_and_content(&next_content, &next_playlists)?;
         *current_playlists = next_playlists;
-        if content_changed {
-            *current_content = next_content;
+        *current_content = next_content;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared content metadata methods
+    // -----------------------------------------------------------------------
+
+    pub fn content_list(
+        &self,
+        offset: usize,
+        limit: usize,
+        include: BTreeMap<String, Vec<String>>,
+        exclude: BTreeMap<String, Vec<String>>,
+    ) -> anyhow::Result<serde_json::Value> {
+        if !(1..=MAX_CONTENT_LIST_LIMIT).contains(&limit) {
+            anyhow::bail!(
+                "content list limit must be between 1 and {MAX_CONTENT_LIST_LIMIT}, got {limit}"
+            );
         }
+        let filters = TagFilters::new(include, exclude)?;
+        let index = self.index.read();
+        let content = self.content_store.lock();
+        let total = content
+            .iter()
+            .filter(|(_, metadata)| filters.accepts(Some(&metadata.tag_groups)))
+            .count();
+        let requested: Vec<(&str, &ContentMetadata)> = content
+            .iter()
+            .filter(|(_, metadata)| filters.accepts(Some(&metadata.tag_groups)))
+            .skip(offset)
+            .take(limit)
+            .collect();
+        bounded_content_list(total, offset, limit, |index_in_store| {
+            let (hash, metadata) = requested[index_in_store - offset];
+            Ok(content_item_json(&index, hash, Some(metadata), None, false))
+        })
+    }
+
+    pub fn content_show(&self, target: &str) -> anyhow::Result<serde_json::Value> {
+        let target = self.resolve_current_content_target(target)?;
+        let index = self.index.read();
+        let source_roots = self.source_roots.read();
+        let content = self.content_store.lock();
+        let identity = resolve_content_target(&index, &content, &target, &source_roots)?;
+        Ok(content_item_json(
+            &index,
+            &identity.hash,
+            content.get(&identity.hash),
+            Some(&identity),
+            true,
+        ))
+    }
+
+    pub fn content_tag(&self, target: &str, kind: &str, tags: Vec<String>) -> anyhow::Result<()> {
+        self.update_content_target(target, |content, identity| {
+            content.set_tag_group(
+                &identity.hash,
+                &identity.aliases,
+                kind,
+                tags,
+                (identity.width, identity.height),
+            )
+        })
+    }
+
+    pub fn content_rate(&self, target: &str, rating: u8) -> anyhow::Result<()> {
+        self.update_content_target(target, |content, identity| {
+            content.set_rating(
+                &identity.hash,
+                &identity.aliases,
+                rating,
+                (identity.width, identity.height),
+            )
+        })
+    }
+
+    pub fn content_clear(&self, target: &str) -> anyhow::Result<()> {
+        self.update_content_target(target, |content, identity| {
+            content.clear_metadata(&identity.hash)
+        })
+    }
+
+    fn resolve_current_content_target(&self, target: &str) -> anyhow::Result<String> {
+        if !target.trim().eq_ignore_ascii_case("current") {
+            return Ok(target.to_string());
+        }
+        let paths: BTreeSet<PathBuf> = self
+            .state
+            .lock()
+            .current_path
+            .values()
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+            .collect();
+        match paths.len() {
+            0 => anyhow::bail!("no current wallpaper reported by the runtime"),
+            1 => Ok(paths
+                .into_iter()
+                .next()
+                .expect("one current wallpaper")
+                .display()
+                .to_string()),
+            _ => anyhow::bail!(
+                "monitors have different current wallpapers; pass an explicit path instead of 'current'"
+            ),
+        }
+    }
+
+    fn update_content_target(
+        &self,
+        target: &str,
+        mutation: impl FnOnce(&mut ContentStore, &ResolvedContent) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let target = self.resolve_current_content_target(target)?;
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
+        let index = self.index.read();
+        let source_roots = self.source_roots.read();
+        let mut current = self.content_store.lock();
+        let identity = resolve_content_target(&index, &current, &target, &source_roots)?;
+        let mut next = current.clone();
+        mutation(&mut next, &identity)?;
+        persist_content(&next, self.content_path.as_ref())?;
+        *current = next;
         Ok(())
     }
 
@@ -1920,10 +2731,15 @@ impl RuntimeHandle {
         let playlist = store
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("playlist '{}' not found", name))?;
+        let content = self.content_store.lock();
+        if content.is_dynamic_playlist(name) {
+            anyhow::bail!(
+                "playlist '{name}' is dynamic; edit shared metadata with `aurora-ctl content` instead"
+            );
+        }
         if !playlist.paths.iter().any(|path| path == &stored) {
             anyhow::bail!("path '{}' not in playlist '{}'", path, name);
         }
-        let content = self.content_store.lock();
         let identity = resolve_content(&index, &content, &stored, &source_roots, hash_unindexed)?
             .ok_or_else(|| {
             anyhow::anyhow!(
@@ -1939,6 +2755,8 @@ impl RuntimeHandle {
         &self,
         mutation: impl FnOnce(&mut ContentStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         let mut current = self.content_store.lock();
         let mut next = current.clone();
         let result = mutation(&mut next)?;
@@ -1949,44 +2767,23 @@ impl RuntimeHandle {
 
     fn persist_playlist_and_content(
         &self,
-        current_content: &ContentStore,
         next_content: &ContentStore,
         next_playlists: &PlaylistStore,
-        content_changed: bool,
     ) -> anyhow::Result<()> {
-        let content_existed = self.content_path.exists();
-        if content_changed {
-            persist_content(next_content, self.content_path.as_ref())?;
-        }
-        if let Err(error) = persist_playlists(next_playlists, self.playlists_path.as_ref()) {
-            if content_changed {
-                let rollback = if content_existed {
-                    persist_content(current_content, self.content_path.as_ref())
-                } else if self.content_path.exists() {
-                    std::fs::remove_file(self.content_path.as_ref()).with_context(|| {
-                        format!(
-                            "remove new content metadata {}",
-                            self.content_path.display()
-                        )
-                    })
-                } else {
-                    Ok(())
-                };
-                if let Err(rollback) = rollback {
-                    anyhow::bail!(
-                        "persist playlists failed: {error:#}; content rollback also failed: {rollback:#}"
-                    );
-                }
-            }
-            return Err(error);
-        }
-        Ok(())
+        commit_playlist_content_transaction(
+            next_playlists,
+            next_content,
+            self.playlists_path.as_ref(),
+            self.content_path.as_ref(),
+        )
     }
 
     fn update_playlists<T>(
         &self,
         mutation: impl FnOnce(&mut PlaylistStore) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         let mut current = self.playlist_store.lock();
         let mut next = current.clone();
         let result = mutation(&mut next)?;
@@ -1995,18 +2792,35 @@ impl RuntimeHandle {
         Ok(result)
     }
 
+    fn recover_pending_transaction(&self) -> anyhow::Result<()> {
+        recover_playlist_content_transaction(
+            self.playlists_path.as_ref(),
+            self.content_path.as_ref(),
+        )
+    }
+
     fn update_playlist_entry<T>(
         &self,
         name: &str,
         path: &str,
         mutation: impl FnOnce(&mut PlaylistStore, &str) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        // Match the runtime swap path's source_roots -> playlist_store order.
+        let _persistence = self.persistence.lock();
+        self.recover_pending_transaction()?;
         let source_roots = self.source_roots.read();
-        self.update_playlists(|store| {
-            let path = resolve_playlist_entry_path(store, name, path, &source_roots)?;
-            mutation(store, &path)
-        })
+        let mut current = self.playlist_store.lock();
+        let content = self.content_store.lock();
+        if content.is_dynamic_playlist(name) {
+            anyhow::bail!(
+                "playlist '{name}' is dynamic; edit shared metadata with `aurora-ctl content` instead"
+            );
+        }
+        let path = resolve_playlist_entry_path(&current, name, path, &source_roots)?;
+        let mut next = current.clone();
+        let result = mutation(&mut next, &path)?;
+        persist_playlists(&next, self.playlists_path.as_ref())?;
+        *current = next;
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -2074,11 +2888,7 @@ mod tests {
             &successful,
         );
         let failures = vec!["monitor DISPLAY2: access denied".to_string()];
-        let error = monitor_results(1, &failures).unwrap_err().to_string();
-        assert_eq!(
-            error,
-            "wallpaper updated on 1 monitor(s), failed on 1: monitor DISPLAY2: access denied"
-        );
+        monitor_results(1, &failures).unwrap();
 
         assert_eq!(
             state.current_path,
@@ -2117,6 +2927,180 @@ mod tests {
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn direct_apply_replaces_stale_per_monitor_state_with_all() {
+        let old_path = PathBuf::from("old.jpg");
+        let new_path = PathBuf::from("new.jpg");
+        let mut state = RuntimeState::new();
+        state
+            .current_path
+            .insert("DISPLAY1".to_string(), old_path.clone());
+        let metrics = Metrics::new();
+        metrics.set_current_photo("DISPLAY1", old_path);
+
+        commit_successful_monitors(
+            &mut state,
+            &metrics,
+            None,
+            &new_path,
+            &SwapReason::Interval,
+            5,
+            &[ALL_MONITORS_ID.to_string()],
+        );
+
+        let expected = HashMap::from([(ALL_MONITORS_ID.to_string(), new_path)]);
+        assert_eq!(state.current_path, expected);
+        assert_eq!(*metrics.current_photo.lock(), expected);
+    }
+
+    #[test]
+    fn automatic_swap_suppresses_targets_already_active_everywhere() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("wallpaper.jpg");
+        std::fs::write(&target, b"wallpaper").unwrap();
+        let alias = directory.path().join(".").join("wallpaper.jpg");
+        let current = HashMap::from([
+            ("DISPLAY1".to_string(), target.clone()),
+            ("DISPLAY2".to_string(), alias),
+        ]);
+        let attached = vec!["DISPLAY1".to_string(), "DISPLAY2".to_string()];
+
+        assert!(should_suppress_same_target(
+            &SwapReason::Interval,
+            &current,
+            &target,
+            &attached,
+        ));
+        assert!(should_suppress_same_target(
+            &SwapReason::AtTime,
+            &current,
+            &target,
+            &attached,
+        ));
+        assert!(!should_suppress_same_target(
+            &SwapReason::Manual,
+            &current,
+            &target,
+            &attached,
+        ));
+        assert!(!should_suppress_same_target(
+            &SwapReason::Previous,
+            &current,
+            &target,
+            &attached,
+        ));
+        assert!(!should_suppress_same_target(
+            &SwapReason::Interval,
+            &HashMap::new(),
+            &target,
+            &attached,
+        ));
+        assert!(!should_suppress_same_target(
+            &SwapReason::Interval,
+            &current,
+            &target,
+            &["DISPLAY1".to_string(), "DISPLAY3".to_string()],
+        ));
+    }
+
+    #[test]
+    fn startup_wallpapers_seed_the_anti_repeat_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current.jpg");
+        std::fs::write(&current, b"wallpaper").unwrap();
+        let alias = directory.path().join(".").join("current.jpg");
+        let mut state = RuntimeState::new();
+        state
+            .current_path
+            .insert("DISPLAY1".to_string(), current.clone());
+        state.current_path.insert("DISPLAY2".to_string(), alias);
+
+        seed_recent_current_paths(&mut state);
+
+        assert_eq!(
+            state.recent_paths,
+            VecDeque::from([current.canonicalize().unwrap()])
+        );
+    }
+
+    #[test]
+    fn startup_cadence_requires_wallpaper_coverage_for_every_monitor() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current.jpg");
+        std::fs::write(&current, b"wallpaper").unwrap();
+        let monitor = |id: &str| crate::apply::MonitorInfo {
+            id: id.to_string(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let (partial, complete) = runtime_state_from_snapshots(vec![
+            MonitorSnapshot {
+                monitor: monitor("DISPLAY1"),
+                current_path: Some(current.clone()),
+            },
+            MonitorSnapshot {
+                monitor: monitor("DISPLAY2"),
+                current_path: None,
+            },
+        ]);
+        assert!(!complete);
+        assert_eq!(partial.current_path.len(), 1);
+
+        let (covered, complete) = runtime_state_from_snapshots(vec![MonitorSnapshot {
+            monitor: monitor("DISPLAY1"),
+            current_path: Some(current),
+        }]);
+        assert!(complete);
+        assert_eq!(covered.current_path.len(), 1);
+    }
+
+    #[test]
+    fn detached_monitors_are_pruned_without_dropping_attached_failures() {
+        let mut state = RuntimeState::new();
+        state
+            .current_path
+            .insert("attached".to_string(), PathBuf::from("old.jpg"));
+        state
+            .current_path
+            .insert("detached".to_string(), PathBuf::from("gone.jpg"));
+        let metrics = Metrics::new();
+        metrics.set_current_photo("attached", PathBuf::from("old.jpg"));
+        metrics.set_current_photo("detached", PathBuf::from("gone.jpg"));
+
+        reconcile_attached_monitors(&mut state, &metrics, &["attached".to_string()]);
+
+        assert_eq!(
+            state.current_path,
+            HashMap::from([("attached".to_string(), PathBuf::from("old.jpg"))])
+        );
+        assert_eq!(*metrics.current_photo.lock(), state.current_path);
+    }
+
+    #[test]
+    fn all_monitor_fallback_expands_when_enumeration_recovers() {
+        let mut state = RuntimeState::new();
+        state
+            .current_path
+            .insert(ALL_MONITORS_ID.to_string(), PathBuf::from("current.jpg"));
+        let metrics = Metrics::new();
+        metrics.set_current_photo(ALL_MONITORS_ID, PathBuf::from("current.jpg"));
+
+        reconcile_attached_monitors(
+            &mut state,
+            &metrics,
+            &["DISPLAY1".to_string(), "DISPLAY2".to_string()],
+        );
+
+        let expected = HashMap::from([
+            ("DISPLAY1".to_string(), PathBuf::from("current.jpg")),
+            ("DISPLAY2".to_string(), PathBuf::from("current.jpg")),
+        ]);
+        assert_eq!(state.current_path, expected);
+        assert_eq!(*metrics.current_photo.lock(), expected);
     }
 
     #[test]
@@ -2287,13 +3271,499 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_playlist_selects_and_pages_current_index_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let playlists_path = directory.path().join("playlists.kdl");
+        let mut playlists = PlaylistStore::default();
+        playlists.create("focus").unwrap();
+        playlists.activate("focus").unwrap();
+        let playlists = Arc::new(Mutex::new(playlists));
+        let handle = make_playlist_handle(playlists_path, playlists);
+
+        let first_hash = "a".repeat(64);
+        let ignored_hash = "b".repeat(64);
+        let second_hash = "c".repeat(64);
+        let banned_hash = "d".repeat(64);
+        let first = PathBuf::from("first.bmp");
+        let ignored = PathBuf::from("ignored.bmp");
+        let second = PathBuf::from("second.bmp");
+        let banned = PathBuf::from("banned.bmp");
+        handle.index.write().photos = vec![
+            PhotoEntry {
+                path: first.clone(),
+                width: Some(10),
+                height: Some(11),
+                hash: first_hash.clone(),
+                banned: false,
+            },
+            PhotoEntry {
+                path: ignored,
+                width: Some(20),
+                height: Some(21),
+                hash: ignored_hash.clone(),
+                banned: false,
+            },
+            PhotoEntry {
+                path: second.clone(),
+                width: Some(30),
+                height: Some(31),
+                hash: second_hash.clone(),
+                banned: false,
+            },
+            PhotoEntry {
+                path: banned,
+                width: Some(40),
+                height: Some(41),
+                hash: banned_hash.clone(),
+                banned: true,
+            },
+        ];
+
+        {
+            let mut content = handle.content_store.lock();
+            content.set_dynamic_playlist("focus", true).unwrap();
+            content
+                .set_playlist_filters(
+                    "focus",
+                    BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                    BTreeMap::new(),
+                )
+                .unwrap();
+            for hash in [&first_hash, &second_hash, &banned_hash] {
+                content
+                    .set_tag_group(hash, &[], "theme", vec!["night".to_string()], (None, None))
+                    .unwrap();
+            }
+            content
+                .set_tag_group(
+                    &ignored_hash,
+                    &[],
+                    "theme",
+                    vec!["day".to_string()],
+                    (None, None),
+                )
+                .unwrap();
+            content
+                .set_rating(&first_hash, &[], 4, (None, None))
+                .unwrap();
+        }
+
+        let candidates = {
+            let index = handle.index.read();
+            let content = handle.content_store.lock();
+            dynamic_playlist_candidates(
+                &index,
+                &content,
+                content.playlist_filters("focus"),
+                &HashSet::new(),
+            )
+        };
+        assert_eq!(candidates, vec![(first.clone(), 5), (second.clone(), 1)]);
+        assert_eq!(
+            pick_weighted_path(
+                "focus",
+                false,
+                &candidates,
+                &mut HashMap::new(),
+                1,
+                &VecDeque::from([first])
+            ),
+            Some(second.clone())
+        );
+
+        let list = handle.playlist_list();
+        assert_eq!(list["playlists"][0]["dynamic"], true);
+        assert_eq!(list["playlists"][0]["path_count"], 2);
+
+        let page = handle.playlist_show("focus", 1, 1).unwrap();
+        assert_eq!(page["playlist"]["dynamic"], true);
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["items"][0]["path"], second.display().to_string());
+        assert_eq!(
+            page["items"][0]["content_id"],
+            format!("blake3:{second_hash}")
+        );
+        assert_eq!(page["items"][0]["width"], 30);
+        assert_eq!(page["items"][0]["frequency"], 1);
+
+        {
+            let mut content = handle.content_store.lock();
+            content
+                .set_playlist_filters(
+                    "focus",
+                    BTreeMap::from([("theme".to_string(), vec!["missing".to_string()])]),
+                    BTreeMap::new(),
+                )
+                .unwrap();
+        }
+        let no_match = {
+            let index = handle.index.read();
+            let content = handle.content_store.lock();
+            dynamic_playlist_candidates(
+                &index,
+                &content,
+                content.playlist_filters("focus"),
+                &HashSet::new(),
+            )
+        };
+        assert!(no_match.is_empty());
+        assert!(rotation_target(&handle.index.read(), true, None, 0, &VecDeque::new()).is_err());
+    }
+
+    #[test]
+    fn content_commands_resolve_paths_ids_and_current_and_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("shared.bmp");
+        write_test_bmp(&image, [4, 5, 6]);
+        let playlists_path = directory.path().join("playlists.kdl");
+        let handle = make_playlist_handle(
+            playlists_path,
+            Arc::new(Mutex::new(PlaylistStore::default())),
+        );
+        *handle.index.write() = PhotoIndex::scan(
+            &[directory.path().to_path_buf()],
+            &["bmp".to_string()],
+            false,
+        )
+        .unwrap();
+        let hash = handle.index.read().photos[0].hash.clone();
+        let content_id = format!("blake3:{hash}");
+
+        handle
+            .content_tag(&image.to_string_lossy(), "theme", vec!["night".to_string()])
+            .unwrap();
+        handle.content_rate(&content_id, 5).unwrap();
+
+        let shown = handle.content_show(&content_id).unwrap();
+        assert_eq!(shown["content_id"], content_id);
+        assert_eq!(shown["tag_groups"]["theme"][0], "night");
+        assert_eq!(shown["rating"], 5);
+        assert_eq!(shown["orphaned"], false);
+        assert_eq!(shown["indexed_paths"][0], image.display().to_string());
+
+        let matching = handle
+            .content_list(
+                0,
+                1,
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(matching["total"], 1);
+        let missing = handle
+            .content_list(
+                0,
+                1,
+                BTreeMap::from([("theme".to_string(), vec!["day".to_string()])]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(missing["total"], 0);
+
+        handle
+            .state
+            .lock()
+            .current_path
+            .insert("display".to_string(), image.clone());
+        handle.content_clear("current").unwrap();
+        let cleared = load_content(&directory.path().join("content.json")).unwrap();
+        let metadata = cleared.get(&hash).unwrap();
+        assert!(metadata.tag_groups.is_empty());
+        assert_eq!(metadata.rating, None);
+        assert!(!metadata.aliases.is_empty());
+    }
+
+    #[test]
+    fn content_show_reports_unindexed_file_identity_without_persisting() {
+        let _com = ComApartment::initialize().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("external.bmp");
+        write_test_bmp(&image, [7, 8, 9]);
+        let handle = make_playlist_handle(
+            directory.path().join("playlists.kdl"),
+            Arc::new(Mutex::new(PlaylistStore::default())),
+        );
+
+        let shown = handle.content_show(&image.to_string_lossy()).unwrap();
+
+        assert_eq!(shown["orphaned"], false);
+        assert_eq!(
+            shown["resolved_path"],
+            image.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(shown["aliases"][0], image.display().to_string());
+        assert_eq!(shown["width"], 16);
+        assert_eq!(shown["height"], 16);
+        assert!(shown["indexed_paths"].as_array().unwrap().is_empty());
+        assert!(!directory.path().join("content.json").exists());
+    }
+
+    #[test]
+    fn content_list_bounds_rendering_and_wire_size_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = make_playlist_handle(
+            directory.path().join("playlists.kdl"),
+            Arc::new(Mutex::new(PlaylistStore::default())),
+        );
+        for index in 0..5 {
+            let hash = format!("{index:064x}");
+            handle
+                .content_store
+                .lock()
+                .set_autotag(
+                    &hash,
+                    &[format!(r"\\offline.invalid\wallpapers\{index}.jpg")],
+                    AutoTagProvenance {
+                        model: "model".to_string(),
+                        raw: serde_json::json!({"blob": "x".repeat(240 * 1024)}),
+                        ..Default::default()
+                    },
+                    (None, None),
+                )
+                .unwrap();
+        }
+
+        let page = handle
+            .content_list(0, 5, BTreeMap::new(), BTreeMap::new())
+            .unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(page["total"], 5);
+        assert!(!items.is_empty());
+        assert!(items.len() < 5);
+        assert_eq!(page["next_offset"], items.len());
+        assert!(playlist_show_wire_len(&page).unwrap() <= MAX_FRAME_SIZE);
+        assert!(items
+            .iter()
+            .all(|item| item["orphaned"].is_null() && item["available_aliases"].is_array()));
+    }
+
+    #[test]
+    fn dynamic_playlist_crud_is_transactional_and_rejects_path_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let playlists_path = directory.path().join("playlists.kdl");
+        let handle = make_playlist_handle(
+            playlists_path.clone(),
+            Arc::new(Mutex::new(PlaylistStore::default())),
+        );
+
+        handle.playlist_create("smart", true).unwrap();
+        assert!(load_playlists(&playlists_path)
+            .unwrap()
+            .get("smart")
+            .is_some());
+        assert!(load_content(&directory.path().join("content.json"))
+            .unwrap()
+            .is_dynamic_playlist("smart"));
+        assert!(handle
+            .playlist_autotag_status("smart", "photo.bmp")
+            .unwrap_err()
+            .to_string()
+            .contains("dynamic"));
+
+        let error = handle
+            .playlist_add("smart", "photo.bmp")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dynamic"));
+        assert!(error.contains("aurora-ctl content"));
+        assert!(handle
+            .playlist_autotag_upsert(
+                "smart",
+                "photo.bmp",
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("dynamic"));
+
+        handle
+            .playlist_filter(
+                "smart",
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        handle.playlist_delete("smart").unwrap();
+        let content = load_content(&directory.path().join("content.json")).unwrap();
+        assert!(!content.is_dynamic_playlist("smart"));
+        assert!(content.playlist_filters("smart").is_none());
+        assert!(load_playlists(&playlists_path)
+            .unwrap()
+            .get("smart")
+            .is_none());
+        assert!(!directory
+            .path()
+            .join(PLAYLIST_CONTENT_TRANSACTION_FILENAME)
+            .exists());
+
+        handle
+            .content_store
+            .lock()
+            .set_dynamic_playlist("stale", true)
+            .unwrap();
+        assert!(handle
+            .playlist_autotag_upsert(
+                "stale",
+                "photo.bmp",
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("dynamic"));
+        assert!(handle.playlist_store.lock().get("stale").is_none());
+    }
+
+    #[test]
     fn playlist_persist_failure_keeps_memory_unchanged() {
         let blocker = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Mutex::new(PlaylistStore::default()));
         let handle = make_playlist_handle(blocker.path().join("playlists.kdl"), Arc::clone(&store));
 
-        assert!(handle.playlist_create("not-persisted").is_err());
+        assert!(handle.playlist_create("not-persisted", false).is_err());
         assert!(store.lock().get("not-persisted").is_none());
+    }
+
+    #[test]
+    fn cross_store_validation_rejects_stale_or_pathful_dynamic_state() {
+        let mut playlists = PlaylistStore::default();
+        playlists.create("smart").unwrap();
+        playlists.add_path("smart", "photo.jpg").unwrap();
+        let mut content = ContentStore::default();
+        content.set_dynamic_playlist("smart", true).unwrap();
+        assert!(validate_playlist_content_consistency(&playlists, &content)
+            .unwrap_err()
+            .to_string()
+            .contains("must not contain path membership"));
+
+        let playlists = PlaylistStore::default();
+        let mut content = ContentStore::default();
+        content.set_dynamic_playlist("missing", true).unwrap();
+        assert!(validate_playlist_content_consistency(&playlists, &content)
+            .unwrap_err()
+            .to_string()
+            .contains("does not define it"));
+
+        let mut content = ContentStore::default();
+        content
+            .set_playlist_filters(
+                "missing",
+                BTreeMap::from([("theme".to_string(), vec!["night".to_string()])]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(validate_playlist_content_consistency(&playlists, &content)
+            .unwrap_err()
+            .to_string()
+            .contains("filters for missing playlist"));
+    }
+
+    #[test]
+    fn committed_playlist_content_transaction_recovers_every_install_point() {
+        for installed_targets in 0..=2 {
+            let directory = tempfile::tempdir().unwrap();
+            let playlists_path = directory.path().join("playlists.kdl");
+            let content_path = directory.path().join("content.json");
+
+            let mut old_playlists = PlaylistStore::default();
+            old_playlists.create("old").unwrap();
+            persist_playlists(&old_playlists, &playlists_path).unwrap();
+            persist_content(&ContentStore::default(), &content_path).unwrap();
+
+            let mut next_playlists = PlaylistStore::default();
+            next_playlists.create("next").unwrap();
+            let hash = "a".repeat(64);
+            let mut next_content = ContentStore::default();
+            next_content
+                .set_tag_group(
+                    &hash,
+                    &["next.jpg".to_string()],
+                    "theme",
+                    vec!["night".to_string()],
+                    (None, None),
+                )
+                .unwrap();
+            let transaction = PlaylistContentTransaction {
+                version: PLAYLIST_CONTENT_TRANSACTION_VERSION,
+                content_json: String::from_utf8(serialize_content(&next_content).unwrap()).unwrap(),
+                playlists_kdl: serialize_playlists_checked(&next_playlists).unwrap(),
+            };
+            stage_playlist_content_transaction(&transaction, &playlists_path, &content_path)
+                .unwrap();
+            let transaction_path = playlist_content_transaction_path(&content_path);
+            let transaction_tmp = transaction_path.with_extension("json.tmp");
+            write_synced(&transaction_tmp, &serde_json::to_vec(&transaction).unwrap()).unwrap();
+            crate::playlist::replace_file(&transaction_tmp, &transaction_path).unwrap();
+
+            if installed_targets >= 1 {
+                crate::playlist::replace_file(
+                    &content_path.with_extension("json.tmp"),
+                    &content_path,
+                )
+                .unwrap();
+            }
+            if installed_targets >= 2 {
+                crate::playlist::replace_file(
+                    &playlists_path.with_extension("kdl.tmp"),
+                    &playlists_path,
+                )
+                .unwrap();
+            }
+
+            recover_playlist_content_transaction(&playlists_path, &content_path).unwrap();
+            assert!(load_playlists(&playlists_path)
+                .unwrap()
+                .get("next")
+                .is_some());
+            assert_eq!(
+                load_content(&content_path)
+                    .unwrap()
+                    .get(&hash)
+                    .unwrap()
+                    .tag_groups["theme"],
+                ["night"]
+            );
+            assert!(!transaction_path.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_playlist_content_transaction_fails_before_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let playlists_path = directory.path().join("playlists.kdl");
+        let content_path = directory.path().join("content.json");
+        let mut old_playlists = PlaylistStore::default();
+        old_playlists.create("old").unwrap();
+        persist_playlists(&old_playlists, &playlists_path).unwrap();
+        persist_content(&ContentStore::default(), &content_path).unwrap();
+        let old_playlists_bytes = std::fs::read(&playlists_path).unwrap();
+        let old_content_bytes = std::fs::read(&content_path).unwrap();
+
+        let transaction_path = playlist_content_transaction_path(&content_path);
+        write_synced(
+            &transaction_path,
+            br#"{"version":99,"content_json":"{}","playlists_kdl":""}"#,
+        )
+        .unwrap();
+
+        assert!(
+            recover_playlist_content_transaction(&playlists_path, &content_path)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported playlist/content transaction version")
+        );
+        assert_eq!(std::fs::read(&playlists_path).unwrap(), old_playlists_bytes);
+        assert_eq!(std::fs::read(&content_path).unwrap(), old_content_bytes);
+        assert!(transaction_path.exists());
     }
 
     #[test]
@@ -2511,6 +3981,173 @@ mod tests {
         )
         .unwrap());
         assert_eq!(content.get(&id).unwrap().tag_groups["theme"], ["day"]);
+    }
+
+    #[test]
+    fn schema_two_reconciliation_imports_only_previously_skipped_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let known = directory.path().join("known.bmp");
+        let skipped = directory.path().join("skipped.bmp");
+        write_test_bmp(&known, [255, 0, 0]);
+        write_test_bmp(&skipped, [0, 0, 255]);
+        let index = PhotoIndex::scan(
+            &[directory.path().to_path_buf()],
+            &["bmp".to_string()],
+            false,
+        )
+        .unwrap();
+        let known_id = index
+            .photos
+            .iter()
+            .find(|entry| entry.path == known)
+            .unwrap()
+            .hash
+            .clone();
+        let skipped_id = index
+            .photos
+            .iter()
+            .find(|entry| entry.path == skipped)
+            .unwrap()
+            .hash
+            .clone();
+        let known = known.to_string_lossy().into_owned();
+        let skipped = skipped.to_string_lossy().into_owned();
+        let mut playlists = PlaylistStore::default();
+        playlists.create("focus").unwrap();
+        playlists.add_path("focus", &known).unwrap();
+        playlists.add_path("focus", &skipped).unwrap();
+        playlists
+            .set_tag_group("focus", &known, "theme", vec!["night".to_string()])
+            .unwrap();
+        playlists
+            .set_tag_group("focus", &skipped, "artist", vec!["studio".to_string()])
+            .unwrap();
+
+        let metadata_path = directory.path().join("content.json");
+        let entries = BTreeMap::from([(
+            known_id.clone(),
+            serde_json::json!({
+                "aliases": [known],
+                "tag_groups": {"theme": ["day"]}
+            }),
+        )]);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 2,
+                "legacy_migrated": true,
+                "entries": entries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut content = load_content(&metadata_path).unwrap();
+        assert!(content.needs_legacy_reconciliation());
+
+        assert!(migrate_legacy_content(&mut content, &playlists, &index, &[]).unwrap());
+        assert!(!content.needs_legacy_reconciliation());
+        assert_eq!(content.get(&known_id).unwrap().tag_groups["theme"], ["day"]);
+        assert_eq!(
+            content.get(&skipped_id).unwrap().tag_groups["artist"],
+            ["studio"]
+        );
+        assert!(!migrate_legacy_content(&mut content, &playlists, &index, &[]).unwrap());
+
+        persist_content(&content, &metadata_path).unwrap();
+        assert!(!load_content(&metadata_path)
+            .unwrap()
+            .needs_legacy_reconciliation());
+    }
+
+    #[test]
+    fn deferred_legacy_migration_retries_without_hiding_local_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("offline.bmp");
+        let unreadable = directory.path().join("unreadable.bmp");
+        std::fs::write(&unreadable, b"not an image").unwrap();
+        let stored = image.to_string_lossy().into_owned();
+        let unreadable_stored = unreadable.to_string_lossy().into_owned();
+        let mut playlists = PlaylistStore::default();
+        playlists.create("focus").unwrap();
+        playlists.add_path("focus", &stored).unwrap();
+        playlists.add_path("focus", &unreadable_stored).unwrap();
+        playlists
+            .set_tag_group("focus", &stored, "theme", vec!["night".to_string()])
+            .unwrap();
+        playlists
+            .set_tag_group("focus", &stored, "artist", vec!["studio".to_string()])
+            .unwrap();
+        playlists
+            .set_tag_group(
+                "focus",
+                &unreadable_stored,
+                "content",
+                vec!["city".to_string()],
+            )
+            .unwrap();
+        let mut content = ContentStore::default();
+
+        assert!(
+            migrate_legacy_content(&mut content, &playlists, &PhotoIndex::default(), &[]).unwrap()
+        );
+        assert!(!content.needs_legacy_migration());
+        assert!(content.is_legacy_pending("focus", &stored));
+        assert!(content.is_legacy_pending("focus", &unreadable_stored));
+
+        write_test_bmp(&image, [255, 0, 0]);
+        write_test_bmp(&unreadable, [0, 0, 255]);
+        let index = PhotoIndex::scan(
+            &[directory.path().to_path_buf()],
+            &["bmp".to_string()],
+            false,
+        )
+        .unwrap();
+        let id = index.photos[0].hash.clone();
+        content
+            .set_tag_group(
+                &id,
+                std::slice::from_ref(&stored),
+                "color",
+                vec!["blue".to_string()],
+                (Some(16), Some(16)),
+            )
+            .unwrap();
+        content
+            .set_playlist_filters(
+                "focus",
+                BTreeMap::from([("artist".to_string(), vec!["studio".to_string()])]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+
+        let playlist = playlists.get("focus").unwrap();
+        let metadata = content.get(&id).unwrap();
+        let groups = effective_tag_groups(playlist, &stored, Some(metadata), true);
+        assert_eq!(groups["theme"], ["night"]);
+        assert_eq!(groups["artist"], ["studio"]);
+        assert_eq!(groups["color"], ["blue"]);
+        assert!(content.playlist_accepts("focus", Some(&groups)));
+        let item = playlist_item_json(playlist, &stored, None, Some(metadata), true);
+        assert_eq!(item["tag_groups"]["artist"][0], "studio");
+
+        assert!(migrate_legacy_content(&mut content, &playlists, &index, &[]).unwrap());
+        assert!(!content.is_legacy_pending("focus", &stored));
+        assert!(!content.is_legacy_pending("focus", &unreadable_stored));
+        let metadata = content.get(&id).unwrap();
+        assert_eq!(metadata.tag_groups["theme"], ["night"]);
+        assert_eq!(metadata.tag_groups["artist"], ["studio"]);
+        assert_eq!(metadata.tag_groups["color"], ["blue"]);
+        let unreadable_id = index
+            .photos
+            .iter()
+            .find(|entry| entry.path == unreadable)
+            .unwrap()
+            .hash
+            .clone();
+        assert_eq!(
+            content.get(&unreadable_id).unwrap().tag_groups["content"],
+            ["city"]
+        );
     }
 
     #[test]
@@ -3114,6 +4751,7 @@ mod tests {
                     model: "model".to_string(),
                     confidence: Some(0.8),
                     raw: serde_json::json!({"theme": ["night"]}),
+                    ..Default::default()
                 }),
                 true,
                 false,
@@ -3122,6 +4760,7 @@ mod tests {
         assert!(store.lock().get("auto").is_none());
         assert!(content.lock().get(&hash).is_none());
         assert!(!content_path(&config_path).exists());
+        assert!(!playlist_content_transaction_path(handle.content_path.as_ref()).exists());
     }
 
     #[test]
@@ -3152,6 +4791,7 @@ mod tests {
                     model: "vision-model".to_string(),
                     confidence: Some(0.9),
                     raw: serde_json::json!({"identity": {"theme": ["night"]}}),
+                    ..Default::default()
                 }),
                 true,
                 false,
@@ -3769,7 +5409,7 @@ mod tests {
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW.0);
 
-        let error = wait_for_apply_child(
+        let error = wait_for_helper_child(
             command.spawn().expect("start timeout test helper"),
             Duration::from_millis(50),
         )

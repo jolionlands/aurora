@@ -2,15 +2,16 @@
 
 # Aurora
 
-**Native, per-monitor wallpaper rotation for Windows.**
+**Native, multi-monitor wallpaper rotation for Windows.**
 
 Fast indexing. Smooth transitions. Content-aware playlists. Local control.
 
 [![CI](https://github.com/jolionlands/aurora/actions/workflows/ci.yml/badge.svg)](https://github.com/jolionlands/aurora/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Quick start](#quick-start) | [Transitions](#enable-transitions) | [Playlists](#playlists-and-metadata) | [Autotagging](#ai-assisted-tagging) | [Configuration](#configuration-and-storage)
+[Quick start](#quick-start) | [Transitions](#enable-transitions) | [Playlists](#playlists-and-metadata) | [Autotagging](#ai-assisted-tagging) | [Scheduling](#scheduling-behavior) | [Configuration](#configuration-and-storage)
 
 </div>
 
@@ -23,10 +24,10 @@ rather than fragile file paths.
 
 | | |
 | --- | --- |
-| **Per-monitor** | Independent wallpaper selection through `IDesktopWallpaper` |
+| **Multi-monitor** | Native `IDesktopWallpaper` commits with per-display transitions and failure isolation |
 | **Smooth** | Crossfade, slide, wipe, dissolve, and zoom using Direct2D with a CPU fallback |
 | **Fast** | Persistent validated photo index and a bounded decoded-image LRU cache |
-| **Organized** | Playlists, ratings, frequency weights, grouped tags, and include/exclude filters |
+| **Organized** | Static and dynamic playlists, ratings, frequency weights, grouped tags, and filters |
 | **Content-aware** | Exact BLAKE3 identity reconnects indexed renames and shares metadata across duplicates |
 | **Automatable** | Named-pipe IPC, real-time events, optional Prometheus metrics, and a companion CLI |
 | **Flexible** | Interval or fixed-time schedules, fullscreen/idle pauses, and optional wiri workspace triggers |
@@ -83,6 +84,14 @@ Available styles are `crossfade`, `slide-left`, `slide-right`, `wipe-left`,
 `wipe-right`, `dissolve`, `zoom-in`, `zoom-out`, and `none`. The renderer can be
 `gpu`, `cpu`, or `auto`.
 
+Aurora enumerates attached displays and commits each one through a short-lived
+hidden helper with a 10-second timeout. A hung or failed apply is isolated to
+that display; successful display updates are kept and reported. Disabling
+transitions skips only the animation—the normal commit remains per-display so
+one wallpaper change does not force an all-monitor desktop refresh. Aurora
+falls back to one native all-monitor commit only if Windows cannot enumerate
+the displays.
+
 ## Control
 
 | Command | Purpose |
@@ -97,6 +106,7 @@ Available styles are `crossfade`, `slide-left`, `slide-right`, `wipe-left`,
 | `aurora-ctl events` | Stream newline-delimited JSON events |
 | `aurora-ctl stats` | Print the metrics snapshot |
 | `aurora-ctl current-wallpaper` | Show the last successful wallpaper per monitor |
+| `aurora-ctl content ...` | Browse or edit shared metadata by content ID, alias, or path |
 
 Add `--json` before a command for machine-readable output.
 
@@ -123,6 +133,26 @@ aurora-ctl playlist deactivate
 Selection weight is `frequency * (rating + 1)`. Both factors default to `1`
 when unset, and frequency remains local to each playlist.
 
+### Dynamic playlists
+
+A dynamic playlist stores a query instead of a list of paths. Its live
+membership is the current non-banned photo index filtered by shared content
+tags:
+
+```powershell
+aurora-ctl playlist create night-library --dynamic
+aurora-ctl playlist filter night-library --include theme=night --exclude safety=nsfw
+aurora-ctl playlist shuffle night-library true
+aurora-ctl playlist activate night-library
+aurora-ctl playlist show night-library --offset 0 --limit 100
+```
+
+`playlist list` reports the current match count, and `playlist show` pages the
+current matches in index order. Dynamic selection uses `rating + 1` as its
+weight because it has no path-local frequency. Path membership, frequency, and
+path-local metadata commands are intentionally rejected for dynamic playlists;
+use the global `content` commands to change what their filters see.
+
 ### Tags and filters
 
 Built-in tag groups are `general`, `theme`, `content`, `color`, `source`,
@@ -145,6 +175,21 @@ aurora-ctl playlist filter favorites
 
 An active filtered playlist never silently falls back to the full library when
 nothing matches.
+
+### Shared content metadata
+
+The `content` commands edit metadata independently of playlist membership.
+Targets may be a BLAKE3 content ID, a known path alias, an image path, or
+`current` when every attached display reports the same wallpaper:
+
+```powershell
+aurora-ctl content list --include theme=night --offset 0 --limit 100
+aurora-ctl content show current
+aurora-ctl content show "D:\Wallpapers\lake.jpg"
+aurora-ctl content tag "D:\Wallpapers\lake.jpg" --kind theme night neon
+aurora-ctl content rate "D:\Wallpapers\lake.jpg" 5
+aurora-ctl content clear "D:\Wallpapers\lake.jpg"
+```
 
 ### Content identity
 
@@ -202,6 +247,20 @@ resume. Images that already carry either are skipped unless `--force` is used.
 The append-only JSONL resume file records tagged, skipped, and failed paths;
 failed items remain retryable.
 
+## Scheduling behavior
+
+In `interval` mode, cadence is measured from the last successful wallpaper
+change, including a manual change. If Aurora starts with an existing wallpaper,
+it starts that cadence without immediately replacing the image. Failed applies
+remain eligible to retry, while duplicate automatic requests are coalesced.
+
+In `at` mode, each configured `at "HH:MM"` slot is recorded only after a
+successful apply, preventing duplicate successful fires while allowing a
+failure to retry during that minute. Fullscreen and idle policies suppress
+automatic scheduling while active. `aurora-ctl pause` also blocks automatic and
+workspace-triggered changes, while manual `next`, `prev`, and `set` commands
+remain available.
+
 ## Configuration and storage
 
 Aurora keeps its state together under `%APPDATA%\aurora`:
@@ -210,10 +269,17 @@ Aurora keeps its state together under `%APPDATA%\aurora`:
 | --- | --- |
 | `config.kdl` | Sources, scheduling, transitions, monitors, metrics, and cache limits |
 | `playlists.kdl` | Playlist membership, order, shuffle, frequency, and compatibility metadata copies |
-| `content.json` | Versioned tags, ratings, dimensions, filters, aliases, and autotag provenance |
+| `content.json` | Versioned tags, ratings, dimensions, aliases, dynamic playlist markers and filters, and autotag provenance |
 | `index-cache.json` | Validated photo index used for fast restart and reload |
 | `bans.txt` | Exact content hashes that Aurora must not display |
 | `autotag-batch.jsonl` | Default append-only batch audit trail |
+| `playlist-content.txn.json` | Transient recovery marker for coordinated playlist/content updates |
+
+Single-file stores are written through synchronized temporary files before
+replacement. Updates spanning both `playlists.kdl` and `content.json` first
+commit a recovery marker; startup, reload, or the next mutation finishes an
+interrupted committed install. The marker is normally removed immediately
+after both files are installed.
 
 `aurora-ctl reload` refreshes configured sources, playlists, content metadata,
 and bans together. Schedule, transition, monitor, cache-budget, metrics, and
@@ -230,6 +296,10 @@ cargo test --all-targets
 ```
 
 Aurora is Windows-only and under active development.
+
+## License
+
+Aurora is available under the [MIT License](LICENSE).
 
 ## Companion projects
 

@@ -89,6 +89,12 @@ enum Command {
         action: PlaylistCommand,
     },
 
+    /// Manage shared image metadata.
+    Content {
+        #[command(subcommand)]
+        action: ContentCommand,
+    },
+
     /// Ask a vision model to tag one wallpaper.
     Autotag {
         /// Absolute/relative image path, or "current".
@@ -199,7 +205,7 @@ enum PlaylistCommand {
         #[arg(
             long,
             default_value_t = aurora::ipc::messages::DEFAULT_PLAYLIST_SHOW_LIMIT,
-            value_parser = parse_playlist_show_limit
+            value_parser = parse_page_limit
         )]
         limit: usize,
     },
@@ -208,6 +214,9 @@ enum PlaylistCommand {
     Create {
         /// Name of the new playlist.
         name: String,
+        /// Select content dynamically from shared metadata filters.
+        #[arg(long)]
+        dynamic: bool,
     },
 
     /// Add a path to a playlist.
@@ -303,6 +312,60 @@ enum PlaylistCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ContentCommand {
+    /// List one page of shared image metadata.
+    List {
+        /// Required tag rule in KIND=TAG form.
+        #[arg(long, value_name = "KIND=TAG")]
+        include: Vec<String>,
+        /// Rejected tag rule in KIND=TAG form.
+        #[arg(long, value_name = "KIND=TAG")]
+        exclude: Vec<String>,
+        /// Zero-based content offset.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Number of content items to return (1-256).
+        #[arg(
+            long,
+            default_value_t = aurora::ipc::messages::DEFAULT_CONTENT_LIST_LIMIT,
+            value_parser = parse_page_limit
+        )]
+        limit: usize,
+    },
+
+    /// Show shared metadata for one content ID, alias, or path.
+    Show {
+        /// Content ID, alias, or path.
+        target: String,
+    },
+
+    /// Replace one shared tag group for a content item.
+    Tag {
+        /// Content ID, alias, or path.
+        target: String,
+        /// Built-in tag group, or any custom group name.
+        #[arg(long, default_value = "general")]
+        kind: String,
+        /// Tags to assign; omit all tags to clear this group.
+        tags: Vec<String>,
+    },
+
+    /// Rate a content item from 0 to 5.
+    Rate {
+        /// Content ID, alias, or path.
+        target: String,
+        /// Star rating between 0 and 5.
+        rating: u8,
+    },
+
+    /// Clear all shared metadata for a content item.
+    Clear {
+        /// Content ID, alias, or path.
+        target: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Duration parsing helper: "1h" → 3600, "30m" → 1800, "3600s" / "3600" → 3600
 // ---------------------------------------------------------------------------
@@ -343,14 +406,14 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
         .map_err(|_| anyhow::anyhow!("cannot parse duration {:?}", s))
 }
 
-fn parse_playlist_show_limit(value: &str) -> std::result::Result<usize, String> {
+fn parse_page_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
         .parse::<usize>()
-        .map_err(|_| format!("invalid playlist page limit: {value}"))?;
-    if !(1..=aurora::ipc::messages::MAX_PLAYLIST_SHOW_LIMIT).contains(&limit) {
+        .map_err(|_| format!("invalid page limit: {value}"))?;
+    if !(1..=aurora::ipc::messages::MAX_CONTENT_LIST_LIMIT).contains(&limit) {
         return Err(format!(
-            "playlist page limit must be between 1 and {}",
-            aurora::ipc::messages::MAX_PLAYLIST_SHOW_LIMIT
+            "page limit must be between 1 and {}",
+            aurora::ipc::messages::MAX_CONTENT_LIST_LIMIT
         ));
     }
     Ok(limit)
@@ -521,6 +584,10 @@ async fn main() -> Result<()> {
             handle_playlist(action, cli.json).await?;
         }
 
+        Command::Content { action } => {
+            handle_content(action, cli.json).await?;
+        }
+
         Command::Autotag {
             path,
             base_url,
@@ -532,6 +599,11 @@ async fn main() -> Result<()> {
             apply_playlist,
         } => {
             let resolved_path = resolve_playlist_path(path).await?;
+            if let Some(playlist) = apply_playlist.as_deref() {
+                // Preflight daemon availability and reject dynamic playlists
+                // before doing paid model work. This command overwrites by design.
+                let _ = playlist_path_has_metadata(playlist, &resolved_path).await?;
+            }
             let result = autotag_image(AutoTagOptions {
                 path: resolved_path.clone(),
                 base_url,
@@ -540,6 +612,7 @@ async fn main() -> Result<()> {
                 api_key_env,
                 api_key_file,
                 timeout_secs,
+                run_id: None,
             })
             .await?;
 
@@ -652,14 +725,18 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                             let shuffle =
                                 pl.get("shuffle").and_then(|s| s.as_bool()).unwrap_or(false);
                             let count = pl.get("path_count").and_then(Value::as_u64).unwrap_or(0);
-                            let marker = if active == Some(name) {
+                            let active_marker = if active == Some(name) {
                                 " [active]"
                             } else {
                                 ""
                             };
+                            let dynamic =
+                                pl.get("dynamic").and_then(Value::as_bool).unwrap_or(false);
+                            let dynamic_marker = if dynamic { " [dynamic]" } else { "" };
+                            let unit = if dynamic { "match(es)" } else { "file(s)" };
                             println!(
-                                "{}{} - {} file(s), shuffle: {}",
-                                name, marker, count, shuffle
+                                "{}{}{} - {} {}, shuffle: {}",
+                                name, active_marker, dynamic_marker, count, unit, shuffle
                             );
                         }
                     }
@@ -695,11 +772,18 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                     .get("playlist")
                     .ok_or_else(|| anyhow::anyhow!("daemon returned invalid playlist summary"))?;
                 let playlist_name = playlist.get("name").and_then(Value::as_str).unwrap_or("?");
-                let marker = if playlist.get("active").and_then(Value::as_bool) == Some(true) {
+                let active_marker = if playlist.get("active").and_then(Value::as_bool) == Some(true)
+                {
                     " [active]"
                 } else {
                     ""
                 };
+                let dynamic = playlist
+                    .get("dynamic")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let dynamic_marker = if dynamic { " [dynamic]" } else { "" };
+                let unit = if dynamic { "match(es)" } else { "file(s)" };
                 let shuffle = playlist
                     .get("shuffle")
                     .and_then(Value::as_bool)
@@ -713,8 +797,8 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
                     .unwrap_or(&[]);
 
                 println!(
-                    "{}{} - {} file(s), shuffle: {}",
-                    playlist_name, marker, total, shuffle
+                    "{}{}{} - {} {}, shuffle: {}",
+                    playlist_name, active_marker, dynamic_marker, total, unit, shuffle
                 );
                 for (label, field) in [("include", "include_tags"), ("exclude", "exclude_tags")] {
                     if let Some(groups) = playlist.get(field).and_then(Value::as_object) {
@@ -786,8 +870,8 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
             }
         }
 
-        PlaylistCommand::Create { name } => {
-            let resp = send_message(&IpcMessage::PlaylistCreate { name }).await?;
+        PlaylistCommand::Create { name, dynamic } => {
+            let resp = send_message(&IpcMessage::PlaylistCreate { name, dynamic }).await?;
             print_response(&resp, as_json)?;
         }
 
@@ -896,6 +980,160 @@ async fn handle_playlist(action: PlaylistCommand, as_json: bool) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+async fn handle_content(action: ContentCommand, as_json: bool) -> anyhow::Result<()> {
+    use aurora::ipc::{send_message, IpcMessage};
+
+    let message = match action {
+        ContentCommand::List {
+            include,
+            exclude,
+            offset,
+            limit,
+        } => IpcMessage::ContentList {
+            offset,
+            limit,
+            include: parse_tag_filter_rules(include)?,
+            exclude: parse_tag_filter_rules(exclude)?,
+        },
+        ContentCommand::Show { target } => IpcMessage::ContentShow {
+            target: resolve_content_target(target).await?,
+        },
+        ContentCommand::Tag { target, kind, tags } => IpcMessage::ContentTag {
+            target: resolve_content_target(target).await?,
+            kind,
+            tags,
+        },
+        ContentCommand::Rate { target, rating } => {
+            if rating > 5 {
+                bail!("content rating must be between 0 and 5, got {}", rating);
+            }
+            IpcMessage::ContentRate {
+                target: resolve_content_target(target).await?,
+                rating,
+            }
+        }
+        ContentCommand::Clear { target } => IpcMessage::ContentClear {
+            target: resolve_content_target(target).await?,
+        },
+    };
+    let response = send_message(&message).await?;
+    if as_json {
+        return print_response(&response, true);
+    }
+    match &message {
+        IpcMessage::ContentList { .. } => {
+            let response = ensure_success(&response)?;
+            let result = response
+                .get("result")
+                .ok_or_else(|| anyhow::anyhow!("daemon returned invalid content page"))?;
+            let total = result.get("total").and_then(Value::as_u64).unwrap_or(0);
+            let offset = result.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let items = result
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            println!("{} content item(s); offset {}", total, offset);
+            for item in items {
+                print_content_item(item, false);
+            }
+            if let Some(next_offset) = result.get("next_offset").and_then(Value::as_u64) {
+                println!("next offset: {}", next_offset);
+            }
+            Ok(())
+        }
+        IpcMessage::ContentShow { .. } => {
+            let response = ensure_success(&response)?;
+            let item = response
+                .get("result")
+                .ok_or_else(|| anyhow::anyhow!("daemon returned invalid content item"))?;
+            print_content_item(item, true);
+            Ok(())
+        }
+        _ => print_response(&response, false),
+    }
+}
+
+async fn resolve_content_target(target: String) -> anyhow::Result<String> {
+    let is_content_id = target
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("blake3"));
+    if is_content_id || target.eq_ignore_ascii_case("current") {
+        Ok(target)
+    } else {
+        absolute_playlist_path(&target)
+    }
+}
+
+fn print_content_item(item: &Value, detailed: bool) {
+    let content_id = item
+        .get("content_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let orphaned = if item.get("orphaned").and_then(Value::as_bool) == Some(true) {
+        " [orphaned]"
+    } else {
+        ""
+    };
+    println!("{}{}", content_id, orphaned);
+
+    let path = item
+        .get("resolved_path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("indexed_paths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            item.get("aliases")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str)
+        });
+    if let Some(path) = path {
+        println!("  path: {}", path);
+    }
+    if let Some(groups) = item.get("tag_groups").and_then(Value::as_object) {
+        for (kind, tags) in groups {
+            let tags: Vec<&str> = tags
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !tags.is_empty() {
+                println!("  {}: {}", kind, tags.join(", "));
+            }
+        }
+    }
+    if let Some(rating) = item.get("rating").and_then(Value::as_u64) {
+        println!("  rating: {}", rating);
+    }
+    if let (Some(width), Some(height)) = (
+        item.get("width").and_then(Value::as_u64),
+        item.get("height").and_then(Value::as_u64),
+    ) {
+        println!("  dimensions: {}x{}", width, height);
+    }
+    if detailed {
+        if let Some(aliases) = item.get("aliases").and_then(Value::as_array) {
+            for alias in aliases.iter().filter_map(Value::as_str).skip(1) {
+                println!("  alias: {}", alias);
+            }
+        }
+        if let Some(autotag) = item.get("autotag").and_then(Value::as_object) {
+            if let Some(model) = autotag.get("model").and_then(Value::as_str) {
+                println!("  autotag model: {}", model);
+            }
+            if let Some(run_id) = autotag.get("run_id").and_then(Value::as_str) {
+                println!("  autotag run: {}", run_id);
+            }
+        }
+    }
 }
 
 async fn resolve_playlist_path(path: String) -> anyhow::Result<String> {
@@ -1045,6 +1283,7 @@ async fn autotag_batch(opts: BatchAutoTagOptions) -> anyhow::Result<Value> {
             api_key_env: opts.api_key_env.clone(),
             api_key_file: opts.api_key_file.clone(),
             timeout_secs: opts.timeout_secs,
+            run_id: Some(audit.run_id.clone()),
         })
         .await
         {
@@ -1348,7 +1587,10 @@ struct AutoTagOptions {
     api_key_env: String,
     api_key_file: Option<String>,
     timeout_secs: u64,
+    run_id: Option<String>,
 }
+
+const AUTOTAG_PROMPT_VERSION: &str = "aurora-autotag-v1";
 
 struct AutoTagResult {
     path: String,
@@ -1357,6 +1599,10 @@ struct AutoTagResult {
     rating: Option<u8>,
     frequency: Option<u32>,
     confidence: Option<f64>,
+    tagged_at_ms: u64,
+    endpoint: String,
+    prompt_version: String,
+    run_id: String,
     raw: Value,
 }
 
@@ -1369,6 +1615,10 @@ impl AutoTagResult {
             "rating": self.rating,
             "frequency": self.frequency,
             "confidence": self.confidence,
+            "tagged_at_ms": self.tagged_at_ms,
+            "endpoint": self.endpoint,
+            "prompt_version": self.prompt_version,
+            "run_id": self.run_id,
             "raw": self.raw,
         })
     }
@@ -1381,6 +1631,10 @@ async fn autotag_image(opts: AutoTagOptions) -> anyhow::Result<AutoTagResult> {
     )?;
     let request_url = format!("{}/chat/completions", opts.base_url.trim_end_matches('/'));
     parse_http_url(&request_url, opts.allow_http)?;
+    let run_id = opts
+        .run_id
+        .clone()
+        .unwrap_or_else(|| format!("{}-{}", current_unix_ms(), std::process::id()));
     let path = std::path::PathBuf::from(&opts.path);
     let (data_uri, palette) = prepare_autotag_image(&path)?;
 
@@ -1445,6 +1699,10 @@ async fn autotag_image(opts: AutoTagOptions) -> anyhow::Result<AutoTagResult> {
         rating,
         frequency,
         confidence,
+        tagged_at_ms: u64::try_from(current_unix_ms()).unwrap_or(u64::MAX),
+        endpoint: request_url,
+        prompt_version: AUTOTAG_PROMPT_VERSION.to_string(),
+        run_id,
         raw,
     })
 }
@@ -2216,6 +2474,10 @@ fn autotag_upsert_message(
         provenance: Some(aurora::content::AutoTagProvenance {
             model: result.model.clone(),
             confidence: result.confidence,
+            tagged_at_ms: Some(result.tagged_at_ms),
+            endpoint: Some(result.endpoint.clone()),
+            prompt_version: Some(result.prompt_version.clone()),
+            run_id: Some(result.run_id.clone()),
             raw: result.raw.clone(),
         }),
         create_playlist,
@@ -2354,6 +2616,34 @@ mod tests {
     }
 
     #[test]
+    fn playlist_create_cli_defaults_static_and_accepts_dynamic() {
+        let static_playlist =
+            Cli::try_parse_from(["aurora-ctl", "playlist", "create", "focus"]).unwrap();
+        assert!(matches!(
+            static_playlist.command,
+            Command::Playlist {
+                action: PlaylistCommand::Create {
+                    name,
+                    dynamic: false
+                }
+            } if name == "focus"
+        ));
+
+        let dynamic_playlist =
+            Cli::try_parse_from(["aurora-ctl", "playlist", "create", "smart", "--dynamic"])
+                .unwrap();
+        assert!(matches!(
+            dynamic_playlist.command,
+            Command::Playlist {
+                action: PlaylistCommand::Create {
+                    name,
+                    dynamic: true
+                }
+            } if name == "smart"
+        ));
+    }
+
+    #[test]
     fn playlist_filter_cli_parses_repeatable_rules_and_empty_clear() {
         let cli = Cli::try_parse_from([
             "aurora-ctl",
@@ -2448,6 +2738,120 @@ mod tests {
                     .err()
                     .expect("out-of-range page limit must fail");
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn content_list_cli_reuses_filters_and_bounded_pagination() {
+        let defaults = Cli::try_parse_from(["aurora-ctl", "content", "list"]).unwrap();
+        assert!(matches!(
+            defaults.command,
+            Command::Content {
+                action: ContentCommand::List {
+                    offset: 0,
+                    limit: aurora::ipc::messages::DEFAULT_CONTENT_LIST_LIMIT,
+                    ..
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "aurora-ctl",
+            "content",
+            "list",
+            "--include",
+            "theme=night",
+            "--exclude",
+            "safety=nsfw",
+            "--offset",
+            "12",
+            "--limit",
+            "256",
+        ])
+        .unwrap();
+        let Command::Content {
+            action:
+                ContentCommand::List {
+                    include,
+                    exclude,
+                    offset,
+                    limit,
+                },
+        } = cli.command
+        else {
+            panic!("expected content list command");
+        };
+        assert_eq!(parse_tag_filter_rules(include).unwrap()["theme"], ["night"]);
+        assert_eq!(parse_tag_filter_rules(exclude).unwrap()["safety"], ["nsfw"]);
+        assert_eq!((offset, limit), (12, 256));
+
+        for limit in ["0", "257"] {
+            let error = Cli::try_parse_from(["aurora-ctl", "content", "list", "--limit", limit])
+                .err()
+                .expect("out-of-range page limit must fail");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn content_target_commands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["aurora-ctl", "content", "show", "blake3:abc"])
+                .unwrap()
+                .command,
+            Command::Content {
+                action: ContentCommand::Show { target }
+            } if target == "blake3:abc"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "aurora-ctl",
+                "content",
+                "tag",
+                "photo.jpg",
+                "--kind",
+                "theme",
+                "night",
+            ])
+            .unwrap()
+            .command,
+            Command::Content {
+                action: ContentCommand::Tag { target, kind, tags }
+            } if target == "photo.jpg" && kind == "theme" && tags == ["night"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aurora-ctl", "content", "rate", "photo.jpg", "5"])
+                .unwrap()
+                .command,
+            Command::Content {
+                action: ContentCommand::Rate {
+                    target,
+                    rating: 5
+                }
+            } if target == "photo.jpg"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aurora-ctl", "content", "clear", "photo.jpg"])
+                .unwrap()
+                .command,
+            Command::Content {
+                action: ContentCommand::Clear { target }
+            } if target == "photo.jpg"
+        ));
+    }
+
+    #[tokio::test]
+    async fn content_ids_and_current_are_preserved_for_daemon_resolution() {
+        for target in [
+            "blake3:0123456789abcdef",
+            "BLAKE3:0123456789ABCDEF",
+            "current",
+            "CURRENT",
+        ] {
+            assert_eq!(
+                resolve_content_target(target.to_string()).await.unwrap(),
+                target
+            );
         }
     }
 
@@ -2962,6 +3366,10 @@ mod tests {
             rating: Some(4),
             frequency: Some(2),
             confidence: Some(0.9),
+            tagged_at_ms: 123,
+            endpoint: "https://example.test/v1/chat/completions".to_string(),
+            prompt_version: AUTOTAG_PROMPT_VERSION.to_string(),
+            run_id: "run-1".to_string(),
             raw: json!({"identity": {"theme": ["night"]}}),
         };
         let message = autotag_upsert_message("auto", "photo.jpg", &result, true, false);
@@ -2973,6 +3381,10 @@ mod tests {
         assert!(wire.contains("playlist_autotag_upsert"));
         assert!(wire.contains("\"model\":\"model\""));
         assert!(wire.contains("\"confidence\":0.9"));
+        assert!(wire.contains("\"tagged_at_ms\":123"));
+        assert!(wire.contains("https://example.test/v1/chat/completions"));
+        assert!(wire.contains(AUTOTAG_PROMPT_VERSION));
+        assert!(wire.contains("\"run_id\":\"run-1\""));
         assert!(!wire.contains("playlist_list"));
     }
 

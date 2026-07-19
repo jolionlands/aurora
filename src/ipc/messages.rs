@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PLAYLIST_SHOW_LIMIT: usize = 100;
 pub const MAX_PLAYLIST_SHOW_LIMIT: usize = 256;
+pub const DEFAULT_CONTENT_LIST_LIMIT: usize = DEFAULT_PLAYLIST_SHOW_LIMIT;
+pub const MAX_CONTENT_LIST_LIMIT: usize = MAX_PLAYLIST_SHOW_LIMIT;
 
 // ---------------------------------------------------------------------------
 // IPC message enum (client → daemon)
@@ -72,8 +74,12 @@ pub enum IpcMessage {
         limit: usize,
     },
 
-    /// Create an empty playlist.
-    PlaylistCreate { name: String },
+    /// Create an empty static or dynamic playlist.
+    PlaylistCreate {
+        name: String,
+        #[serde(default)]
+        dynamic: bool,
+    },
 
     /// Add a path to a playlist.
     PlaylistAdd { name: String, path: String },
@@ -144,6 +150,38 @@ pub enum IpcMessage {
 
     /// Delete a playlist.
     PlaylistDelete { name: String },
+
+    // ------------------------------------------------------------------
+    // Content metadata
+    // ------------------------------------------------------------------
+    /// Return one bounded page of content metadata.
+    ContentList {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_content_list_limit")]
+        limit: usize,
+        #[serde(default)]
+        include: std::collections::BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        exclude: std::collections::BTreeMap<String, Vec<String>>,
+    },
+
+    /// Return metadata for one content ID, alias, or path.
+    ContentShow { target: String },
+
+    /// Replace one tag group for a content item.
+    ContentTag {
+        target: String,
+        #[serde(default = "default_tag_kind")]
+        kind: String,
+        tags: Vec<String>,
+    },
+
+    /// Set a content item's rating.
+    ContentRate { target: String, rating: u8 },
+
+    /// Clear all shared metadata for a content item.
+    ContentClear { target: String },
 }
 
 fn default_tag_kind() -> String {
@@ -152,6 +190,10 @@ fn default_tag_kind() -> String {
 
 fn default_playlist_show_limit() -> usize {
     DEFAULT_PLAYLIST_SHOW_LIMIT
+}
+
+fn default_content_list_limit() -> usize {
+    DEFAULT_CONTENT_LIST_LIMIT
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +316,32 @@ mod tests {
     }
 
     #[test]
+    fn playlist_create_defaults_to_static() {
+        let defaulted: IpcMessage =
+            serde_json::from_str(r#"{"type":"playlist_create","data":{"name":"focus"}}"#).unwrap();
+        assert!(matches!(
+            defaulted,
+            IpcMessage::PlaylistCreate {
+                name,
+                dynamic: false
+            } if name == "focus"
+        ));
+
+        let raw = serde_json::to_string(&IpcMessage::PlaylistCreate {
+            name: "fresh".to_string(),
+            dynamic: true,
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str(&raw).unwrap(),
+            IpcMessage::PlaylistCreate {
+                name,
+                dynamic: true
+            } if name == "fresh"
+        ));
+    }
+
+    #[test]
     fn playlist_filter_roundtrip() {
         let message = IpcMessage::PlaylistFilter {
             name: "focus".to_string(),
@@ -300,6 +368,71 @@ mod tests {
                 && include["theme"] == ["night"]
                 && exclude["safety"] == ["nsfw"]
         ));
+    }
+
+    #[test]
+    fn content_list_roundtrip_and_defaults() {
+        let message = IpcMessage::ContentList {
+            offset: 12,
+            limit: 64,
+            include: std::collections::BTreeMap::from([(
+                "theme".to_string(),
+                vec!["night".to_string()],
+            )]),
+            exclude: std::collections::BTreeMap::new(),
+        };
+        let raw = serde_json::to_string(&message).unwrap();
+        assert!(matches!(
+            serde_json::from_str(&raw).unwrap(),
+            IpcMessage::ContentList {
+                offset: 12,
+                limit: 64,
+                include,
+                exclude,
+            } if include["theme"] == ["night"] && exclude.is_empty()
+        ));
+
+        let defaulted: IpcMessage =
+            serde_json::from_str(r#"{"type":"content_list","data":{}}"#).unwrap();
+        assert!(matches!(
+            defaulted,
+            IpcMessage::ContentList {
+                offset: 0,
+                limit: DEFAULT_CONTENT_LIST_LIMIT,
+                include,
+                exclude,
+            } if include.is_empty() && exclude.is_empty()
+        ));
+    }
+
+    #[test]
+    fn content_mutation_roundtrip() {
+        let messages = [
+            IpcMessage::ContentShow {
+                target: "blake3:abc".to_string(),
+            },
+            IpcMessage::ContentTag {
+                target: "blake3:abc".to_string(),
+                kind: "theme".to_string(),
+                tags: vec!["night".to_string()],
+            },
+            IpcMessage::ContentRate {
+                target: "blake3:abc".to_string(),
+                rating: 4,
+            },
+            IpcMessage::ContentClear {
+                target: "blake3:abc".to_string(),
+            },
+        ];
+
+        for message in messages {
+            let raw = serde_json::to_string(&message).unwrap();
+            let decoded: IpcMessage = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(message).unwrap()
+            );
+        }
     }
 
     #[test]

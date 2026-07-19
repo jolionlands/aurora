@@ -44,6 +44,12 @@ struct SchedulerProgressState {
 pub struct SchedulerProgress(Arc<Mutex<SchedulerProgressState>>);
 
 impl SchedulerProgress {
+    /// Start interval cadence from daemon readiness when Windows already has
+    /// a wallpaper, instead of replacing it immediately on every restart.
+    pub fn seed_success(&self) {
+        self.0.lock().last_success.get_or_insert_with(Instant::now);
+    }
+
     pub fn complete(&self, reason: &SwapReason, succeeded: bool) {
         self.complete_at(reason, succeeded, Instant::now());
     }
@@ -427,6 +433,14 @@ mod tests {
         progress.complete_at(&SwapReason::Interval, true, start);
         assert!(!progress.interval_due(interval, start + Duration::from_secs(59)));
         assert!(progress.interval_due(interval, start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn existing_wallpaper_starts_interval_cadence_without_an_immediate_swap() {
+        let progress = SchedulerProgress::default();
+        progress.seed_success();
+
+        assert!(!progress.interval_due(Duration::from_secs(60), Instant::now()));
     }
 
     #[test]

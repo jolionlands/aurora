@@ -2,9 +2,14 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{
+    FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+};
 
 use crate::config::types::SourceConfig;
 use rand::Rng;
@@ -28,14 +33,25 @@ pub struct PhotoIndex {
     pub photos: Vec<PhotoEntry>,
 }
 
-const INDEX_CACHE_VERSION: u32 = 1;
+const INDEX_CACHE_VERSION: u32 = 2;
+// Bump whenever validate_image_file's acceptance rules change.
+const INDEX_VALIDATOR_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    size: u64,
+    creation_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedPhoto {
     path: String,
-    size: u64,
-    creation_time: u64,
-    last_write_time: u64,
+    #[serde(default)]
+    fingerprint: Option<FileFingerprint>,
     width: u32,
     height: u32,
     hash: Option<String>,
@@ -44,6 +60,8 @@ struct CachedPhoto {
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexCacheFile {
     version: u32,
+    #[serde(default)]
+    validator_version: u32,
     entries: Vec<CachedPhoto>,
 }
 
@@ -373,7 +391,20 @@ fn build_entry_cached(
         return Ok(None);
     }
 
-    let cached = state.cache.find(canonical_path, meta).cloned();
+    let fingerprint = match FileFingerprint::read(path) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            tracing::debug!(
+                "photo index cache disabled for {}: {error:#}",
+                path.display()
+            );
+            None
+        }
+    };
+    let cached = state
+        .cache
+        .find(canonical_path, fingerprint.as_ref())
+        .cloned();
     let mut fact = if let Some(mut cached) = cached {
         state.cache_hits += 1;
         cached.path = canonical_path.to_string_lossy().into_owned();
@@ -382,11 +413,13 @@ fn build_entry_cached(
         state.cache_misses += 1;
         let (width, height) = crate::decode::validate_image_file(path)
             .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
-        CachedPhoto::new(canonical_path, meta, width, height)
+        CachedPhoto::new(canonical_path, fingerprint, width, height)
     };
 
     if fact.width < min_width || fact.height < min_height {
-        state.refreshed.insert(canonical_path.to_path_buf(), fact);
+        if fact.fingerprint.is_some() {
+            state.refreshed.insert(canonical_path.to_path_buf(), fact);
+        }
         return Ok(None);
     }
 
@@ -399,7 +432,9 @@ fn build_entry_cached(
         }
     };
     let (width, height) = (fact.width, fact.height);
-    state.refreshed.insert(canonical_path.to_path_buf(), fact);
+    if fact.fingerprint.is_some() {
+        state.refreshed.insert(canonical_path.to_path_buf(), fact);
+    }
     Ok(Some(PhotoEntry {
         path: path.to_path_buf(),
         width: Some(width),
@@ -409,13 +444,54 @@ fn build_entry_cached(
     }))
 }
 
+impl FileFingerprint {
+    fn read(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .open(path)
+            .with_context(|| format!("open file attributes {}", path.display()))?;
+        let handle = HANDLE(file.as_raw_handle());
+        let mut basic = FILE_BASIC_INFO::default();
+        let mut id = FILE_ID_INFO::default();
+
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                std::ptr::from_mut(&mut basic).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .with_context(|| format!("read change time {}", path.display()))?;
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                std::ptr::from_mut(&mut id).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .with_context(|| format!("read file identity {}", path.display()))?;
+
+        Ok(Self {
+            size: file
+                .metadata()
+                .with_context(|| format!("read file size {}", path.display()))?
+                .len(),
+            creation_time: basic.CreationTime,
+            last_write_time: basic.LastWriteTime,
+            change_time: basic.ChangeTime,
+            volume_serial_number: id.VolumeSerialNumber,
+            file_id: id.FileId.Identifier,
+        })
+    }
+}
+
 impl CachedPhoto {
-    fn new(path: &Path, meta: &std::fs::Metadata, width: u32, height: u32) -> Self {
+    fn new(path: &Path, fingerprint: Option<FileFingerprint>, width: u32, height: u32) -> Self {
         Self {
             path: path.to_string_lossy().into_owned(),
-            size: meta.len(),
-            creation_time: meta.creation_time(),
-            last_write_time: meta.last_write_time(),
+            fingerprint,
             width,
             height,
             hash: None,
@@ -423,17 +499,16 @@ impl CachedPhoto {
     }
 
     fn is_valid(&self) -> bool {
-        self.size <= crate::decode::MAX_IMAGE_FILE_BYTES
+        self.fingerprint
+            .is_some_and(|fingerprint| fingerprint.size <= crate::decode::MAX_IMAGE_FILE_BYTES)
             && self.width > 0
             && self.height > 0
             && u64::from(self.width) * u64::from(self.height) <= crate::decode::MAX_IMAGE_PIXELS
             && self.hash.as_deref().is_none_or(valid_blake3_hash)
     }
 
-    fn matches(&self, meta: &std::fs::Metadata) -> bool {
-        self.size == meta.len()
-            && self.creation_time == meta.creation_time()
-            && self.last_write_time == meta.last_write_time()
+    fn matches(&self, fingerprint: &FileFingerprint) -> bool {
+        self.fingerprint.as_ref() == Some(fingerprint)
     }
 }
 
@@ -449,12 +524,13 @@ impl CacheLookup {
         lookup
     }
 
-    fn find(&self, path: &Path, meta: &std::fs::Metadata) -> Option<&CachedPhoto> {
+    fn find(&self, path: &Path, fingerprint: Option<&FileFingerprint>) -> Option<&CachedPhoto> {
+        let fingerprint = fingerprint?;
         let by_path = self
             .by_path
             .get(path)
             .and_then(|index| self.entries.get(*index));
-        if by_path.is_some_and(|entry| entry.matches(meta)) {
+        if by_path.is_some_and(|entry| entry.matches(fingerprint)) {
             return by_path;
         }
         None
@@ -476,12 +552,14 @@ fn load_index_cache(path: &Path) -> Result<CacheLookup> {
         .with_context(|| format!("read photo index cache {}", path.display()))?;
     let cache: IndexCacheFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse photo index cache {}", path.display()))?;
-    if cache.version != INDEX_CACHE_VERSION {
+    if cache.version != INDEX_CACHE_VERSION || cache.validator_version != INDEX_VALIDATOR_VERSION {
         tracing::info!(
-            "photo index cache {} uses version {}, rebuilding version {}",
+            "photo index cache {} uses format/validator {}/{}, rebuilding {}/{}",
             path.display(),
             cache.version,
-            INDEX_CACHE_VERSION
+            cache.validator_version,
+            INDEX_CACHE_VERSION,
+            INDEX_VALIDATOR_VERSION
         );
         return Ok(CacheLookup::default());
     }
@@ -501,12 +579,12 @@ fn persist_index_cache(path: &Path, entries: Vec<CachedPhoto>) -> Result<()> {
     }
     let cache = IndexCacheFile {
         version: INDEX_CACHE_VERSION,
+        validator_version: INDEX_VALIDATOR_VERSION,
         entries,
     };
     let bytes = serde_json::to_vec(&cache).context("serialize photo index cache")?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)
-        .with_context(|| format!("write photo index cache temp file {}", tmp.display()))?;
+    crate::playlist::write_synced(&tmp, &bytes)?;
     crate::playlist::replace_file(&tmp, path)
 }
 
@@ -861,6 +939,39 @@ mod tests {
         assert_ne!(second.photos[0].hash, first.photos[0].hash);
         assert_eq!(second.photos[0].width, Some(24));
         assert_eq!(second.photos[0].height, Some(24));
+    }
+
+    #[test]
+    fn persistent_cache_detects_same_size_rewrite_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = make_temp_image(dir.path(), "changed.bmp", 16, 16);
+        let cache_path = dir.path().join("index-cache.json");
+        let sources = [source(dir.path().to_path_buf(), false, &["bmp"], 0, 0)];
+        let (first, _, _) = scan_with_test_cache(&sources, &cache_path);
+        let before = FileFingerprint::read(&image_path).unwrap();
+        let modified = std::fs::metadata(&image_path).unwrap().modified().unwrap();
+
+        let mut bytes = std::fs::read(&image_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&image_path, bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = FileFingerprint::read(&image_path).unwrap();
+
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.creation_time, before.creation_time);
+        assert_eq!(after.last_write_time, before.last_write_time);
+        assert_eq!(after.volume_serial_number, before.volume_serial_number);
+        assert_eq!(after.file_id, before.file_id);
+        assert_ne!(after.change_time, before.change_time);
+
+        let (second, hits, misses) = scan_with_test_cache(&sources, &cache_path);
+        assert_eq!((hits, misses), (0, 1));
+        assert_ne!(second.photos[0].hash, first.photos[0].hash);
     }
 
     #[test]

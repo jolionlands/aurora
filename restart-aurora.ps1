@@ -1,14 +1,14 @@
 [CmdletBinding()]
 <#
 .SYNOPSIS
-Cleanly restart the aurora wallpaper daemon (recovers a wedged instance).
+Cleanly restart the Aurora wallpaper daemon.
 
 .DESCRIPTION
-aurora occasionally wedges: the process is alive but stops advancing the
-wallpaper (or its control pipe stops responding). The fix is a graceful
-'aurora-ctl quit' followed by a NON-ELEVATED relaunch -- never run elevated, as
-an elevated aurora creates an integrity-level split-brain where the user's
-aurora-ctl gets AccessDenied on the pipe.
+Performs a graceful 'aurora-ctl quit' followed by a NON-ELEVATED relaunch.
+This is useful after rebuilding, changing restart-only configuration, or
+recovering from an unexpected process failure. Never run elevated: an elevated
+Aurora creates an integrity-level split-brain where the user's aurora-ctl gets
+AccessDenied on the pipe.
 
 Run from a normal (non-admin) shell. Idempotent.
 #>
@@ -51,7 +51,7 @@ Start-Sleep -Seconds 1
 
 # 2. Relaunch (detached, non-elevated).
 Write-Host "Launching aurora..."
-$process = Start-Process -FilePath $exe -WorkingDirectory $AuroraDir -PassThru
+$process = Start-Process -FilePath $exe -WorkingDirectory $AuroraDir -WindowStyle Hidden -PassThru
 
 # 3. Wait for the control pipe to answer (daemon indexes its library on boot).
 $deadline = (Get-Date).AddSeconds($ReadyTimeoutSec)

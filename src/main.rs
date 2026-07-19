@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use aurora::apply::{WallpaperApplier, WallpaperFit};
+use aurora::apply::{MonitorSnapshot, WallpaperApplier, WallpaperFit};
 use aurora::config::parse::{default_config_path, parse_kdl_config};
 use aurora::hooks::StartupManager;
 use aurora::integrations::wiri::subscribe_wiri_events;
@@ -40,6 +40,12 @@ struct Args {
     #[arg(long, hide = true, requires = "apply_once", value_name = "FIT")]
     apply_fit: Option<String>,
 
+    #[arg(long, hide = true, requires = "apply_once", value_name = "MONITOR")]
+    apply_monitor: Option<String>,
+
+    #[arg(long, hide = true, conflicts_with = "apply_once")]
+    inspect_wallpapers: bool,
+
     /// Register aurora in the Windows Run key so it starts with Windows.
     #[arg(long)]
     register_autostart: bool,
@@ -57,8 +63,15 @@ async fn main() -> Result<()> {
     // 1. CLI flags that do not start the daemon
     // ---------------------------------------------------------------------------
     let args = Args::parse();
+    if args.inspect_wallpapers {
+        return inspect_wallpapers();
+    }
     if let Some(path) = args.apply_once {
-        return apply_once(&path, args.apply_fit.as_deref());
+        return apply_once(
+            &path,
+            args.apply_fit.as_deref(),
+            args.apply_monitor.as_deref(),
+        );
     }
     if args.register_autostart || args.unregister_autostart {
         init_logging("info")?;
@@ -104,7 +117,7 @@ async fn main() -> Result<()> {
     let ipc = Arc::new(IpcServer::bind()?);
 
     // ---------------------------------------------------------------------------
-    // 3. COM initialisation (required for WIC + IDesktopWallpaper)
+    // 3. COM initialisation (required for WIC; wallpaper COM runs in helpers)
     // ---------------------------------------------------------------------------
     let _com = ComApartment::initialize()?;
 
@@ -148,7 +161,7 @@ async fn main() -> Result<()> {
     }
 
     // ---------------------------------------------------------------------------
-    // 5. Build metrics, applier, runtime
+    // 5. Build metrics and runtime
     // ---------------------------------------------------------------------------
     let metrics = Metrics::new();
     let metrics_listener = if config.metrics.enabled {
@@ -161,13 +174,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    let applier = WallpaperApplier::new().context("create WallpaperApplier")?;
-
     let (scheduler, swap_rx) = Scheduler::new(config.schedule.clone());
     let mut runtime = Runtime::new(
         &config,
         &config_path,
-        applier,
         Arc::clone(&metrics),
         scheduler.progress(),
     )
@@ -248,8 +258,8 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------------------
     // 11. Runtime drain loop
     // ---------------------------------------------------------------------------
-    // Runtime owns apartment-bound COM interfaces, so poll it on the root
-    // thread where COM was initialized rather than on a Tokio worker.
+    // Runtime decoding uses apartment-bound WIC interfaces, so poll it on the
+    // root thread where COM was initialized rather than on a Tokio worker.
     wait_for_core_exit(
         runtime.run(swap_rx, snap_state, pause_arc),
         shutdown_rx,
@@ -259,13 +269,39 @@ async fn main() -> Result<()> {
     .await
 }
 
-fn apply_once(path: &Path, fit: Option<&str>) -> Result<()> {
+fn apply_once(path: &Path, fit: Option<&str>, monitor: Option<&str>) -> Result<()> {
     let _com = ComApartment::initialize()?;
     let applier = WallpaperApplier::new()?;
     if let Some(fit) = fit {
         applier.set_fit(WallpaperFit::parse(fit))?;
     }
-    applier.set_for_all_monitors(path)
+    if let Some(monitor) = monitor {
+        applier.set_for_monitor(monitor, path)
+    } else {
+        applier.set_for_all_monitors(path)
+    }
+}
+
+fn inspect_wallpapers() -> Result<()> {
+    let _com = ComApartment::initialize()?;
+    let applier = WallpaperApplier::new()?;
+    let snapshots: Vec<MonitorSnapshot> = applier
+        .list_monitors()?
+        .into_iter()
+        .map(|monitor| {
+            let current_path = applier
+                .current_for_monitor(&monitor.id)
+                .ok()
+                .flatten()
+                .filter(|path| path.is_file());
+            MonitorSnapshot {
+                monitor,
+                current_path,
+            }
+        })
+        .collect();
+    println!("{}", serde_json::to_string(&snapshots)?);
+    Ok(())
 }
 
 fn init_logging(default_filter: &str) -> Result<()> {
@@ -349,6 +385,14 @@ mod tests {
     #[test]
     fn apply_helper_fit_requires_an_apply_path() {
         assert!(Args::try_parse_from(["aurora", "--apply-fit", "fill"]).is_err());
+        assert!(Args::try_parse_from(["aurora", "--apply-monitor", "display"]).is_err());
+        assert!(Args::try_parse_from([
+            "aurora",
+            "--apply-once",
+            r"C:\wallpapers\one.jpg",
+            "--inspect-wallpapers",
+        ])
+        .is_err());
 
         let args = Args::try_parse_from([
             "aurora",
@@ -356,9 +400,15 @@ mod tests {
             r"C:\wallpapers\one.jpg",
             "--apply-fit",
             "contain",
+            "--apply-monitor",
+            "display",
         ])
         .unwrap();
         assert_eq!(args.apply_fit.as_deref(), Some("contain"));
+        assert_eq!(args.apply_monitor.as_deref(), Some("display"));
+
+        let args = Args::try_parse_from(["aurora", "--inspect-wallpapers"]).unwrap();
+        assert!(args.inspect_wallpapers);
     }
 
     #[tokio::test]
