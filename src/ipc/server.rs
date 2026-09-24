@@ -227,64 +227,52 @@ impl IpcServer {
         Ok(())
     }
 
+    /// Clone the runtime handle without holding the lock past this call.
+    fn runtime_handle(&self) -> Option<RuntimeHandle> {
+        self.runtime.lock().clone()
+    }
+
     async fn process_message(&self, message: IpcMessage) -> serde_json::Value {
-        // Helper: get a clone of the runtime handle, or return not-ready error.
-        macro_rules! runtime {
-            () => {
-                match self.runtime.lock().clone() {
-                    Some(h) => h,
-                    None => {
-                        return serde_json::json!({
-                            "success": false,
-                            "error": "runtime not yet initialised"
-                        })
-                    }
+        let Some(handle) = self.runtime_handle() else {
+            return match message {
+                IpcMessage::Status => {
+                    serde_json::json!({ "success": true, "result": { "running": true } })
                 }
+                IpcMessage::Stats => serde_json::json!({ "success": true, "result": {} }),
+                _ => serde_json::json!({
+                    "success": false,
+                    "error": "runtime not yet initialised"
+                }),
             };
-        }
+        };
 
         match message {
             IpcMessage::Status => {
-                let result = match self.runtime.lock().clone() {
-                    Some(h) => h.status(),
-                    None => serde_json::json!({ "running": true }),
-                };
-                serde_json::json!({ "success": true, "result": result })
+                serde_json::json!({ "success": true, "result": handle.status() })
             }
 
-            IpcMessage::Stats => {
-                let result = match self.runtime.lock().clone() {
-                    Some(h) => h.stats(),
-                    None => serde_json::json!({}),
-                };
-                serde_json::json!({ "success": true, "result": result })
-            }
+            IpcMessage::Stats => serde_json::json!({ "success": true, "result": handle.stats() }),
 
             IpcMessage::Reload => {
                 info!("IPC: Reload config requested");
-                let handle = { self.runtime.lock().clone() };
-                if let Some(handle) = handle {
-                    match tokio::task::spawn_blocking(move || handle.reload_from_disk()).await {
-                        Ok(Ok(())) => {
-                            self.broadcast_event(IpcEvent::ConfigReloaded);
-                            serde_json::json!({
-                                "success": true,
-                                "result": {
-                                    "index_reloaded": true,
-                                    "restart_required": ["schedule", "transitions", "monitors", "cache", "metrics", "log-level"]
-                                }
-                            })
-                        }
-                        Ok(Err(error)) => {
-                            serde_json::json!({ "success": false, "error": error.to_string() })
-                        }
-                        Err(error) => serde_json::json!({
-                            "success": false,
-                            "error": format!("reload task failed: {error}")
-                        }),
+                match tokio::task::spawn_blocking(move || handle.reload_from_disk()).await {
+                    Ok(Ok(())) => {
+                        self.broadcast_event(IpcEvent::ConfigReloaded);
+                        serde_json::json!({
+                            "success": true,
+                            "result": {
+                                "index_reloaded": true,
+                                "restart_required": ["schedule", "transitions", "animated", "monitors", "cache", "metrics", "log-level"]
+                            }
+                        })
                     }
-                } else {
-                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
+                    Ok(Err(error)) => {
+                        serde_json::json!({ "success": false, "error": error.to_string() })
+                    }
+                    Err(error) => serde_json::json!({
+                        "success": false,
+                        "error": format!("reload task failed: {error}")
+                    }),
                 }
             }
 
@@ -292,49 +280,17 @@ impl IpcServer {
                 serde_json::json!({ "success": false, "error": "quit requires an IPC connection" })
             }
 
-            IpcMessage::Next => command_response(runtime!().skip_next()),
-
-            IpcMessage::Prev => command_response(runtime!().prev()),
-
             IpcMessage::Pause { duration_secs } => {
-                let h = runtime!();
-                let dur = duration_secs.map(std::time::Duration::from_secs);
-                h.pause(dur);
+                handle.pause(duration_secs.map(std::time::Duration::from_secs));
                 self.broadcast_event(IpcEvent::Paused);
                 serde_json::json!({ "success": true })
             }
 
             IpcMessage::Resume => {
-                let h = runtime!();
-                h.resume();
+                handle.resume();
                 self.broadcast_event(IpcEvent::Resumed);
                 serde_json::json!({ "success": true })
             }
-
-            IpcMessage::Set { path } => {
-                command_response(runtime!().set_specific(std::path::PathBuf::from(path)))
-            }
-
-            IpcMessage::SetFolder { path } => {
-                let handle = { self.runtime.lock().clone() };
-                if let Some(handle) = handle {
-                    match tokio::task::spawn_blocking(move || {
-                        handle.set_folder(std::path::PathBuf::from(path))
-                    })
-                    .await
-                    {
-                        Ok(result) => command_response(result),
-                        Err(error) => serde_json::json!({
-                            "success": false,
-                            "error": format!("set-folder task failed: {error}")
-                        }),
-                    }
-                } else {
-                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
-                }
-            }
-
-            IpcMessage::Ban { hash } => command_response(runtime!().ban(&hash)),
 
             IpcMessage::SubscribeEvents { .. } => {
                 // Handled above in handle_client before reaching process_message.
@@ -342,162 +298,188 @@ impl IpcServer {
             }
 
             IpcMessage::GetCurrentWallpaper => {
-                if let Some(handle) = self.runtime.lock().clone() {
-                    let map = handle.current_wallpaper();
-                    let entries: serde_json::Map<String, serde_json::Value> = map
-                        .into_iter()
-                        .map(|(k, v)| (k, serde_json::Value::String(v.display().to_string())))
-                        .collect();
-                    serde_json::json!({ "success": true, "result": entries })
-                } else {
-                    serde_json::json!({ "success": false, "error": "runtime not initialised" })
-                }
+                let entries: serde_json::Map<String, serde_json::Value> = handle
+                    .current_wallpaper()
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v.display().to_string())))
+                    .collect();
+                serde_json::json!({ "success": true, "result": entries })
             }
 
-            // ------------------------------------------------------------------
-            // Playlist management
-            // ------------------------------------------------------------------
-            IpcMessage::PlaylistList => {
-                let h = runtime!();
-                let result = h.playlist_list();
-                serde_json::json!({ "success": true, "result": result })
+            // Everything else may hash files, fsync stores, or wait on the
+            // ban gate while a wallpaper apply finishes. Keep that off the
+            // two async workers that also run the scheduler and IPC accept loop.
+            message => tokio::task::spawn_blocking(move || dispatch_blocking(&handle, message))
+                .await
+                .unwrap_or_else(|error| {
+                    serde_json::json!({
+                        "success": false,
+                        "error": format!("IPC command task failed: {error}")
+                    })
+                }),
+        }
+    }
+}
+
+/// Commands whose handlers may block on disk I/O or locks.
+fn dispatch_blocking(handle: &RuntimeHandle, message: IpcMessage) -> serde_json::Value {
+    match message {
+        IpcMessage::Next => command_response(handle.skip_next()),
+
+        IpcMessage::Prev => command_response(handle.prev()),
+
+        IpcMessage::Set { path } => {
+            command_response(handle.set_specific(std::path::PathBuf::from(path)))
+        }
+
+        IpcMessage::Ban { hash } => command_response(handle.ban(&hash)),
+
+        // ------------------------------------------------------------------
+        // Playlist management
+        // ------------------------------------------------------------------
+        IpcMessage::PlaylistList => {
+            let result = handle.playlist_list();
+            serde_json::json!({ "success": true, "result": result })
+        }
+
+        IpcMessage::PlaylistShow {
+            name,
+            offset,
+            limit,
+        } => match handle.playlist_show(&name, offset, limit) {
+            Ok(result) => serde_json::json!({ "success": true, "result": result }),
+            Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
+        },
+
+        IpcMessage::PlaylistCreate { name, dynamic } => {
+            command_response(handle.playlist_create(&name, dynamic))
+        }
+
+        IpcMessage::PlaylistAdd { name, path } => {
+            command_response(handle.playlist_add(&name, &path))
+        }
+
+        IpcMessage::PlaylistTag {
+            name,
+            path,
+            kind,
+            tags,
+        } => command_response(handle.playlist_tag(&name, &path, &kind, tags)),
+
+        IpcMessage::PlaylistRate { name, path, rating } => {
+            command_response(handle.playlist_rate(&name, &path, rating))
+        }
+
+        IpcMessage::PlaylistFrequency {
+            name,
+            path,
+            frequency,
+        } => command_response(handle.playlist_frequency(&name, &path, frequency)),
+
+        IpcMessage::PlaylistShuffle { name, shuffle } => {
+            command_response(handle.playlist_shuffle(&name, shuffle))
+        }
+
+        IpcMessage::PlaylistFilter {
+            name,
+            include,
+            exclude,
+        } => command_response(handle.playlist_filter(&name, include, exclude)),
+
+        IpcMessage::PlaylistAutotagStatus { name, path } => {
+            match handle.playlist_autotag_status(&name, &path) {
+                Ok(has_metadata) => serde_json::json!({
+                    "success": true,
+                    "result": { "has_metadata": has_metadata },
+                }),
+                Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
             }
+        }
 
-            IpcMessage::PlaylistShow {
-                name,
-                offset,
-                limit,
-            } => {
-                let h = runtime!();
-                match h.playlist_show(&name, offset, limit) {
-                    Ok(result) => serde_json::json!({ "success": true, "result": result }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
-
-            IpcMessage::PlaylistCreate { name, dynamic } => {
-                command_response(runtime!().playlist_create(&name, dynamic))
-            }
-
-            IpcMessage::PlaylistAdd { name, path } => {
-                command_response(runtime!().playlist_add(&name, &path))
-            }
-
-            IpcMessage::PlaylistTag {
-                name,
-                path,
-                kind,
-                tags,
-            } => command_response(runtime!().playlist_tag(&name, &path, &kind, tags)),
-
-            IpcMessage::PlaylistRate { name, path, rating } => {
-                command_response(runtime!().playlist_rate(&name, &path, rating))
-            }
-
-            IpcMessage::PlaylistFrequency {
-                name,
-                path,
-                frequency,
-            } => command_response(runtime!().playlist_frequency(&name, &path, frequency)),
-
-            IpcMessage::PlaylistShuffle { name, shuffle } => {
-                command_response(runtime!().playlist_shuffle(&name, shuffle))
-            }
-
-            IpcMessage::PlaylistFilter {
-                name,
-                include,
-                exclude,
-            } => command_response(runtime!().playlist_filter(&name, include, exclude)),
-
-            IpcMessage::PlaylistAutotagStatus { name, path } => {
-                let h = runtime!();
-                match h.playlist_autotag_status(&name, &path) {
-                    Ok(has_metadata) => serde_json::json!({
-                        "success": true,
-                        "result": { "has_metadata": has_metadata },
-                    }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
-
-            IpcMessage::PlaylistAutotagUpsert {
-                name,
-                path,
+        IpcMessage::PlaylistAutotagUpsert {
+            name,
+            path,
+            groups,
+            rating,
+            frequency,
+            provenance,
+            create_playlist,
+            overwrite_existing,
+        } => {
+            match handle.playlist_autotag_upsert(
+                &name,
+                &path,
                 groups,
                 rating,
                 frequency,
                 provenance,
                 create_playlist,
                 overwrite_existing,
-            } => {
-                let h = runtime!();
-                match h.playlist_autotag_upsert(
-                    &name,
-                    &path,
-                    groups,
-                    rating,
-                    frequency,
-                    provenance,
-                    create_playlist,
-                    overwrite_existing,
-                ) {
-                    Ok(applied) => serde_json::json!({
-                        "success": true,
-                        "result": { "applied": applied },
-                    }),
-                    Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
-                }
-            }
-
-            IpcMessage::PlaylistRemove { name, path } => {
-                command_response(runtime!().playlist_remove(&name, &path))
-            }
-
-            IpcMessage::PlaylistActivate { name } => {
-                command_response(runtime!().playlist_activate(&name))
-            }
-
-            IpcMessage::PlaylistDeactivate => command_response(runtime!().playlist_deactivate()),
-
-            IpcMessage::PlaylistDelete { name } => {
-                command_response(runtime!().playlist_delete(&name))
-            }
-
-            // ------------------------------------------------------------------
-            // Content metadata
-            // ------------------------------------------------------------------
-            IpcMessage::ContentList {
-                offset,
-                limit,
-                include,
-                exclude,
-            } => match runtime!().content_list(offset, limit, include, exclude) {
-                Ok(result) => serde_json::json!({ "success": true, "result": result }),
-                Err(error) => {
-                    serde_json::json!({ "success": false, "error": error.to_string() })
-                }
-            },
-
-            IpcMessage::ContentShow { target } => match runtime!().content_show(&target) {
-                Ok(result) => serde_json::json!({ "success": true, "result": result }),
-                Err(error) => {
-                    serde_json::json!({ "success": false, "error": error.to_string() })
-                }
-            },
-
-            IpcMessage::ContentTag { target, kind, tags } => {
-                command_response(runtime!().content_tag(&target, &kind, tags))
-            }
-
-            IpcMessage::ContentRate { target, rating } => {
-                command_response(runtime!().content_rate(&target, rating))
-            }
-
-            IpcMessage::ContentClear { target } => {
-                command_response(runtime!().content_clear(&target))
+            ) {
+                Ok(applied) => serde_json::json!({
+                    "success": true,
+                    "result": { "applied": applied },
+                }),
+                Err(e) => serde_json::json!({ "success": false, "error": e.to_string() }),
             }
         }
+
+        IpcMessage::PlaylistRemove { name, path } => {
+            command_response(handle.playlist_remove(&name, &path))
+        }
+
+        IpcMessage::PlaylistActivate { name } => command_response(handle.playlist_activate(&name)),
+
+        IpcMessage::PlaylistDeactivate => command_response(handle.playlist_deactivate()),
+
+        IpcMessage::PlaylistDelete { name } => command_response(handle.playlist_delete(&name)),
+
+        // ------------------------------------------------------------------
+        // Content metadata
+        // ------------------------------------------------------------------
+        IpcMessage::ContentList {
+            offset,
+            limit,
+            include,
+            exclude,
+        } => match handle.content_list(offset, limit, include, exclude) {
+            Ok(result) => serde_json::json!({ "success": true, "result": result }),
+            Err(error) => {
+                serde_json::json!({ "success": false, "error": error.to_string() })
+            }
+        },
+
+        IpcMessage::ContentShow { target } => match handle.content_show(&target) {
+            Ok(result) => serde_json::json!({ "success": true, "result": result }),
+            Err(error) => {
+                serde_json::json!({ "success": false, "error": error.to_string() })
+            }
+        },
+
+        IpcMessage::ContentTag { target, kind, tags } => {
+            command_response(handle.content_tag(&target, &kind, tags))
+        }
+
+        IpcMessage::ContentRate { target, rating } => {
+            command_response(handle.content_rate(&target, rating))
+        }
+
+        IpcMessage::ContentClear { target } => command_response(handle.content_clear(&target)),
+        IpcMessage::SetFolder { path } => {
+            command_response(handle.set_folder(std::path::PathBuf::from(path)))
+        }
+
+        IpcMessage::Status
+        | IpcMessage::Stats
+        | IpcMessage::Reload
+        | IpcMessage::Quit
+        | IpcMessage::Pause { .. }
+        | IpcMessage::Resume
+        | IpcMessage::SubscribeEvents { .. }
+        | IpcMessage::GetCurrentWallpaper => serde_json::json!({
+            "success": false,
+            "error": "command is handled asynchronously"
+        }),
     }
 }
 
