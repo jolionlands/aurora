@@ -74,7 +74,16 @@ async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
 
         tracing::trace!(bytes = line.len(), "wiri event received");
 
-        if parse_event(&line)? && !enqueue_workspace(swap_tx) {
+        // One malformed event must not drop the subscription for a retry
+        // period; skip it and keep reading.
+        let is_switch = match parse_event(&line) {
+            Ok(is_switch) => is_switch,
+            Err(error) => {
+                tracing::warn!("ignoring malformed wiri event: {error}");
+                false
+            }
+        };
+        if is_switch && !enqueue_workspace(swap_tx) {
             // Receiver dropped — daemon is shutting down
             break;
         }
