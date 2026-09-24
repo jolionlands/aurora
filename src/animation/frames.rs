@@ -1,19 +1,28 @@
 //! Bounded decoding of animated GIF and WebP files into display-ready frames.
 //!
-//! Frames are composited by the `image` crate, then downscaled (never
-//! upscaled) to the smallest size that still covers the display. The result is
-//! bounded three ways: frames shown faster than `max-fps` are merged, the
-//! frame count is capped by merging evenly spaced neighbours, and the pixel
-//! budget is enforced by shrinking every frame when it would be exceeded.
+//! GIFs are decoded with the `gif` crate as palette indices and composited
+//! into one persistent canvas (disposal and transparency handled here), so
+//! memory stays near one canvas plus the stored output frames. WebP goes
+//! through the `image` crate's compositor.
+//!
+//! Every composited frame is downscaled once (never upscaled) with an integer
+//! area filter to the smallest size that covers the display and fits the
+//! memory budget. The result is bounded three ways: frames shown faster than
+//! `max-fps` or identical to their predecessor are merged, the frame count is
+//! capped by merging evenly spaced neighbours, and the byte budget is enforced
+//! by choosing the size up front (from a cheap GIF metadata pass) with an
+//! adaptive shrink as a safety net.
 
 use std::fs::File;
 use std::io::BufReader;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use image::imageops::FilterType;
-use image::{AnimationDecoder, RgbaImage};
+#[cfg(test)]
+use image::RgbaImage;
+use image::{AnimationDecoder, ImageBuffer, Rgba};
 
 use crate::decode::{MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS};
 
@@ -85,40 +94,184 @@ pub fn decode_animation(path: &Path, budget: &FrameBudget) -> Result<Option<Anim
             metadata.len()
         );
     }
-    let (width, height) = image::image_dimensions(path)
-        .with_context(|| format!("read dimensions of {}", path.display()))?;
+    match image::ImageFormat::from_path(path).ok() {
+        Some(image::ImageFormat::Gif) => decode_gif(path, budget),
+        Some(image::ImageFormat::WebP) => decode_webp(path, budget),
+        _ => Ok(None),
+    }
+    .with_context(|| format!("decode animation {}", path.display()))
+}
+
+fn open(path: &Path) -> Result<BufReader<File>> {
+    Ok(BufReader::new(
+        File::open(path).with_context(|| format!("open {}", path.display()))?,
+    ))
+}
+
+fn check_canvas(width: u32, height: u32) -> Result<()> {
     if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        bail!(
-            "animation {} is {width}x{height}; too large",
-            path.display()
-        );
+        bail!("canvas {width}x{height} is too large");
+    }
+    if width == 0 || height == 0 {
+        bail!("canvas has no area");
+    }
+    Ok(())
+}
+
+fn gif_options() -> gif::DecodeOptions {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    // Indexed output is one byte per pixel.
+    if let Some(limit) = NonZeroU64::new(MAX_IMAGE_PIXELS) {
+        options.set_memory_limit(gif::MemoryLimit::Bytes(limit));
+    }
+    options
+}
+
+fn gif_delay(centiseconds: u16) -> Duration {
+    source_delay((u32::from(centiseconds) * 10, 1))
+}
+
+/// Frame delays from GIF block headers only (no pixel decoding), used to
+/// size the output before any frame is decoded.
+fn gif_delays(path: &Path) -> Result<Vec<Duration>> {
+    let mut decoder = gif_options()
+        .read_info(open(path)?)
+        .context("read GIF header")?;
+    let mut delays = Vec::new();
+    while let Some(frame) = decoder.next_frame_info().context("read GIF frame header")? {
+        delays.push(gif_delay(frame.delay));
+        if delays.len() >= MAX_SOURCE_FRAMES {
+            break;
+        }
+    }
+    Ok(delays)
+}
+
+fn decode_gif(path: &Path, budget: &FrameBudget) -> Result<Option<Animation>> {
+    let delays = gif_delays(path)?;
+    if delays.len() < 2 {
+        return Ok(None);
+    }
+    let mut decoder = gif_options()
+        .read_info(open(path)?)
+        .context("read GIF header")?;
+    let (width, height) = (u32::from(decoder.width()), u32::from(decoder.height()));
+    check_canvas(width, height)?;
+    let global_palette = decoder.global_palette().map(<[u8]>::to_vec);
+    let mut canvas = GifCanvas::new(width as usize, height as usize);
+    let mut collector =
+        FrameCollector::new(budget, Some(planned_frames(&delays, budget.min_delay)));
+
+    while let Some(frame) = decoder.read_next_frame().context("decode GIF frame")? {
+        let palette = frame
+            .palette
+            .as_deref()
+            .or(global_palette.as_deref())
+            .context("GIF frame has no color table")?;
+        canvas.draw(frame, palette);
+        collector.push(&canvas.rgba, width, height, gif_delay(frame.delay))?;
+        canvas.dispose(frame);
+        if collector.is_full() {
+            break;
+        }
+    }
+    Ok(collector.finish())
+}
+
+fn decode_webp(path: &Path, budget: &FrameBudget) -> Result<Option<Animation>> {
+    let decoder = image::codecs::webp::WebPDecoder::new(open(path)?).context("read WebP header")?;
+    if !decoder.has_animation() {
+        return Ok(None);
+    }
+    let mut collector = FrameCollector::new(budget, None);
+    for frame in decoder.into_frames() {
+        let frame = frame.context("decode WebP frame")?;
+        let delay = source_delay(frame.delay().numer_denom_ms());
+        let buffer = frame.into_buffer();
+        check_canvas(buffer.width(), buffer.height())?;
+        collector.push(buffer.as_raw(), buffer.width(), buffer.height(), delay)?;
+        if collector.is_full() {
+            break;
+        }
+    }
+    Ok(collector.finish())
+}
+
+/// The GIF logical screen, composited frame by frame.
+struct GifCanvas {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    /// Pixels under the current frame, kept for `DisposalMethod::Previous`.
+    saved: Vec<u8>,
+}
+
+impl GifCanvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            rgba: vec![0; width * height * 4],
+            saved: Vec::new(),
+        }
     }
 
-    let reader =
-        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
-    let format = image::ImageFormat::from_path(path).ok();
-    let frames = match format {
-        Some(image::ImageFormat::Gif) => image::codecs::gif::GifDecoder::new(reader)
-            .context("read GIF header")?
-            .into_frames(),
-        Some(image::ImageFormat::WebP) => {
-            let decoder =
-                image::codecs::webp::WebPDecoder::new(reader).context("read WebP header")?;
-            if !decoder.has_animation() {
-                return Ok(None);
+    /// The frame rectangle clipped to the canvas: (left, top, width, height).
+    fn clip(&self, frame: &gif::Frame<'_>) -> (usize, usize, usize, usize) {
+        let left = usize::from(frame.left).min(self.width);
+        let top = usize::from(frame.top).min(self.height);
+        let width = usize::from(frame.width).min(self.width - left);
+        let height = usize::from(frame.height).min(self.height - top);
+        (left, top, width, height)
+    }
+
+    fn draw(&mut self, frame: &gif::Frame<'_>, palette: &[u8]) {
+        let (left, top, width, height) = self.clip(frame);
+        if frame.dispose == gif::DisposalMethod::Previous {
+            self.saved.clear();
+            for row in top..top + height {
+                let start = (row * self.width + left) * 4;
+                self.saved
+                    .extend_from_slice(&self.rgba[start..start + width * 4]);
             }
-            decoder.into_frames()
         }
-        _ => return Ok(None),
-    };
-    collect_frames(
-        frames.map(|frame| {
-            let frame = frame?;
-            let delay = source_delay(frame.delay().numer_denom_ms());
-            Ok((frame.into_buffer(), delay))
-        }),
-        budget,
-    )
+        let source_width = usize::from(frame.width);
+        for row in 0..height {
+            let source = &frame.buffer[row * source_width..][..width];
+            let start = ((top + row) * self.width + left) * 4;
+            let target = &mut self.rgba[start..start + width * 4];
+            for (pixel, &index) in target.chunks_exact_mut(4).zip(source) {
+                if Some(index) == frame.transparent {
+                    continue;
+                }
+                let color = usize::from(index) * 3;
+                if let Some(rgb) = palette.get(color..color + 3) {
+                    pixel.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+        }
+    }
+
+    fn dispose(&mut self, frame: &gif::Frame<'_>) {
+        let (left, top, width, height) = self.clip(frame);
+        match frame.dispose {
+            gif::DisposalMethod::Background => {
+                for row in top..top + height {
+                    let start = (row * self.width + left) * 4;
+                    self.rgba[start..start + width * 4].fill(0);
+                }
+            }
+            gif::DisposalMethod::Previous if self.saved.len() == width * height * 4 => {
+                for (index, row) in (top..top + height).enumerate() {
+                    let start = (row * self.width + left) * 4;
+                    self.rgba[start..start + width * 4]
+                        .copy_from_slice(&self.saved[index * width * 4..][..width * 4]);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn source_delay((numer, denom): (u32, u32)) -> Duration {
@@ -129,6 +282,21 @@ fn source_delay((numer, denom): (u32, u32)) -> Duration {
     } else {
         delay
     }
+}
+
+/// How many frames survive `min_delay` merging (the collector's rule).
+fn planned_frames(delays: &[Duration], min_delay: Duration) -> usize {
+    let mut kept = 0usize;
+    let mut last = Duration::MAX;
+    for &delay in delays {
+        if kept > 0 && last < min_delay {
+            last += delay;
+        } else {
+            kept += 1;
+            last = delay;
+        }
+    }
+    kept
 }
 
 /// Size that covers the display without upscaling the source.
@@ -165,22 +333,30 @@ fn frame_bytes(width: u32, height: u32) -> usize {
         .saturating_mul(4)
 }
 
-fn to_bgra(image: &RgbaImage) -> Box<[u8]> {
-    let mut bgra = image.as_raw().clone();
-    for pixel in bgra.chunks_exact_mut(4) {
+/// Downscale (integer area filter) or copy `rgba`, returning BGRA.
+fn scaled_bgra(rgba: &[u8], from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
+    let mut out = if from == to {
+        rgba.to_vec()
+    } else {
+        match ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(from.0, from.1, rgba) {
+            Some(view) => image::imageops::thumbnail(&view, to.0, to.1).into_raw(),
+            None => vec![0; frame_bytes(to.0, to.1)],
+        }
+    };
+    for pixel in out.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    bgra.into_boxed_slice()
+    out.into_boxed_slice()
 }
 
-fn resize_bgra(frame: &Frame, from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
-    // Channel order does not matter to the resampler.
-    let Some(image) = RgbaImage::from_raw(from.0, from.1, frame.bgra.to_vec()) else {
-        return vec![0; frame_bytes(to.0, to.1)].into_boxed_slice();
-    };
-    image::imageops::resize(&image, to.0, to.1, FilterType::Triangle)
-        .into_raw()
-        .into_boxed_slice()
+/// Rescale an already stored BGRA frame (channel order is irrelevant).
+fn rescale_stored(frame: &Frame, from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
+    match ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(from.0, from.1, &frame.bgra) {
+        Some(view) => image::imageops::thumbnail(&view, to.0, to.1)
+            .into_raw()
+            .into_boxed_slice(),
+        None => vec![0; frame_bytes(to.0, to.1)].into_boxed_slice(),
+    }
 }
 
 /// Merge each odd frame into its predecessor, halving the frame count while
@@ -196,80 +372,144 @@ fn halve_frames(frames: &mut Vec<Frame>) {
     *frames = kept;
 }
 
-/// Core of [`decode_animation`], separated so tests can feed synthetic frames.
+/// Turns a stream of composited RGBA canvases into a bounded [`Animation`].
+pub(crate) struct FrameCollector<'a> {
+    budget: &'a FrameBudget,
+    max_frames: usize,
+    /// Frame count expected after rate merging, when known in advance.
+    planned: Option<usize>,
+    frames: Vec<Frame>,
+    size: Option<(u32, u32)>,
+    /// After halving the frame list, only every `stride`-th source frame is
+    /// kept so later frames keep the same spacing.
+    stride: usize,
+    seen: usize,
+}
+
+impl<'a> FrameCollector<'a> {
+    pub(crate) fn new(budget: &'a FrameBudget, planned: Option<usize>) -> Self {
+        Self {
+            budget,
+            max_frames: budget.max_frames.max(2),
+            planned,
+            frames: Vec::new(),
+            size: None,
+            stride: 1,
+            seen: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.seen >= MAX_SOURCE_FRAMES
+    }
+
+    fn target_size(&mut self, width: u32, height: u32) -> (u32, u32) {
+        *self.size.get_or_insert_with(|| {
+            let (w, h) = cover_size(
+                width,
+                height,
+                self.budget.display_width,
+                self.budget.display_height,
+            );
+            let frames = self
+                .planned
+                .map_or(2, |planned| planned.min(self.max_frames))
+                .max(2);
+            budget_size(w, h, frames, self.budget.max_bytes)
+                .or_else(|| budget_size(w, h, 2, self.budget.max_bytes))
+                .unwrap_or((w.min(MIN_EDGE), h.min(MIN_EDGE)))
+        })
+    }
+
+    /// Offer the next composited canvas (`width` x `height` RGBA).
+    pub(crate) fn push(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        delay: Duration,
+    ) -> Result<()> {
+        let index = self.seen;
+        self.seen += 1;
+        if rgba.len() != frame_bytes(width, height) {
+            bail!("frame buffer does not match {width}x{height}");
+        }
+        let target = self.target_size(width, height);
+
+        // Too-fast frames extend the previous frame instead of being stored.
+        if let Some(previous) = self.frames.last_mut() {
+            if previous.delay < self.budget.min_delay || !index.is_multiple_of(self.stride) {
+                previous.delay += delay;
+                return Ok(());
+            }
+        }
+
+        let bgra = scaled_bgra(rgba, (width, height), target);
+        // Identical frames (common in GIFs that hold a pose) cost nothing.
+        if let Some(previous) = self.frames.last_mut() {
+            if previous.bgra == bgra {
+                previous.delay += delay;
+                return Ok(());
+            }
+        }
+        self.frames.push(Frame { bgra, delay });
+
+        if self.frames.len() > self.max_frames {
+            halve_frames(&mut self.frames);
+            self.stride = self.stride.saturating_mul(2);
+        }
+        let current = self.size.unwrap_or(target);
+        if frame_bytes(current.0, current.1).saturating_mul(self.frames.len())
+            > self.budget.max_bytes
+        {
+            match budget_size(
+                current.0,
+                current.1,
+                self.frames.len() * 2,
+                self.budget.max_bytes,
+            ) {
+                // Shrink now with headroom for as many frames again.
+                Some(smaller) => {
+                    for frame in &mut self.frames {
+                        frame.bgra = rescale_stored(frame, current, smaller);
+                    }
+                    self.size = Some(smaller);
+                }
+                // Already at the minimum size: drop frames instead.
+                None => {
+                    halve_frames(&mut self.frames);
+                    self.stride = self.stride.saturating_mul(2);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Option<Animation> {
+        if self.frames.len() < 2 {
+            return None;
+        }
+        let (width, height) = self.size.unwrap_or((0, 0));
+        Some(Animation {
+            width,
+            height,
+            frames: self.frames,
+        })
+    }
+}
+
+/// Collect an iterator of RGBA frames (used by tests).
+#[cfg(test)]
 pub(crate) fn collect_frames(
     source: impl Iterator<Item = image::ImageResult<(RgbaImage, Duration)>>,
     budget: &FrameBudget,
 ) -> Result<Option<Animation>> {
-    let max_frames = budget.max_frames.max(2);
-    let mut frames: Vec<Frame> = Vec::new();
-    let mut size: Option<(u32, u32)> = None;
-    // After halving the frame list, only every `stride`-th source frame is
-    // kept so later frames keep the same spacing.
-    let mut stride = 1usize;
-
-    for (index, item) in source.take(MAX_SOURCE_FRAMES).enumerate() {
+    let mut collector = FrameCollector::new(budget, None);
+    for item in source {
         let (image, delay) = item.context("decode animation frame")?;
-
-        let target = *size.get_or_insert_with(|| {
-            let (w, h) = cover_size(
-                image.width(),
-                image.height(),
-                budget.display_width,
-                budget.display_height,
-            );
-            // Always leave room for at least two frames at the chosen size.
-            budget_size(w, h, 2, budget.max_bytes).unwrap_or((w.min(MIN_EDGE), h.min(MIN_EDGE)))
-        });
-
-        // Too-fast frames extend the previous frame instead of being stored.
-        if let Some(previous) = frames.last_mut() {
-            if previous.delay < budget.min_delay || !index.is_multiple_of(stride) {
-                previous.delay += delay;
-                continue;
-            }
-        }
-
-        let bgra = if (image.width(), image.height()) == target {
-            to_bgra(&image)
-        } else {
-            let resized = image::imageops::resize(&image, target.0, target.1, FilterType::Triangle);
-            to_bgra(&resized)
-        };
-        frames.push(Frame { bgra, delay });
-
-        if frames.len() > max_frames {
-            halve_frames(&mut frames);
-            stride = stride.saturating_mul(2);
-        }
-        let current = size.unwrap_or(target);
-        if frame_bytes(current.0, current.1).saturating_mul(frames.len()) > budget.max_bytes {
-            match budget_size(current.0, current.1, frames.len() * 2, budget.max_bytes) {
-                // Shrink now with headroom for as many frames again.
-                Some(smaller) => {
-                    for frame in &mut frames {
-                        frame.bgra = resize_bgra(frame, current, smaller);
-                    }
-                    size = Some(smaller);
-                }
-                // Already at the minimum size: drop frames instead.
-                None => {
-                    halve_frames(&mut frames);
-                    stride = stride.saturating_mul(2);
-                }
-            }
-        }
+        collector.push(image.as_raw(), image.width(), image.height(), delay)?;
     }
-
-    if frames.len() < 2 {
-        return Ok(None);
-    }
-    let (width, height) = size.unwrap_or((0, 0));
-    Ok(Some(Animation {
-        width,
-        height,
-        frames,
-    }))
+    Ok(collector.finish())
 }
 
 #[cfg(test)]
@@ -386,6 +626,109 @@ mod tests {
         );
         assert!(animation.width >= MIN_EDGE);
         assert_eq!(animation.loop_duration(), Duration::from_millis(16_000));
+    }
+
+    /// A 4x4 GIF exercising sub-rectangles, transparency, and every disposal.
+    fn disposal_gif(path: &Path) {
+        use gif::{DisposalMethod, Encoder, Frame as GifFrame, Repeat};
+        // 0 red, 1 green, 2 blue, 3 white (transparent in overlays)
+        let palette = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let mut encoder = Encoder::new(File::create(path).unwrap(), 4, 4, &palette).unwrap();
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        let mut write = |left, top, w, h, pixels: Vec<u8>, dispose, transparent| {
+            let mut frame = GifFrame::from_indexed_pixels(w, h, pixels, transparent);
+            frame.left = left;
+            frame.top = top;
+            frame.delay = 10;
+            frame.dispose = dispose;
+            encoder.write_frame(&frame).unwrap();
+        };
+        // Full red background, kept.
+        write(0, 0, 4, 4, vec![0; 16], DisposalMethod::Keep, None);
+        // Green 2x2 with a transparent corner, restored to previous after.
+        write(
+            1,
+            1,
+            2,
+            2,
+            vec![1, 1, 1, 3],
+            DisposalMethod::Previous,
+            Some(3),
+        );
+        // Blue 2x2 at the origin, cleared to background after.
+        write(0, 0, 2, 2, vec![2; 4], DisposalMethod::Background, None);
+        // Green column overlapping the cleared area, kept.
+        write(1, 0, 1, 4, vec![1; 4], DisposalMethod::Keep, None);
+    }
+
+    #[test]
+    fn native_gif_compositing_matches_the_image_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disposal.gif");
+        disposal_gif(&path);
+
+        let ours = decode_animation(&path, &budget(1 << 30, 100, 0))
+            .unwrap()
+            .unwrap();
+        let reference: Vec<RgbaImage> =
+            image::codecs::gif::GifDecoder::new(BufReader::new(File::open(&path).unwrap()))
+                .unwrap()
+                .into_frames()
+                .map(|frame| frame.unwrap().into_buffer())
+                .collect();
+        assert_eq!(reference.len(), 4);
+        assert_eq!(ours.frames.len(), 4);
+        for (index, (frame, expected)) in ours.frames.iter().zip(&reference).enumerate() {
+            let mut rgba = frame.bgra.to_vec();
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            // Transparent pixels only need to agree on transparency.
+            for (a, b) in rgba.chunks_exact(4).zip(expected.as_raw().chunks_exact(4)) {
+                if a[3] == 0 || b[3] == 0 {
+                    assert_eq!(a[3], b[3], "frame {index} transparency");
+                } else {
+                    assert_eq!(a, b, "frame {index} color");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identical_frames_merge_and_malformed_rects_are_clipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hold.gif");
+        {
+            use gif::{Encoder, Frame as GifFrame, Repeat};
+            let palette = [0, 0, 0, 255, 255, 255];
+            let mut encoder = Encoder::new(File::create(&path).unwrap(), 4, 4, &palette).unwrap();
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for (index, color) in [0u8, 0, 0, 1].into_iter().enumerate() {
+                let mut frame = GifFrame::from_indexed_pixels(4, 4, vec![color; 16], None);
+                frame.delay = 10 + index as u16;
+                encoder.write_frame(&frame).unwrap();
+            }
+            // A frame hanging off the canvas must not panic.
+            let mut frame = GifFrame::from_indexed_pixels(4, 4, vec![0; 16], None);
+            frame.left = 2;
+            frame.top = 3;
+            frame.delay = 10;
+            encoder.write_frame(&frame).unwrap();
+        }
+        let animation = decode_animation(&path, &budget(1 << 30, 100, 0))
+            .unwrap()
+            .unwrap();
+        // Three identical black frames collapse into one 330 ms frame.
+        assert_eq!(animation.frames.len(), 3);
+        assert_eq!(animation.frames[0].delay, Duration::from_millis(330));
+    }
+
+    #[test]
+    fn planned_frames_follows_the_merge_rule() {
+        let ms = Duration::from_millis;
+        assert_eq!(planned_frames(&[ms(33); 10], ms(66)), 5);
+        assert_eq!(planned_frames(&[ms(100); 7], ms(66)), 7);
+        assert_eq!(planned_frames(&[], ms(66)), 0);
     }
 
     #[test]

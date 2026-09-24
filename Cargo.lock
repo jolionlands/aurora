@@ -93,6 +93,7 @@ dependencies = [
  "base64",
  "blake3",
  "clap",
+ "gif",
  "image",
  "parking_lot",
  "rand",
