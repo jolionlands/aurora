@@ -262,37 +262,75 @@ fn inspect_wallpapers_in_child() -> Result<Vec<MonitorSnapshot>> {
     serde_json::from_slice(&output.stdout).context("parse wallpaper inspection helper output")
 }
 
-fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Result<Output> {
-    let started = Instant::now();
+/// Largest helper stdout/stderr Aurora keeps; helpers print a few KB at most.
+const MAX_HELPER_OUTPUT: u64 = 1024 * 1024;
 
-    loop {
-        if child
-            .try_wait()
-            .context("poll wallpaper apply helper")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("collect wallpaper apply helper output");
+/// Wait for a helper without polling, draining its pipes concurrently so a
+/// chatty helper cannot block on a full pipe until the timeout kills it.
+fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Result<Output> {
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|pipe| {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.take(MAX_HELPER_OUTPUT).read_to_end(&mut buffer);
+                buffer
+            })
+        })
+    }
+    let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        reader
+            .map(|reader| reader.join().unwrap_or_default())
+            .unwrap_or_default()
+    };
+
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    let waited = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), millis) };
+
+    if waited == WAIT_TIMEOUT {
+        let kill_error = child.kill().err();
+        // Reap the helper (closing its pipes) before joining the readers. A
+        // failed kill is fine if the helper exited on its own meanwhile.
+        let terminated = match kill_error {
+            None => child.wait().is_ok(),
+            Some(_) => child.try_wait().ok().flatten().is_some(),
+        };
+        if terminated {
+            collect(stdout);
+            collect(stderr);
         }
-        if started.elapsed() >= timeout {
-            if let Err(error) = child.kill() {
-                if child.try_wait().ok().flatten().is_none() {
-                    anyhow::bail!(
-                        "wallpaper helper timed out after {} milliseconds and could not be terminated: {error}",
-                        timeout.as_millis()
-                    );
-                }
-            } else {
-                let _ = child.wait();
-            }
+        // Otherwise the readers are detached: joining would block on pipes
+        // the surviving helper still holds open.
+        if let (Some(error), false) = (kill_error, terminated) {
             anyhow::bail!(
-                "wallpaper helper timed out after {} milliseconds",
+                "wallpaper helper timed out after {} milliseconds and could not be terminated: {error}",
                 timeout.as_millis()
             );
         }
-        std::thread::sleep(Duration::from_millis(25));
+        anyhow::bail!(
+            "wallpaper helper timed out after {} milliseconds",
+            timeout.as_millis()
+        );
     }
+    if waited != WAIT_OBJECT_0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        collect(stdout);
+        collect(stderr);
+        anyhow::bail!("waiting for wallpaper helper failed: {waited:?}");
+    }
+    let status = child.wait().context("collect wallpaper helper status")?;
+    Ok(Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    })
 }
 
 fn indexed_hash(index: &PhotoIndex, path: &Path) -> Option<String> {
@@ -5547,6 +5585,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("timed out after 50 milliseconds"));
+    }
+
+    #[test]
+    fn helper_output_larger_than_a_pipe_buffer_does_not_deadlock() {
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Error.Write('e' * 200000); [Console]::Out.Write('o' * 200000)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW.0);
+
+        let output = wait_for_helper_child(
+            command.spawn().expect("start chatty helper"),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
     }
 
     // -----------------------------------------------------------------------
