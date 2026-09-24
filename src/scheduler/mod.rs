@@ -4,11 +4,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::config::types::ScheduleConfig;
 
 pub const SWAP_QUEUE_CAPACITY: usize = 4;
+
+/// First retry delay after a failed automatic swap; doubles per failure.
+const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Longest retry delay after repeated failures.
+const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+/// While a due swap is held back by the fullscreen or idle policy, look again
+/// this often.
+const POLICY_RECHECK: Duration = Duration::from_secs(15);
+/// Retry delay when a due swap could not be queued.
+const QUEUE_FULL_RETRY: Duration = Duration::from_secs(1);
+/// Upper bound on one sleep, so wall-clock changes (at-mode) and missed timer
+/// wakeups after resume are noticed.
+const MAX_SLEEP: Duration = Duration::from_secs(10 * 60);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,18 +49,41 @@ struct SchedulerProgressState {
     last_at_fired: Option<(u32, u32)>,
     pending_interval: bool,
     pending_at: Option<(u32, u32)>,
+    /// Consecutive failed automatic swaps; drives the retry backoff.
+    failures: u32,
+    /// No automatic swap before this instant (set after a failure).
+    retry_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct SchedulerProgressInner {
+    state: Mutex<SchedulerProgressState>,
+    /// Wakes the scheduler when a completion changes the next due time.
+    changed: Notify,
 }
 
 /// Completion state shared with the runtime. Queueing does not count as a
 /// wallpaper change; only the runtime can record a successful apply.
 #[derive(Clone, Default)]
-pub struct SchedulerProgress(Arc<Mutex<SchedulerProgressState>>);
+pub struct SchedulerProgress(Arc<SchedulerProgressInner>);
+
+fn failure_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    FAILURE_BACKOFF_BASE
+        .saturating_mul(1 << doublings)
+        .min(FAILURE_BACKOFF_MAX)
+}
 
 impl SchedulerProgress {
     /// Start interval cadence from daemon readiness when Windows already has
     /// a wallpaper, instead of replacing it immediately on every restart.
     pub fn seed_success(&self) {
-        self.0.lock().last_success.get_or_insert_with(Instant::now);
+        self.0
+            .state
+            .lock()
+            .last_success
+            .get_or_insert_with(Instant::now);
+        self.0.changed.notify_one();
     }
 
     pub fn complete(&self, reason: &SwapReason, succeeded: bool) {
@@ -61,7 +97,7 @@ impl SchedulerProgress {
     }
 
     fn complete_at(&self, reason: &SwapReason, succeeded: bool, now: Instant) {
-        let mut state = self.0.lock();
+        let mut state = self.0.state.lock();
         let at_slot = match reason {
             SwapReason::Interval => {
                 state.pending_interval = false;
@@ -70,8 +106,17 @@ impl SchedulerProgress {
             SwapReason::AtTime => state.pending_at.take(),
             _ => None,
         };
+        let automatic = matches!(reason, SwapReason::Interval | SwapReason::AtTime);
+        if !succeeded && automatic {
+            // Back off instead of re-spawning helpers every tick while the
+            // library, a playlist, or the shell keeps failing.
+            state.failures = state.failures.saturating_add(1);
+            state.retry_at = now.checked_add(failure_backoff(state.failures));
+        }
         if succeeded {
-            if !matches!(reason, SwapReason::Interval | SwapReason::AtTime) {
+            state.failures = 0;
+            state.retry_at = None;
+            if !automatic {
                 state.pending_interval = false;
                 if let Some(slot) = state.pending_at.take() {
                     state.last_at_fired = Some(slot);
@@ -82,10 +127,12 @@ impl SchedulerProgress {
                 state.last_at_fired = Some(slot);
             }
         }
+        drop(state);
+        self.0.changed.notify_one();
     }
 
     fn begin_automatic(&self, reason: &SwapReason, at_slot: Option<(u32, u32)>) -> bool {
-        let mut state = self.0.lock();
+        let mut state = self.0.state.lock();
         match reason {
             SwapReason::Interval if !state.pending_interval => {
                 state.pending_interval = true;
@@ -104,7 +151,7 @@ impl SchedulerProgress {
     }
 
     fn cancel_automatic(&self, reason: &SwapReason) {
-        let mut state = self.0.lock();
+        let mut state = self.0.state.lock();
         match reason {
             SwapReason::Interval => state.pending_interval = false,
             SwapReason::AtTime => state.pending_at = None,
@@ -113,7 +160,7 @@ impl SchedulerProgress {
     }
 
     pub fn should_process(&self, reason: &SwapReason) -> bool {
-        let state = self.0.lock();
+        let state = self.0.state.lock();
         match reason {
             SwapReason::Interval => state.pending_interval,
             SwapReason::AtTime => state.pending_at.is_some(),
@@ -121,19 +168,47 @@ impl SchedulerProgress {
         }
     }
 
+    /// True if `slot` has neither fired successfully nor is queued.
+    fn at_slot_open(&self, slot: (u32, u32)) -> bool {
+        let state = self.0.state.lock();
+        state.pending_at.is_none() && state.last_at_fired != Some(slot)
+    }
+
     fn roll_minute(&self, current_hm: (u32, u32)) {
-        let mut state = self.0.lock();
+        let mut state = self.0.state.lock();
         if state.last_at_fired.is_some_and(|fired| fired != current_hm) {
             state.last_at_fired = None;
         }
     }
 
     fn interval_due(&self, interval: Duration, now: Instant) -> bool {
-        let state = self.0.lock();
-        !state.pending_interval
-            && state
-                .last_success
-                .is_none_or(|last| now.duration_since(last) >= interval)
+        self.next_interval_due(interval, now)
+            .is_some_and(|due| due <= now)
+    }
+
+    /// When the next interval swap is due, or `None` while one is queued.
+    fn next_interval_due(&self, interval: Duration, now: Instant) -> Option<Instant> {
+        let state = self.0.state.lock();
+        if state.pending_interval {
+            return None;
+        }
+        let cadence = state
+            .last_success
+            .and_then(|last| last.checked_add(interval));
+        match (cadence, state.retry_at) {
+            (Some(cadence), Some(retry)) => Some(cadence.max(retry)),
+            (Some(due), None) | (None, Some(due)) => Some(due),
+            (None, None) => Some(now),
+        }
+    }
+
+    /// Earliest instant an automatic at-time swap may be retried.
+    fn retry_at(&self) -> Option<Instant> {
+        self.0.state.lock().retry_at
+    }
+
+    async fn changed(&self) {
+        self.0.changed.notified().await;
     }
 }
 
@@ -172,59 +247,110 @@ impl Scheduler {
     // -----------------------------------------------------------------------
 
     /// Long-running async task.  Never returns unless cancelled.
+    ///
+    /// Sleeps until the next swap is due instead of polling: an interval
+    /// schedule wakes once per interval, an at-schedule once per configured
+    /// time, and a completion from the runtime wakes it early to recompute.
     pub async fn run(&self) {
-        let mut interval_ticker = tokio::time::interval(Duration::from_secs(1));
         let at_times = parse_at_times(&self.config.at_times);
+        let interval = Duration::from_secs(self.config.interval_secs);
 
         loop {
-            interval_ticker.tick().await;
-
-            // Fullscreen check
-            if self.config.pause_when_fullscreen && is_fullscreen_active() {
+            let now = Instant::now();
+            let due = self.next_due(interval, &at_times, now);
+            let sleep = due
+                .map(|due| due.saturating_duration_since(now))
+                .unwrap_or(MAX_SLEEP)
+                .min(MAX_SLEEP);
+            if !sleep.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep) => {}
+                    _ = self.progress.changed() => {}
+                }
                 continue;
             }
 
-            // Idle threshold means pause scheduling while the user is away.
-            if self.config.pause_when_idle_secs > 0 {
-                let idle_secs = get_idle_secs();
-                if idle_secs >= self.config.pause_when_idle_secs as u64 {
-                    // System is idle; skip scheduled swaps.
-                    continue;
-                }
-            }
-
-            // at_times check
-            let current_hm = local_hour_minute();
-            self.progress.roll_minute(current_hm);
-
-            let should_at_fire = should_fire_at(&self.config.mode, &at_times, current_hm);
-
-            if should_at_fire
-                && self.try_enqueue_automatic(
-                    SwapRequest {
-                        reason: SwapReason::AtTime,
-                        specific: None,
-                    },
-                    Some(current_hm),
-                )
-            {
+            let retry = if self.policy_blocks() {
+                POLICY_RECHECK
+            } else if self.fire_due(interval, &at_times) {
                 continue;
-            }
-
-            // Interval check
-            if self.config.mode == "interval" {
-                let interval = Duration::from_secs(self.config.interval_secs);
-                if self.progress.interval_due(interval, Instant::now()) {
-                    self.try_enqueue_automatic(
-                        SwapRequest {
-                            reason: SwapReason::Interval,
-                            specific: None,
-                        },
-                        None,
-                    );
-                }
+            } else {
+                // Due but not queued (queue full of manual requests): wait
+                // for the runtime instead of spinning.
+                QUEUE_FULL_RETRY
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(retry) => {}
+                _ = self.progress.changed() => {}
             }
         }
+    }
+
+    /// Fullscreen and idle policies hold back automatic swaps while active.
+    fn policy_blocks(&self) -> bool {
+        (self.config.pause_when_fullscreen && is_fullscreen_active())
+            || (self.config.pause_when_idle_secs > 0
+                && get_idle_secs() >= u64::from(self.config.pause_when_idle_secs))
+    }
+
+    /// The next instant something may be due, or `None` when only a runtime
+    /// completion can make progress.
+    fn next_due(
+        &self,
+        interval: Duration,
+        at_times: &[(u32, u32)],
+        now: Instant,
+    ) -> Option<Instant> {
+        match self.config.mode.as_str() {
+            "interval" => self.progress.next_interval_due(interval, now),
+            "at" => {
+                let current = local_time();
+                self.progress.roll_minute((current.0, current.1));
+                if should_fire_at(&self.config.mode, at_times, (current.0, current.1))
+                    && self.progress.at_slot_open((current.0, current.1))
+                {
+                    let retry = self.progress.retry_at().filter(|retry| *retry > now);
+                    // A retry after the slot's minute has passed is moot.
+                    let minute_left = Duration::from_secs(u64::from(60 - current.2.min(59)));
+                    return match retry {
+                        Some(retry) if retry.saturating_duration_since(now) < minute_left => {
+                            Some(retry)
+                        }
+                        Some(_) => now.checked_add(minute_left),
+                        None => Some(now),
+                    };
+                }
+                now.checked_add(until_next_at_time(at_times, current))
+            }
+            _ => None,
+        }
+    }
+
+    /// Queue whatever is due. Returns false if nothing could be queued.
+    fn fire_due(&self, interval: Duration, at_times: &[(u32, u32)]) -> bool {
+        let (hour, minute, _) = local_time();
+        let current_hm = (hour, minute);
+        self.progress.roll_minute(current_hm);
+        if should_fire_at(&self.config.mode, at_times, current_hm)
+            && self.try_enqueue_automatic(
+                SwapRequest {
+                    reason: SwapReason::AtTime,
+                    specific: None,
+                },
+                Some(current_hm),
+            )
+        {
+            return true;
+        }
+        self.config.mode == "interval"
+            && self.progress.interval_due(interval, Instant::now())
+            && self.try_enqueue_automatic(
+                SwapRequest {
+                    reason: SwapReason::Interval,
+                    specific: None,
+                },
+                None,
+            )
     }
 
     fn try_enqueue_automatic(&self, request: SwapRequest, at_slot: Option<(u32, u32)>) -> bool {
@@ -286,9 +412,38 @@ pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
 // Windows platform helpers
 // ---------------------------------------------------------------------------
 
-fn local_hour_minute() -> (u32, u32) {
+/// Local wall-clock `(hour, minute, second)`.
+fn local_time() -> (u32, u32, u32) {
     let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    (u32::from(now.wHour), u32::from(now.wMinute))
+    (
+        u32::from(now.wHour),
+        u32::from(now.wMinute),
+        u32::from(now.wSecond),
+    )
+}
+
+/// Time from `current` until the start of the next configured `HH:MM`
+/// minute (strictly later than the current minute).
+fn until_next_at_time(
+    at_times: &[(u32, u32)],
+    (hour, minute, second): (u32, u32, u32),
+) -> Duration {
+    let now_minutes = hour * 60 + minute;
+    let minutes = at_times
+        .iter()
+        .map(|(h, m)| {
+            let slot = h * 60 + m;
+            let ahead = (slot + 24 * 60 - now_minutes) % (24 * 60);
+            if ahead == 0 {
+                24 * 60
+            } else {
+                ahead
+            }
+        })
+        .min()
+        .unwrap_or(24 * 60);
+    Duration::from_secs(u64::from(minutes) * 60)
+        .saturating_sub(Duration::from_secs(u64::from(second.min(59))))
 }
 
 /// Returns true if the foreground window covers an entire monitor.
@@ -432,7 +587,9 @@ mod tests {
         assert!(progress.interval_due(interval, start));
         assert!(progress.begin_automatic(&SwapReason::Interval, None));
         progress.complete_at(&SwapReason::Interval, false, start);
-        assert!(progress.interval_due(interval, start));
+        // A failure retries after the backoff, not on the next tick.
+        assert!(!progress.interval_due(interval, start));
+        assert!(progress.interval_due(interval, start + FAILURE_BACKOFF_BASE));
 
         assert!(progress.begin_automatic(&SwapReason::Interval, None));
         progress.complete_at(&SwapReason::Interval, true, start);
@@ -486,9 +643,74 @@ mod tests {
 
     #[test]
     fn local_time_is_valid() {
-        let (hour, minute) = local_hour_minute();
+        let (hour, minute, second) = local_time();
         assert!(hour < 24);
         assert!(minute < 60);
+        assert!(second < 61);
+    }
+
+    #[test]
+    fn next_at_time_is_computed_not_polled() {
+        let times = [(9, 30), (17, 0)];
+        assert_eq!(
+            until_next_at_time(&times, (9, 0, 0)),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            until_next_at_time(&times, (9, 29, 30)),
+            Duration::from_secs(30)
+        );
+        // The current slot's minute never counts as "next".
+        assert_eq!(
+            until_next_at_time(&times, (9, 30, 0)),
+            Duration::from_secs((17 * 60 - (9 * 60 + 30)) * 60)
+        );
+        // Wraps past midnight.
+        assert_eq!(
+            until_next_at_time(&times, (23, 0, 0)),
+            Duration::from_secs((10 * 60 + 30) * 60)
+        );
+    }
+
+    #[test]
+    fn repeated_failures_back_off_exponentially_up_to_a_cap() {
+        assert_eq!(failure_backoff(1), Duration::from_secs(30));
+        assert_eq!(failure_backoff(2), Duration::from_secs(60));
+        assert_eq!(failure_backoff(4), Duration::from_secs(240));
+        assert_eq!(failure_backoff(50), FAILURE_BACKOFF_MAX);
+
+        let progress = SchedulerProgress::default();
+        let start = Instant::now();
+        let interval = Duration::from_secs(3600);
+        for _ in 0..3 {
+            assert!(progress.begin_automatic(&SwapReason::Interval, None));
+            progress.complete_at(&SwapReason::Interval, false, start);
+        }
+        assert!(!progress.interval_due(interval, start + Duration::from_secs(119)));
+        assert!(progress.interval_due(interval, start + Duration::from_secs(120)));
+
+        // A manual failure does not extend the automatic backoff, and any
+        // success clears it.
+        progress.complete_at(&SwapReason::Manual, false, start);
+        assert!(progress.interval_due(interval, start + Duration::from_secs(120)));
+        progress.complete_at(&SwapReason::Manual, true, start);
+        assert!(!progress.interval_due(interval, start + Duration::from_secs(120)));
+        assert!(progress.interval_due(interval, start + interval));
+    }
+
+    #[tokio::test]
+    async fn completion_wakes_a_sleeping_scheduler() {
+        let progress = SchedulerProgress::default();
+        let waiter = {
+            let progress = progress.clone();
+            tokio::spawn(async move { progress.changed().await })
+        };
+        tokio::task::yield_now().await;
+        progress.complete(&SwapReason::Manual, true);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("completion should wake the scheduler")
+            .unwrap();
     }
 
     #[test]

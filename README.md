@@ -304,13 +304,16 @@ failed items remain retryable.
 
 In `interval` mode, cadence is measured from the last successful wallpaper
 change, including a manual change. If Aurora starts with an existing wallpaper,
-it starts that cadence without immediately replacing the image. Failed applies
-remain eligible to retry, while duplicate automatic requests are coalesced.
+it starts that cadence without immediately replacing the image. A failed
+automatic apply is retried after 30 seconds, and the delay doubles with each
+further failure, up to 30 minutes. Duplicate automatic requests are coalesced.
+The scheduler sleeps until the next swap is due instead of polling.
 
 In `at` mode, each configured `at "HH:MM"` slot is recorded only after a
 successful apply, preventing duplicate successful fires while allowing a
 failure to retry during that minute. Fullscreen and idle policies suppress
-automatic scheduling while active. `aurora-ctl pause` also blocks automatic and
+automatic scheduling while active. A held-back swap is checked again every 15
+seconds. `aurora-ctl pause` also blocks automatic and
 workspace-triggered changes, while manual `next`, `prev`, and `set` commands
 remain available.
 
