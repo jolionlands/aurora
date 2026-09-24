@@ -296,11 +296,20 @@ fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Result<Output> 
 }
 
 fn indexed_hash(index: &PhotoIndex, path: &Path) -> Option<String> {
-    index
-        .photos
-        .iter()
-        .find(|entry| entry.path == path)
-        .map(|entry| entry.hash.clone())
+    indexed_entry_for_path(index, path).map(|entry| entry.hash.clone())
+}
+
+/// `\\?\C:\x` -> `C:\x` and `\\?\UNC\s\x` -> `\\s\x`, so a canonicalized path
+/// compares equal to the plain path an index scan recorded.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn target_hash(
@@ -928,13 +937,28 @@ struct ResolvedContent {
     height: Option<u32>,
 }
 
+/// Find the index entry for `path` without touching the disk in the common
+/// case. Callers often pass canonical (`\\?\`) paths while the index keeps
+/// the scanned spelling, so both forms are compared first. Only a real
+/// spelling difference (case, `..`, links) falls back to canonicalizing, and
+/// then only for entries with the same file name.
 fn indexed_entry_for_path<'a>(index: &'a PhotoIndex, path: &Path) -> Option<&'a PhotoEntry> {
-    if let Some(entry) = index.photos.iter().find(|entry| entry.path == path) {
+    let plain = strip_verbatim_prefix(path);
+    if let Some(entry) = index
+        .photos
+        .iter()
+        .find(|entry| entry.path == path || entry.path == plain)
+    {
         return Some(entry);
     }
     let canonical = std::fs::canonicalize(path).ok()?;
+    let name = canonical.file_name()?.to_string_lossy().to_lowercase();
     index.photos.iter().find(|entry| {
-        std::fs::canonicalize(&entry.path).is_ok_and(|entry_path| entry_path == canonical)
+        entry
+            .path
+            .file_name()
+            .is_some_and(|entry_name| entry_name.to_string_lossy().to_lowercase() == name)
+            && std::fs::canonicalize(&entry.path).is_ok_and(|entry_path| entry_path == canonical)
     })
 }
 
@@ -5452,6 +5476,36 @@ mod tests {
     // -----------------------------------------------------------------------
     // test_runtime_first_swap_no_transition
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_paths_find_scanned_entries_without_rehashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Lake.PNG");
+        std::fs::write(&file, b"not decoded").unwrap();
+        let mut index = PhotoIndex::default();
+        index.photos.push(crate::index::PhotoEntry {
+            path: file.clone(),
+            width: Some(1),
+            height: Some(1),
+            hash: "a".repeat(64),
+            banned: false,
+        });
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(
+            strip_verbatim_prefix(&canonical),
+            PathBuf::from(&canonical.to_string_lossy()[4..])
+        );
+        assert_eq!(indexed_hash(&index, &canonical), Some("a".repeat(64)));
+        // A different spelling of the same file still resolves.
+        let lower = dir.path().join("lake.png");
+        assert_eq!(indexed_hash(&index, &lower), Some("a".repeat(64)));
+        assert_eq!(indexed_hash(&index, &dir.path().join("other.png")), None);
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\a.jpg")),
+            PathBuf::from(r"\\server\share\a.jpg")
+        );
+    }
 
     #[test]
     fn transition_decode_requires_enabled_transition_and_previous_image() {
