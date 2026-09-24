@@ -60,49 +60,87 @@ fn input_desktop_locked() -> bool {
     }
 }
 
-/// The foreground window's monitor rectangle, when that window is maximized
-/// or fullscreen and therefore hides the desktop on that monitor.
-pub fn covered_monitor() -> Option<Rect> {
+/// Monitors hidden behind a visible maximized or fullscreen window.
+///
+/// Every top-level window is considered, not just the foreground one: a
+/// maximized editor stays in front of the desktop while a small dialog has
+/// focus. Cloaked windows (other virtual desktops, suspended UWP) and
+/// click-through overlays do not count.
+pub fn covered_monitors() -> Vec<Rect> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let covered = &mut *(lparam.0 as *mut Vec<Rect>);
+        if let Some(rect) = monitor_covered_by(hwnd) {
+            if !covered.iter().any(|known| same_rect(known, &rect)) {
+                covered.push(rect);
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut covered = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(&mut covered as *mut Vec<Rect> as isize));
+    }
+    covered
+}
+
+/// The monitor `hwnd` hides, if it is a visible maximized/fullscreen window.
+unsafe fn monitor_covered_by(hwnd: windows::Win32::Foundation::HWND) -> Option<Rect> {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowRect, IsIconic, IsWindowVisible, IsZoomed,
+        GetClassNameW, GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, IsZoomed,
+        GWL_EXSTYLE, WS_EX_TRANSPARENT,
     };
 
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return None;
-        }
-        let mut class = [0u16; 32];
-        let len = GetClassNameW(hwnd, &mut class) as usize;
-        if is_desktop_class(&String::from_utf16_lossy(&class[..len.min(class.len())])) {
-            return None;
-        }
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-        if monitor.is_invalid() {
-            return None;
-        }
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return None;
-        }
-        let mut window = RECT::default();
-        if GetWindowRect(hwnd, &mut window).is_err() {
-            return None;
-        }
-        covers(
-            IsZoomed(hwnd).as_bool(),
-            &window,
-            &info.rcMonitor,
-            &info.rcWork,
-        )
-        .then(|| rect_from(&info.rcMonitor))
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return None;
     }
+    if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0 {
+        return None; // click-through overlay
+    }
+    let mut cloaked = 0u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        (&mut cloaked as *mut u32).cast(),
+        std::mem::size_of::<u32>() as u32,
+    )
+    .is_ok()
+        && cloaked != 0
+    {
+        return None;
+    }
+    let mut class = [0u16; 32];
+    let len = GetClassNameW(hwnd, &mut class) as usize;
+    if is_desktop_class(&String::from_utf16_lossy(&class[..len.min(class.len())])) {
+        return None;
+    }
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    if monitor.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return None;
+    }
+    let mut window = RECT::default();
+    GetWindowRect(hwnd, &mut window).ok()?;
+    covers(
+        IsZoomed(hwnd).as_bool(),
+        &window,
+        &info.rcMonitor,
+        &info.rcWork,
+    )
+    .then(|| rect_from(&info.rcMonitor))
 }
 
 fn is_desktop_class(class: &str) -> bool {
@@ -178,6 +216,14 @@ mod tests {
             ..AnimatedConfig::default()
         };
         assert!(!pause_everywhere(&config, on_battery));
+    }
+
+    #[test]
+    fn covered_monitor_scan_is_fast_and_sane() {
+        let started = std::time::Instant::now();
+        let covered = covered_monitors();
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert!(covered.iter().all(|rect| rect.width > 0 && rect.height > 0));
     }
 
     #[test]

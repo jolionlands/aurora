@@ -447,9 +447,9 @@ impl PlayerLoop {
         }
         self.manage_long_freeze(frozen_everywhere, now);
         let covered = if self.config.pause_when_covered && !frozen_everywhere {
-            policy::covered_monitor()
+            policy::covered_monitors()
         } else {
-            None
+            Vec::new()
         };
 
         // Explorer restarts destroy the shell windows and ours with them.
@@ -475,7 +475,9 @@ impl PlayerLoop {
                 playing.window = None;
             }
             let frozen = frozen_everywhere
-                || covered.is_some_and(|rect| policy::same_rect(&rect, &display.target.bounds));
+                || covered
+                    .iter()
+                    .any(|rect| policy::same_rect(rect, &display.target.bounds));
             if playing.frozen && !frozen {
                 playing.next_due = now; // resume promptly, from the current frame
             }
