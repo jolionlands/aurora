@@ -55,8 +55,7 @@ struct Args {
     unregister_autostart: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     enable_dpi_awareness();
 
     // ---------------------------------------------------------------------------
@@ -114,6 +113,19 @@ async fn main() -> Result<()> {
     // 2. Reserve this session's authoritative IPC endpoint before startup work.
     // ---------------------------------------------------------------------------
     let _singleton = aurora::ipc::SingletonGuard::acquire()?;
+
+    // Helpers and duplicate launches never need an async worker pool. The
+    // daemon has a few I/O tasks; decoding stays on this COM root thread and
+    // blocking IPC work uses Tokio's separate blocking pool.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("initialize daemon async runtime")?
+        .block_on(run_daemon())
+}
+
+async fn run_daemon() -> Result<()> {
     let ipc = Arc::new(IpcServer::bind()?);
 
     // ---------------------------------------------------------------------------

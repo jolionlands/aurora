@@ -20,6 +20,11 @@ in your way. It uses native Windows wallpaper and graphics APIs, exposes a
 scriptable command-line client, and remembers image metadata by exact content
 rather than fragile file paths.
 
+The daemon uses two async workers, with apartment-bound image decoding on its
+main thread. Short-lived wallpaper helpers and duplicate launches do not create
+an async worker pool. The decoded-image cache grows on demand up to its configured
+limit; with transitions disabled, wallpaper commits bypass that decode cache.
+
 ## Highlights
 
 | | |
