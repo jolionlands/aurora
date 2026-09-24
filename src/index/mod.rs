@@ -107,9 +107,8 @@ impl PhotoIndex {
         Ok(state.index)
     }
 
-    /// Scan configured sources, preserving each source's extension, recursion,
-    /// and minimum-dimension rules. WIC-only formats require COM to be
-    /// initialized on the current thread.
+    /// Uncached source scan, for tests.
+    #[cfg(test)]
     pub fn scan_sources(sources: &[SourceConfig]) -> Result<Self> {
         Ok(scan_sources_with_cache(sources, CacheLookup::default())?.0)
     }

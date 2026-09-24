@@ -228,24 +228,6 @@ impl WallpaperApplier {
                 .context("IDesktopWallpaper::SetPosition")
         }
     }
-
-    pub fn apply_all(&self, config: &Config, path: &Path) -> Result<()> {
-        if let Some(first) = config.monitors.first() {
-            let fit = WallpaperFit::parse(&first.fit);
-            if config
-                .monitors
-                .iter()
-                .skip(1)
-                .any(|monitor| WallpaperFit::parse(&monitor.fit) != fit)
-            {
-                tracing::warn!(
-                    "per-monitor fit overrides differ, but Windows applies one global wallpaper position"
-                );
-            }
-            self.set_fit(fit)?;
-        }
-        self.set_for_all_monitors(path)
-    }
 }
 
 fn attached_monitor(id: String, rect: RECT) -> Option<MonitorInfo> {
