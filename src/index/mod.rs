@@ -98,7 +98,7 @@ impl PhotoIndex {
                 root,
                 &exts,
                 recursive,
-                (0, 0),
+                (0, 0, false),
                 &mut visited_dirs,
                 &mut state,
             );
@@ -247,7 +247,7 @@ fn scan_sources_with_cache(
             &source.path,
             &exts,
             source.recursive,
-            (source.min_width, source.min_height),
+            (source.min_width, source.min_height, source.landscape_only),
             &mut visited_dirs,
             &mut state,
         ) {
@@ -275,7 +275,7 @@ fn collect_files(
     dir: &Path,
     extensions: &[String],
     recursive: bool,
-    min_dimensions: (u32, u32),
+    min_dimensions: (u32, u32, bool),
     visited_dirs: &mut HashSet<PathBuf>,
     state: &mut ScanState,
 ) -> bool {
@@ -357,6 +357,7 @@ fn collect_files(
             &meta,
             min_dimensions.0,
             min_dimensions.1,
+            min_dimensions.2,
             state,
         ) {
             Ok(Some(photo)) => {
@@ -379,6 +380,7 @@ fn build_entry_cached(
     meta: &std::fs::Metadata,
     min_width: u32,
     min_height: u32,
+    landscape_only: bool,
     state: &mut ScanState,
 ) -> Result<Option<PhotoEntry>> {
     if meta.len() > crate::decode::MAX_IMAGE_FILE_BYTES {
@@ -416,7 +418,10 @@ fn build_entry_cached(
         CachedPhoto::new(canonical_path, fingerprint, width, height)
     };
 
-    if fact.width < min_width || fact.height < min_height {
+    if fact.width < min_width
+        || fact.height < min_height
+        || (landscape_only && fact.height > fact.width)
+    {
         if fact.fingerprint.is_some() {
             state.refreshed.insert(canonical_path.to_path_buf(), fact);
         }
@@ -658,6 +663,7 @@ mod tests {
             extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
             min_width,
             min_height,
+            landscape_only: false,
         }
     }
 

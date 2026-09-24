@@ -298,7 +298,7 @@ fn is_fullscreen_active() -> bool {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetShellWindow, GetWindowRect,
+        GetForegroundWindow, GetShellWindow, GetWindowRect, IsZoomed,
     };
 
     unsafe {
@@ -307,6 +307,9 @@ fn is_fullscreen_active() -> bool {
             return false;
         }
         let is_shell_desktop = hwnd == GetShellWindow();
+        // A maximized window also covers the monitor when the taskbar is
+        // auto-hidden; only borderless fullscreen (video, games) should pause.
+        let is_maximized = IsZoomed(hwnd).as_bool();
 
         let mut win_rect = RECT::default();
         if GetWindowRect(hwnd, &mut win_rect).is_err() {
@@ -323,16 +326,18 @@ fn is_fullscreen_active() -> bool {
         }
 
         let mr = mi.rcMonitor;
-        should_pause_for_window(is_shell_desktop, &win_rect, &mr)
+        should_pause_for_window(is_shell_desktop, is_maximized, &win_rect, &mr)
     }
 }
 
 fn should_pause_for_window(
     is_shell_desktop: bool,
+    is_maximized: bool,
     window: &windows::Win32::Foundation::RECT,
     monitor: &windows::Win32::Foundation::RECT,
 ) -> bool {
     !is_shell_desktop
+        && !is_maximized
         && window.left <= monitor.left
         && window.top <= monitor.top
         && window.right >= monitor.right
@@ -504,10 +509,19 @@ mod tests {
         };
         assert!(should_pause_for_window(
             false,
+            false,
             &bordered_fullscreen,
             &monitor
         ));
         assert!(!should_pause_for_window(
+            true,
+            false,
+            &bordered_fullscreen,
+            &monitor
+        ));
+        // Maximized window with an auto-hidden taskbar covers the monitor too.
+        assert!(!should_pause_for_window(
+            false,
             true,
             &bordered_fullscreen,
             &monitor
@@ -519,7 +533,7 @@ mod tests {
             right: 1919,
             bottom: 1080,
         };
-        assert!(!should_pause_for_window(false, &inset_window, &monitor));
+        assert!(!should_pause_for_window(false, false, &inset_window, &monitor));
     }
 
     #[test]

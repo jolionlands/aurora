@@ -39,6 +39,8 @@ pub struct SourceConfig {
     pub extensions: Vec<String>,
     pub min_width: u32,
     pub min_height: u32,
+    /// Skip portrait images (height > width), e.g. phone wallpapers.
+    pub landscape_only: bool,
 }
 
 impl Default for SourceConfig {
@@ -52,6 +54,7 @@ impl Default for SourceConfig {
                 .collect(),
             min_width: 1280,
             min_height: 720,
+            landscape_only: false,
         }
     }
 }

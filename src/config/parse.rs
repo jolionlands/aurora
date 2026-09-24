@@ -459,6 +459,7 @@ fn apply_kv(
                 "recursive" => s.recursive = parse_bool(value)?,
                 "min-width" | "min_width" => s.min_width = parse_u32(value)?,
                 "min-height" | "min_height" => s.min_height = parse_u32(value)?,
+                "landscape-only" | "landscape_only" => s.landscape_only = parse_bool(value)?,
                 "extensions" => {
                     // Comma-separated or space-separated list on one line
                     s.extensions = value
