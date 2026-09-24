@@ -36,6 +36,7 @@ fn decode_one(path: &Path, width: u32, height: u32) {
         max_bytes: config.max_memory_mb as usize * 1024 * 1024,
         max_frames: config.max_frames as usize,
         min_delay: Duration::from_millis(1000 / u64::from(config.max_fps)),
+        scaling: config.scaling,
     };
     let started = Instant::now();
     let result = decode_animation(path, &budget);
@@ -43,7 +44,8 @@ fn decode_one(path: &Path, width: u32, height: u32) {
     let peak = peak_working_set_mb();
     match result {
         Ok(Some(animation)) => println!(
-            "ANIMATED frames={} size={}x{} stored_mb={:.1} loop_ms={} decode_ms={millis} peak_ws_mb={peak:.1}",
+            "ANIMATED pixel_art={} frames={} size={}x{} stored_mb={:.1} loop_ms={} decode_ms={millis} peak_ws_mb={peak:.1}",
+            animation.pixel_art,
             animation.frames.len(),
             animation.width,
             animation.height,
