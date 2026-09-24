@@ -128,7 +128,7 @@ impl IpcServer {
                 continue;
             }
 
-            info!("IPC client connected");
+            debug!("IPC client connected");
             let permit = Arc::clone(&self.handler_slots)
                 .acquire_owned()
                 .await
@@ -152,7 +152,7 @@ impl IpcServer {
         let payload = match read_frame_with_timeout(&mut pipe, FRAME_IO_TIMEOUT).await? {
             Some(payload) => payload,
             None => {
-                info!("IPC client disconnected");
+                debug!("IPC client disconnected");
                 return Ok(());
             }
         };
