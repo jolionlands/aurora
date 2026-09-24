@@ -533,7 +533,12 @@ mod tests {
             right: 1919,
             bottom: 1080,
         };
-        assert!(!should_pause_for_window(false, false, &inset_window, &monitor));
+        assert!(!should_pause_for_window(
+            false,
+            false,
+            &inset_window,
+            &monitor
+        ));
     }
 
     #[test]
