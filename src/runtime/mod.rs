@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::animation::{AnimationPlayer, DisplayTarget};
 use crate::apply::{configured_global_fit, MonitorInfo, MonitorSnapshot, WallpaperFit};
+pub use crate::com::ComApartment;
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::content::{
     content_path, load_content, parse_content, persist_content, serialize_content,
@@ -156,30 +157,6 @@ impl BanGate {
         let result = apply().map(Some);
         drop(hashes);
         result
-    }
-}
-
-pub struct ComApartment {
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl ComApartment {
-    pub fn initialize() -> Result<Self> {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
-        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if result.is_err() {
-            anyhow::bail!("CoInitializeEx failed: {result:?}");
-        }
-        Ok(Self {
-            _not_send: std::marker::PhantomData,
-        })
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
     }
 }
 

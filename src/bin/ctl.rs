@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use aurora::com::ComApartment;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use serde_json::Value;
@@ -1773,26 +1774,6 @@ fn bgra_to_rgba(width: u32, height: u32, mut pixels: Vec<u8>) -> anyhow::Result<
         pixel.swap(0, 2);
     }
     Ok(pixels)
-}
-
-struct ComApartment;
-
-impl ComApartment {
-    fn initialize() -> anyhow::Result<Self> {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
-        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if result.is_err() {
-            anyhow::bail!("CoInitializeEx failed before image decode: {result:?}");
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
-    }
 }
 
 fn analyze_color_palette(image: &image::DynamicImage) -> PaletteResult {

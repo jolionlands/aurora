@@ -175,6 +175,9 @@ struct WicFrame {
     frame: windows::Win32::Graphics::Imaging::IWICBitmapFrameDecode,
     width: u32,
     height: u32,
+    /// Keeps this thread in the MTA until the WIC objects above are released
+    /// (fields drop in declaration order).
+    _com: crate::com::ComApartment,
 }
 
 fn open_wic_frame(path: &Path) -> Result<WicFrame> {
@@ -186,6 +189,7 @@ fn open_wic_frame(path: &Path) -> Result<WicFrame> {
     };
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
+    let com = crate::com::ComApartment::initialize()?;
     let path = HSTRING::from(path);
 
     unsafe {
@@ -208,6 +212,7 @@ fn open_wic_frame(path: &Path) -> Result<WicFrame> {
             frame,
             width,
             height,
+            _com: com,
         })
     }
 }
@@ -514,21 +519,8 @@ mod tests {
     #[test]
     fn wic_validation_decodes_one_bgra_pixel() {
         use image::{ImageBuffer, ImageFormat, Rgb};
-        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
-        struct ComApartment;
-        impl Drop for ComApartment {
-            fn drop(&mut self) {
-                unsafe { CoUninitialize() };
-            }
-        }
-
-        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        assert!(
-            initialized.is_ok(),
-            "CoInitializeEx failed: {initialized:?}"
-        );
-        let _com = ComApartment;
+        // No explicit COM initialization: WIC helpers join the MTA themselves.
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wallpaper.heic");

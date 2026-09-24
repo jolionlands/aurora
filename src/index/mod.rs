@@ -683,24 +683,6 @@ mod tests {
         std::fs::write(path, header).unwrap();
     }
 
-    struct TestComApartment;
-
-    impl TestComApartment {
-        fn initialize() -> Self {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
-            let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            assert!(result.is_ok(), "CoInitializeEx failed: {result:?}");
-            Self
-        }
-    }
-
-    impl Drop for TestComApartment {
-        fn drop(&mut self) {
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
-
     #[test]
     fn test_index_scan_finds_jpegs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -766,7 +748,7 @@ mod tests {
 
     #[test]
     fn scan_skips_malformed_wic_only_files() {
-        let _com = TestComApartment::initialize();
+        let _com = crate::com::ComApartment::initialize().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         for extension in ["heic", "heif", "avif"] {
             std::fs::write(

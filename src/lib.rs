@@ -1,5 +1,6 @@
 pub mod animation;
 pub mod apply;
+pub mod com;
 pub mod config;
 pub mod content;
 pub mod decode;
