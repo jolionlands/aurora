@@ -164,50 +164,20 @@ pub(super) fn bounded_content_list(
     total: usize,
     offset: usize,
     limit: usize,
-    mut item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
+    item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut items = Vec::new();
-    let mut overflow_at = None;
-    let end = total.min(offset.saturating_add(limit));
-
-    for index in offset..end {
-        items.push(item_at(index)?);
-        let next = offset.saturating_add(items.len());
-        let candidate =
-            content_list_result_json(total, offset, limit, (next < total).then_some(next), &items);
-        if playlist_show_fits_frame(&candidate)? {
-            continue;
-        }
-        let item = items.pop().expect("the candidate contains the new item");
-        let single_next = index.saturating_add(1);
-        let single = content_list_result_json(
-            total,
-            index,
-            1,
-            (single_next < total).then_some(single_next),
-            std::slice::from_ref(&item),
-        );
-        if !playlist_show_fits_frame(&single)? {
-            anyhow::bail!(
-                "content item at offset {index} exceeds the IPC response limit; reduce its autotag metadata before retrying"
-            );
-        }
-        if items.is_empty() {
-            anyhow::bail!(
-                "content item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce its autotag metadata"
-            );
-        }
-        overflow_at = Some(index);
-        break;
-    }
-
-    let next = offset.saturating_add(items.len());
-    let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
-    let result = content_list_result_json(total, offset, limit, next_offset, &items);
-    if !playlist_show_fits_frame(&result)? {
-        anyhow::bail!("content page exceeds the IPC response limit");
-    }
-    Ok(result)
+    bounded_page(
+        PageText {
+            noun: "content",
+            reduce: "its autotag metadata",
+            page_too_large: "content page exceeds the IPC response limit",
+        },
+        total,
+        offset,
+        limit,
+        item_at,
+        |offset, limit, next, items| content_list_result_json(total, offset, limit, next, items),
+    )
 }
 
 pub(super) fn playlist_show_result_json(
@@ -245,45 +215,83 @@ pub(super) fn bounded_playlist_show(
     total: usize,
     offset: usize,
     limit: usize,
-    mut item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
+    item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
+    bounded_page(
+        PageText {
+            noun: "playlist",
+            reduce: "its tag metadata",
+            page_too_large:
+                "playlist summary exceeds the IPC response limit; shorten the playlist name",
+        },
+        total,
+        offset,
+        limit,
+        item_at,
+        |offset, limit, next, items| {
+            playlist_show_result_json(summary, total, offset, limit, next, items)
+        },
+    )
+}
+
+/// Wording for [`bounded_page`] errors.
+pub(super) struct PageText {
+    noun: &'static str,
+    reduce: &'static str,
+    page_too_large: &'static str,
+}
+
+/// Slack for the `next_offset` field changing between the running estimate
+/// and the final page (a number growing by a few digits, or null).
+const PAGE_ESTIMATE_SLACK: usize = 64;
+
+/// Collect up to `limit` items from `offset` into the largest page that fits
+/// one IPC frame. Each item is serialized once and a running byte count
+/// decides the cut, so a page costs O(items) instead of re-serializing the
+/// whole page after every item.
+pub(super) fn bounded_page(
+    text: PageText,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    mut item_at: impl FnMut(usize) -> anyhow::Result<serde_json::Value>,
+    build: impl Fn(usize, usize, Option<usize>, &[serde_json::Value]) -> serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let fits = |value: &serde_json::Value| playlist_show_fits_frame(value);
+    let base_len = playlist_show_wire_len(&build(offset, limit, Some(total), &[]))?;
+    let mut used = base_len + PAGE_ESTIMATE_SLACK;
     let mut items = Vec::new();
     let mut overflow_at = None;
     let end = total.min(offset.saturating_add(limit));
 
     for index in offset..end {
-        items.push(item_at(index)?);
-        let next = offset.saturating_add(items.len());
-        let candidate = playlist_show_result_json(
-            summary,
-            total,
-            offset,
-            limit,
-            (next < total).then_some(next),
-            &items,
-        );
-        if playlist_show_fits_frame(&candidate)? {
+        let item = item_at(index)?;
+        // Item bytes plus the separating comma.
+        let item_len = serde_json::to_vec(&item)?.len() + 1;
+        if used + item_len <= MAX_FRAME_SIZE {
+            used += item_len;
+            items.push(item);
             continue;
         }
-
-        let item = items.pop().expect("the candidate contains the new item");
         let single_next = index.saturating_add(1);
-        let single = playlist_show_result_json(
-            summary,
-            total,
+        let single = build(
             index,
             1,
             (single_next < total).then_some(single_next),
             std::slice::from_ref(&item),
         );
-        if !playlist_show_fits_frame(&single)? {
+        if !fits(&single)? {
             anyhow::bail!(
-                "playlist item at offset {index} exceeds the IPC response limit; reduce its tag metadata before retrying"
+                "{} item at offset {index} exceeds the IPC response limit; reduce {} before retrying",
+                text.noun,
+                text.reduce
             );
         }
         if items.is_empty() {
             anyhow::bail!(
-                "playlist item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce its tag metadata"
+                "{} item at offset {index} does not fit with limit {limit}; retry with --limit 1 or reduce {}",
+                text.noun,
+                text.reduce
             );
         }
         overflow_at = Some(index);
@@ -292,9 +300,9 @@ pub(super) fn bounded_playlist_show(
 
     let next = offset.saturating_add(items.len());
     let next_offset = overflow_at.or_else(|| (next < total).then_some(next));
-    let result = playlist_show_result_json(summary, total, offset, limit, next_offset, &items);
-    if !playlist_show_fits_frame(&result)? {
-        anyhow::bail!("playlist summary exceeds the IPC response limit; shorten the playlist name");
+    let result = build(offset, limit, next_offset, &items);
+    if !fits(&result)? {
+        anyhow::bail!("{}", text.page_too_large);
     }
     Ok(result)
 }
