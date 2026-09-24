@@ -109,8 +109,12 @@ fn cache_budget_bytes(decoded_mb: u32) -> usize {
     bytes.min(usize::MAX as u64) as usize
 }
 
+/// Transitions only ever reuse the image on each display (old) and the one
+/// being applied (new); more entries just pin memory for the daemon's life.
+const MAX_CACHE_ENTRIES: usize = 4;
+
 fn cache_capacity(decoded_bytes: usize) -> usize {
-    (decoded_bytes / BYTES_PER_4K_BGRA).max(1)
+    (decoded_bytes / BYTES_PER_4K_BGRA).clamp(1, MAX_CACHE_ENTRIES)
 }
 
 fn monitor_results(successful: usize, failures: &[String]) -> Result<()> {
@@ -3173,6 +3177,13 @@ mod tests {
     // -----------------------------------------------------------------------
     // test_runtime_first_swap_no_transition
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_cache_keeps_only_what_transitions_reuse() {
+        assert_eq!(cache_capacity(0), 1);
+        assert_eq!(cache_capacity(BYTES_PER_4K_BGRA * 2), 2);
+        assert_eq!(cache_capacity(cache_budget_bytes(256)), MAX_CACHE_ENTRIES);
+    }
 
     #[test]
     fn canonical_paths_find_scanned_entries_without_rehashing() {
