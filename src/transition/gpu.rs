@@ -128,8 +128,10 @@ pub fn run_transition(
         let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
             pixelFormat: pixel_format,
-            dpiX: 0.0,
-            dpiY: 0.0,
+            // Draw rectangles are in physical pixels; 0.0 would mean the
+            // desktop DPI and scale everything up at >100% display scaling.
+            dpiX: 96.0,
+            dpiY: 96.0,
             usage: D2D1_RENDER_TARGET_USAGE_NONE,
             minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
@@ -210,7 +212,7 @@ pub fn run_transition(
             Vec::new()
         };
 
-        let start = Instant::now();
+        let mut start = Instant::now();
         let total = Duration::from_millis(duration_ms as u64);
         let w = monitor_bounds.width as f32;
         let h = monitor_bounds.height as f32;
@@ -461,6 +463,10 @@ pub fn run_transition(
             if !committed {
                 commit().context("commit wallpaper behind GPU transition overlay")?;
                 committed = true;
+                // The helper-process commit can take a second or more; start
+                // the animation clock once the overlay hides it so the full
+                // duration stays visible.
+                start = Instant::now();
             }
 
             // Pump messages

@@ -168,16 +168,6 @@ impl TransitionRenderer {
         }
     }
 
-    /// Run the full transition animation, blocking until completion.
-    ///
-    /// `monitor_bounds` — screen-space rect of the target monitor.
-    /// `old` / `new` — BGRA32 decoded images.
-    ///
-    /// This compatibility entry point does not commit a desktop wallpaper.
-    pub fn run(&self, monitor_bounds: Rect, old: &DecodedImage, new: &DecodedImage) -> Result<()> {
-        self.run_with_commit(monitor_bounds, old, new, || Ok(()))
-    }
-
     /// Show the first overlay frame, commit the desktop behind it, then finish
     /// the animation before the overlay is destroyed.
     pub fn run_with_commit(
@@ -343,7 +333,7 @@ mod tests {
             bgra: vec![0, 0, 0, 255],
         };
         TransitionRenderer::new(TransitionStyle::None, 0, Backend::Cpu)
-            .run(
+            .run_with_commit(
                 Rect {
                     x: 0,
                     y: 0,
@@ -352,6 +342,7 @@ mod tests {
                 },
                 &image,
                 &image,
+                || Ok(()),
             )
             .unwrap();
     }

@@ -331,7 +331,7 @@ pub fn run_transition(
             Vec::new()
         };
 
-        let start = Instant::now();
+        let mut start = Instant::now();
         let total = Duration::from_millis(duration_ms as u64);
 
         let screen_dc = ScreenDc::acquire()?;
@@ -413,6 +413,10 @@ pub fn run_transition(
             if !committed {
                 commit().context("commit wallpaper behind CPU transition overlay")?;
                 committed = true;
+                // The helper-process commit can take a second or more; start
+                // the animation clock once the overlay hides it so the full
+                // duration stays visible.
+                start = Instant::now();
             }
 
             // Pump messages so the window stays responsive

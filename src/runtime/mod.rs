@@ -1139,7 +1139,13 @@ impl Runtime {
         );
 
         let style = TransitionStyle::parse(&config.transitions.style);
-        let backend = Backend::parse(&config.transitions.renderer);
+        // Disabled transitions never render, so skip the Direct2D probe
+        // (and loading d2d1.dll) that renderer "auto" would do.
+        let backend = if config.transitions.enabled {
+            Backend::parse(&config.transitions.renderer)
+        } else {
+            Backend::Cpu
+        };
         let transitions = TransitionRenderer::new(style, config.transitions.duration_ms, backend);
 
         let configured_cache_bytes = cache_budget_bytes(config.cache.decoded_mb);
