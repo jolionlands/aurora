@@ -4,6 +4,7 @@
 //! cargo run --release --example animated_preview -- <file.gif> [seconds]
 //! ```
 //! With no file, a synthetic animation is generated in the temp directory.
+//! Add `--policy` to apply the default battery and covered-window pauses.
 //! The static wallpaper is not changed; only the animation window is shown.
 
 use std::path::PathBuf;
@@ -49,11 +50,20 @@ fn main() -> anyhow::Result<()> {
         let _com = ComApartment::initialize()?;
         WallpaperApplier::new()?.list_monitors()?
     };
-    let config = AnimatedConfig {
-        enabled: true,
-        pause_on_battery: false,
-        pause_when_covered: false,
-        ..AnimatedConfig::default()
+    // Pass `--policy` to keep the default battery/cover pauses; by default
+    // the preview always plays.
+    let config = if std::env::args().any(|arg| arg == "--policy") {
+        AnimatedConfig {
+            enabled: true,
+            ..AnimatedConfig::default()
+        }
+    } else {
+        AnimatedConfig {
+            enabled: true,
+            pause_on_battery: false,
+            pause_when_covered: false,
+            ..AnimatedConfig::default()
+        }
     };
     let mut player = AnimationPlayer::from_config(&config).expect("enabled");
     for monitor in monitors {

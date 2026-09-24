@@ -38,10 +38,14 @@ use render::{Gpu, PresentError};
 
 pub use frames::may_be_animated;
 
+/// Policy check interval while something is visibly animating.
 const POLICY_INTERVAL: Duration = Duration::from_secs(1);
-/// Policy check interval while battery, lock, or display-off freezes all
-/// animation.
-const FROZEN_POLICY_INTERVAL: Duration = Duration::from_secs(5);
+/// While every animated display is hidden behind a window: how quickly
+/// playback resumes once the window goes away.
+const COVERED_POLICY_INTERVAL: Duration = Duration::from_secs(2);
+/// While battery, lock, or display-off freezes everything. Power and session
+/// notifications wake the player immediately; this is only a safety net.
+const FROZEN_POLICY_INTERVAL: Duration = Duration::from_secs(60);
 /// After this long frozen everywhere, decoded frames and GPU objects are
 /// released; they are decoded again when playback may resume.
 const RELEASE_FROZEN_AFTER: Duration = Duration::from_secs(60);
@@ -224,7 +228,7 @@ struct PlayerLoop {
     frozen_everywhere: bool,
     /// When the current everywhere-freeze began.
     frozen_since: Option<Instant>,
-    power: Option<power::DisplayPowerWatch>,
+    power: Option<power::PowerWatch>,
     /// Direct3D/Direct2D objects; present only while something animates.
     gpu: Option<Gpu>,
 }
@@ -253,8 +257,8 @@ impl PlayerLoop {
     }
 
     fn run(mut self) {
-        self.power = power::DisplayPowerWatch::register()
-            .inspect_err(|error| debug!("display power notifications unavailable: {error:#}"))
+        self.power = power::PowerWatch::register()
+            .inspect_err(|error| debug!("power notifications unavailable: {error:#}"))
             .ok();
         loop {
             while let Ok(command) = self.commands.try_recv() {
@@ -271,14 +275,20 @@ impl PlayerLoop {
                 self.apply_policy(now);
                 let interval = if self.frozen_everywhere {
                     FROZEN_POLICY_INTERVAL
-                } else {
+                } else if self.any_animating() {
                     POLICY_INTERVAL
+                } else {
+                    COVERED_POLICY_INTERVAL
                 };
                 self.next_policy = now + interval;
             }
             self.advance_frames(Instant::now());
             let timeout = self.timeout(Instant::now());
             wait_and_pump(&self.wake, timeout);
+            if power::take_change() {
+                // Power source, battery saver, display, or lock changed.
+                self.next_policy = Instant::now();
+            }
         }
     }
 
@@ -399,6 +409,16 @@ impl PlayerLoop {
         self.displays
             .values()
             .any(|display| display.playing.is_some())
+    }
+
+    /// Some display is visibly animating (not frozen).
+    fn any_animating(&self) -> bool {
+        self.displays.values().any(|display| {
+            display
+                .playing
+                .as_ref()
+                .is_some_and(|playing| !playing.frozen)
+        })
     }
 
     /// Something is playing or waiting to be decoded again after a freeze.
@@ -709,19 +729,25 @@ fn wait_and_pump(wake: &WakeEvent, timeout: Option<Duration>) {
 // ---------------------------------------------------------------------------
 
 mod power {
+    //! Event-driven power, display and session state, so a frozen player can
+    //! sleep instead of polling.
+
     use std::cell::Cell;
 
     use anyhow::{Context, Result};
     use windows::core::{w, GUID, PCWSTR};
-    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND};
     use windows::Win32::System::Power::{
         RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
         POWERBROADCAST_SETTING,
     };
+    use windows::Win32::System::RemoteDesktop::{
+        WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, HWND_MESSAGE,
-        PBT_POWERSETTINGCHANGE, REGISTER_NOTIFICATION_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_POWERBROADCAST, WNDCLASSEXW,
+        PBT_APMPOWERSTATUSCHANGE, PBT_POWERSETTINGCHANGE, REGISTER_NOTIFICATION_FLAGS,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
     };
 
     use super::{LPARAM, LRESULT, WPARAM};
@@ -729,19 +755,26 @@ mod power {
     /// GUID_CONSOLE_DISPLAY_STATE: data is 0 = off, 1 = on, 2 = dimmed.
     const GUID_CONSOLE_DISPLAY_STATE: GUID =
         GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    /// GUID_ACDC_POWER_SOURCE: AC, DC (battery), or short-term UPS.
+    const GUID_ACDC_POWER_SOURCE: GUID = GUID::from_u128(0x5d3e9a59_e9d5_4b00_a6bd_ff34ff516548);
+    /// GUID_POWER_SAVING_STATUS: battery saver on/off.
+    const GUID_POWER_SAVING_STATUS: GUID = GUID::from_u128(0xe00958c0_c213_4ace_ac77_fecced2eeea5);
     const CLASS_NAME: PCWSTR = w!("AuroraAnimationPower");
 
     thread_local! {
         static DISPLAY_OFF: Cell<bool> = const { Cell::new(false) };
+        static CHANGED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Message-only window receiving console display on/off notifications.
-    pub struct DisplayPowerWatch {
+    /// Message-only window receiving display, power-source, battery-saver
+    /// and lock/unlock notifications.
+    pub struct PowerWatch {
         hwnd: HWND,
-        registration: HPOWERNOTIFY,
+        registrations: Vec<HPOWERNOTIFY>,
+        session: bool,
     }
 
-    impl DisplayPowerWatch {
+    impl PowerWatch {
         pub fn register() -> Result<Self> {
             unsafe {
                 let class = WNDCLASSEXW {
@@ -767,18 +800,29 @@ mod power {
                     None,
                 )
                 .context("create power notification window")?;
-                let registration = match RegisterPowerSettingNotification(
-                    windows::Win32::Foundation::HANDLE(hwnd.0),
-                    &GUID_CONSOLE_DISPLAY_STATE,
-                    REGISTER_NOTIFICATION_FLAGS(0), // DEVICE_NOTIFY_WINDOW_HANDLE
-                ) {
-                    Ok(registration) => registration,
-                    Err(error) => {
-                        let _ = DestroyWindow(hwnd);
-                        return Err(error).context("register display power notification");
-                    }
+                let mut watch = Self {
+                    hwnd,
+                    registrations: Vec::new(),
+                    session: false,
                 };
-                Ok(Self { hwnd, registration })
+                for setting in [
+                    GUID_CONSOLE_DISPLAY_STATE,
+                    GUID_ACDC_POWER_SOURCE,
+                    GUID_POWER_SAVING_STATUS,
+                ] {
+                    // DEVICE_NOTIFY_WINDOW_HANDLE; a missing setting only
+                    // means slower reaction through the safety poll.
+                    if let Ok(registration) = RegisterPowerSettingNotification(
+                        HANDLE(hwnd.0),
+                        &setting,
+                        REGISTER_NOTIFICATION_FLAGS(0),
+                    ) {
+                        watch.registrations.push(registration);
+                    }
+                }
+                watch.session =
+                    WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_ok();
+                Ok(watch)
             }
         }
 
@@ -787,10 +831,21 @@ mod power {
         }
     }
 
-    impl Drop for DisplayPowerWatch {
+    /// True (once) if power, display, or session state changed since the
+    /// last call.
+    pub fn take_change() -> bool {
+        CHANGED.with(|changed| changed.replace(false))
+    }
+
+    impl Drop for PowerWatch {
         fn drop(&mut self) {
             unsafe {
-                let _ = UnregisterPowerSettingNotification(self.registration);
+                for registration in self.registrations.drain(..) {
+                    let _ = UnregisterPowerSettingNotification(registration);
+                }
+                if self.session {
+                    let _ = WTSUnRegisterSessionNotification(self.hwnd);
+                }
                 let _ = DestroyWindow(self.hwnd);
             }
         }
@@ -802,15 +857,26 @@ mod power {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if msg == WM_POWERBROADCAST && wparam.0 == PBT_POWERSETTINGCHANGE as usize && lparam.0 != 0
-        {
-            let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
-            if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting.DataLength >= 1 {
-                DISPLAY_OFF.with(|off| off.set(setting.Data[0] == 0));
+        match msg {
+            WM_POWERBROADCAST => {
+                if wparam.0 == PBT_POWERSETTINGCHANGE as usize && lparam.0 != 0 {
+                    let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
+                    if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting.DataLength >= 1
+                    {
+                        DISPLAY_OFF.with(|off| off.set(setting.Data[0] == 0));
+                    }
+                    CHANGED.with(|changed| changed.set(true));
+                } else if wparam.0 == PBT_APMPOWERSTATUSCHANGE as usize {
+                    CHANGED.with(|changed| changed.set(true));
+                }
+                LRESULT(1)
             }
-            return LRESULT(1);
+            WM_WTSSESSION_CHANGE => {
+                CHANGED.with(|changed| changed.set(true));
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
-        DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }
 
