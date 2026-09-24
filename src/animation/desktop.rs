@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::frames::Animation;
-use super::render::{Gpu, PresentError, Surface};
+use super::render::{Gpu, Layout, PresentError, Surface};
 use crate::apply::WallpaperFit;
 use crate::transition::Rect;
 
@@ -292,15 +292,30 @@ impl PlayerWindow {
             return Ok(());
         };
         let full = (0, 0, self.width as i32, self.height as i32);
-        let (src, dst) = placement(
-            fit,
-            animation.width as i32,
-            animation.height as i32,
-            full.2,
-            full.3,
-        );
+        let (src, dst) = if animation.pixel_art {
+            pixel_art_placement(
+                animation.width as i32,
+                animation.height as i32,
+                full.2,
+                full.3,
+            )
+        } else {
+            placement(
+                fit,
+                animation.width as i32,
+                animation.height as i32,
+                full.2,
+                full.3,
+            )
+        };
         let pixels = (!pixels.bgra.is_empty()).then_some(&*pixels.bgra);
-        let result = surface.present(gpu, frame, pixels, src, dst, dst != full);
+        let layout = Layout {
+            src,
+            dst,
+            letterbox: (dst != full).then_some(animation.background),
+            pixel_art: animation.pixel_art,
+        };
+        let result = surface.present(gpu, frame, pixels, &layout);
         if matches!(result, Err(PresentError::Device(_))) {
             self.surface = None;
         }
@@ -372,6 +387,28 @@ unsafe extern "system" fn player_wnd_proc(
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Whole art centered at the largest integer scale that fits the display
+/// (never cropped), or scaled down to fit when the art is larger.
+pub(crate) fn pixel_art_placement(
+    src_w: i32,
+    src_h: i32,
+    dst_w: i32,
+    dst_h: i32,
+) -> (PixelRect, PixelRect) {
+    if src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 {
+        return ((0, 0, src_w, src_h), (0, 0, dst_w, dst_h));
+    }
+    let scale = (dst_w / src_w).min(dst_h / src_h);
+    if scale == 0 {
+        return placement(WallpaperFit::Contain, src_w, src_h, dst_w, dst_h);
+    }
+    let (w, h) = (src_w * scale, src_h * scale);
+    (
+        (0, 0, src_w, src_h),
+        ((dst_w - w) / 2, (dst_h - h) / 2, w, h),
+    )
 }
 
 /// `(x, y, width, height)` in pixels.
@@ -452,6 +489,19 @@ mod tests {
         assert_eq!((src, dst), ((0, 0, 480, 270), (0, 0, 1280, 800)));
         // Degenerate sizes never divide by zero.
         let _ = placement(WallpaperFit::Fill, 0, 0, 1280, 800);
+    }
+
+    #[test]
+    fn pixel_art_uses_whole_scale_factors_and_is_never_cropped() {
+        // 377 px art on a 2560x1600 panel: 4x = 1508, centered.
+        assert_eq!(
+            pixel_art_placement(377, 377, 2560, 1600),
+            ((0, 0, 377, 377), (526, 46, 1508, 1508))
+        );
+        // Larger than the display: shrink to fit, still uncropped.
+        let (src, dst) = pixel_art_placement(2000, 2000, 1280, 800);
+        assert_eq!(src, (0, 0, 2000, 2000));
+        assert_eq!((dst.2, dst.3), (800, 800));
     }
 
     #[test]

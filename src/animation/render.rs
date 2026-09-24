@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Factory1,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
     D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
@@ -106,6 +106,18 @@ pub struct Surface {
     target: ID2D1Bitmap1,
     frames: Vec<Option<ID2D1Bitmap1>>,
     frame_size: (u32, u32),
+}
+
+/// Where and how a frame is drawn into the window.
+pub struct Layout {
+    /// Source rectangle in frame pixels.
+    pub src: PixelRect,
+    /// Destination rectangle in window pixels.
+    pub dst: PixelRect,
+    /// Fill (BGRA) for the area outside `dst`, when it does not cover all.
+    pub letterbox: Option<[u8; 4]>,
+    /// Nearest-neighbour instead of linear filtering.
+    pub pixel_art: bool,
 }
 
 /// Why a frame could not be presented.
@@ -202,9 +214,7 @@ impl Surface {
         gpu: &Gpu,
         index: usize,
         pixels: Option<&[u8]>,
-        src: PixelRect,
-        dst: PixelRect,
-        letterbox: bool,
+        layout: &Layout,
     ) -> std::result::Result<(), PresentError> {
         if self.frames.get(index).is_none_or(Option::is_none) {
             let expected = (self.frame_size.0 as usize) * (self.frame_size.1 as usize) * 4;
@@ -228,20 +238,25 @@ impl Surface {
             let context = &gpu.context;
             context.SetTarget(&self.target);
             context.BeginDraw();
-            if letterbox {
+            if let Some([b, g, r, _]) = layout.letterbox {
                 context.Clear(Some(&D2D1_COLOR_F {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
+                    r: f32::from(r) / 255.0,
+                    g: f32::from(g) / 255.0,
+                    b: f32::from(b) / 255.0,
                     a: 1.0,
                 }));
             }
+            let interpolation = if layout.pixel_art {
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+            } else {
+                D2D1_INTERPOLATION_MODE_LINEAR
+            };
             context.DrawBitmap(
                 frame,
-                Some(&rect(dst)),
+                Some(&rect(layout.dst)),
                 1.0,
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                Some(&rect(src)),
+                interpolation,
+                Some(&rect(layout.src)),
                 None,
             );
             let drawn = context.EndDraw(None, None);

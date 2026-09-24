@@ -32,6 +32,8 @@ const MIN_SOURCE_DELAY: Duration = Duration::from_millis(20);
 const DEFAULT_FAST_DELAY: Duration = Duration::from_millis(100);
 /// Stop reading pathological files after this many source frames.
 const MAX_SOURCE_FRAMES: usize = 5_000;
+/// Smallest native size (per side) treated as upscaled pixel art.
+const MIN_ART_EDGE: u32 = 32;
 /// Budget shrinking never goes below this edge length.
 const MIN_EDGE: u32 = 96;
 
@@ -48,6 +50,11 @@ pub struct Animation {
     pub width: u32,
     pub height: u32,
     pub frames: Vec<Frame>,
+    /// Scale with nearest-neighbour at whole factors (pixel art).
+    pub pixel_art: bool,
+    /// Opaque BGRA fill for letterbox bars and transparent pixels, sampled
+    /// from the first frame's border.
+    pub background: [u8; 4],
 }
 
 impl Animation {
@@ -69,6 +76,7 @@ pub struct FrameBudget {
     pub max_bytes: usize,
     pub max_frames: usize,
     pub min_delay: Duration,
+    pub scaling: crate::config::types::AnimationScaling,
 }
 
 /// Extensions whose files may contain more than one frame.
@@ -153,15 +161,45 @@ fn decode_gif(path: &Path, budget: &FrameBudget) -> Result<Option<Animation>> {
     if delays.len() < 2 {
         return Ok(None);
     }
+    let decoder = gif_options()
+        .read_info(open(path)?)
+        .context("read GIF header")?;
+    check_canvas(u32::from(decoder.width()), u32::from(decoder.height()))?;
+    drop(decoder);
+    let planned = planned_frames(&delays, budget.min_delay);
+    match decode_gif_frames(path, budget, planned, None)? {
+        GifPass::Done(animation) => Ok(animation),
+        // A later frame broke the block pattern: decode again without it.
+        GifPass::NotPixelArt => match decode_gif_frames(path, budget, planned, Some(1))? {
+            GifPass::Done(animation) => Ok(animation),
+            GifPass::NotPixelArt => bail!("pixel-art detection did not settle"),
+        },
+    }
+}
+
+enum GifPass {
+    Done(Option<Animation>),
+    NotPixelArt,
+}
+
+/// One full decode. `block` forces a block size; `None` detects it from the
+/// first frame (subject to the configured scaling).
+fn decode_gif_frames(
+    path: &Path,
+    budget: &FrameBudget,
+    planned: usize,
+    block: Option<u32>,
+) -> Result<GifPass> {
+    use crate::config::types::AnimationScaling;
+
     let mut decoder = gif_options()
         .read_info(open(path)?)
         .context("read GIF header")?;
     let (width, height) = (u32::from(decoder.width()), u32::from(decoder.height()));
-    check_canvas(width, height)?;
     let global_palette = decoder.global_palette().map(<[u8]>::to_vec);
     let mut canvas = GifCanvas::new(width as usize, height as usize);
-    let mut collector =
-        FrameCollector::new(budget, Some(planned_frames(&delays, budget.min_delay)));
+    let mut collector = FrameCollector::new(budget, Some(planned));
+    let mut block = block;
 
     while let Some(frame) = decoder.read_next_frame().context("decode GIF frame")? {
         let palette = frame
@@ -170,13 +208,58 @@ fn decode_gif(path: &Path, budget: &FrameBudget) -> Result<Option<Animation>> {
             .or(global_palette.as_deref())
             .context("GIF frame has no color table")?;
         canvas.draw(frame, palette);
+        let size = *block.get_or_insert_with(|| match budget.scaling {
+            AnimationScaling::Smooth => 1,
+            AnimationScaling::Auto | AnimationScaling::Nearest => {
+                pixel_block(&canvas.rgba, width, height)
+            }
+        });
+        if size > 1 && pixel_block_of(&canvas.rgba, width, height, size) != size {
+            return Ok(GifPass::NotPixelArt);
+        }
+        collector.set_pixel_block(size);
         collector.push(&canvas.rgba, width, height, gif_delay(frame.delay))?;
         canvas.dispose(frame);
         if collector.is_full() {
             break;
         }
     }
-    Ok(collector.finish())
+    Ok(GifPass::Done(collector.finish()))
+}
+
+/// Largest block size (up to 16) such that the image consists of uniform
+/// `n`x`n` squares aligned to the origin; 1 when it is not upscaled art.
+pub(crate) fn pixel_block(rgba: &[u8], width: u32, height: u32) -> u32 {
+    (2..=16u32)
+        .rev()
+        .find(|&n| pixel_block_of(rgba, width, height, n) == n)
+        .unwrap_or(1)
+}
+
+/// `n` if every `n`x`n` block of the image is uniform, else 1.
+fn pixel_block_of(rgba: &[u8], width: u32, height: u32, n: u32) -> u32 {
+    // The art itself must be at least MIN_ART_EDGE on each side; smaller
+    // "art" is more likely a flat or tiny image than upscaled pixel art.
+    if n < 2
+        || !width.is_multiple_of(n)
+        || !height.is_multiple_of(n)
+        || width / n < MIN_ART_EDGE
+        || height / n < MIN_ART_EDGE
+    {
+        return 1;
+    }
+    let (w, n_us) = (width as usize, n as usize);
+    let pixel = |x: usize, y: usize| &rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+    for y in 0..height as usize {
+        let row_anchor = y - y % n_us;
+        for x in 0..w {
+            let anchor = pixel(x - x % n_us, row_anchor);
+            if pixel(x, y) != anchor {
+                return 1;
+            }
+        }
+    }
+    n
 }
 
 fn decode_webp(path: &Path, budget: &FrameBudget) -> Result<Option<Animation>> {
@@ -333,10 +416,29 @@ fn frame_bytes(width: u32, height: u32) -> usize {
         .saturating_mul(4)
 }
 
-/// Downscale (integer area filter) or copy `rgba`, returning BGRA.
-fn scaled_bgra(rgba: &[u8], from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
+/// Nearest-neighbour resample (keeps pixel art crisp).
+fn nearest(rgba: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
+    let (fw, fh) = (from.0 as usize, from.1 as usize);
+    let (tw, th) = (to.0 as usize, to.1 as usize);
+    let mut out = Vec::with_capacity(tw * th * 4);
+    for y in 0..th {
+        let sy = (y * fh / th.max(1)).min(fh.saturating_sub(1));
+        for x in 0..tw {
+            let sx = (x * fw / tw.max(1)).min(fw.saturating_sub(1));
+            let at = (sy * fw + sx) * 4;
+            out.extend_from_slice(&rgba[at..at + 4]);
+        }
+    }
+    out
+}
+
+/// Downscale (integer area filter, or nearest for pixel art) or copy `rgba`,
+/// returning BGRA.
+fn scaled_bgra(rgba: &[u8], from: (u32, u32), to: (u32, u32), pixel_art: bool) -> Box<[u8]> {
     let mut out = if from == to {
         rgba.to_vec()
+    } else if pixel_art {
+        nearest(rgba, from, to)
     } else {
         match ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(from.0, from.1, rgba) {
             Some(view) => image::imageops::thumbnail(&view, to.0, to.1).into_raw(),
@@ -350,7 +452,10 @@ fn scaled_bgra(rgba: &[u8], from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
 }
 
 /// Rescale an already stored BGRA frame (channel order is irrelevant).
-fn rescale_stored(frame: &Frame, from: (u32, u32), to: (u32, u32)) -> Box<[u8]> {
+fn rescale_stored(frame: &Frame, from: (u32, u32), to: (u32, u32), pixel_art: bool) -> Box<[u8]> {
+    if pixel_art {
+        return nearest(&frame.bgra, from, to).into_boxed_slice();
+    }
     match ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(from.0, from.1, &frame.bgra) {
         Some(view) => image::imageops::thumbnail(&view, to.0, to.1)
             .into_raw()
@@ -384,6 +489,9 @@ pub(crate) struct FrameCollector<'a> {
     /// kept so later frames keep the same spacing.
     stride: usize,
     seen: usize,
+    /// Source pixels per art pixel; >1 stores frames at native art size
+    /// with nearest-neighbour sampling.
+    pixel_block: u32,
 }
 
 impl<'a> FrameCollector<'a> {
@@ -396,7 +504,19 @@ impl<'a> FrameCollector<'a> {
             size: None,
             stride: 1,
             seen: 0,
+            pixel_block: 1,
         }
+    }
+
+    fn set_pixel_block(&mut self, block: u32) {
+        if self.frames.is_empty() {
+            self.pixel_block = block.max(1);
+        }
+    }
+
+    fn pixel_art(&self) -> bool {
+        self.pixel_block > 1
+            || self.budget.scaling == crate::config::types::AnimationScaling::Nearest
     }
 
     fn is_full(&self) -> bool {
@@ -404,13 +524,19 @@ impl<'a> FrameCollector<'a> {
     }
 
     fn target_size(&mut self, width: u32, height: u32) -> (u32, u32) {
+        let block = self.pixel_block;
         *self.size.get_or_insert_with(|| {
-            let (w, h) = cover_size(
-                width,
-                height,
-                self.budget.display_width,
-                self.budget.display_height,
-            );
+            let (w, h) = if block > 1 {
+                // Native art size; the GPU scales it up by a whole factor.
+                (width / block, height / block)
+            } else {
+                cover_size(
+                    width,
+                    height,
+                    self.budget.display_width,
+                    self.budget.display_height,
+                )
+            };
             let frames = self
                 .planned
                 .map_or(2, |planned| planned.min(self.max_frames))
@@ -444,7 +570,7 @@ impl<'a> FrameCollector<'a> {
             }
         }
 
-        let bgra = scaled_bgra(rgba, (width, height), target);
+        let bgra = scaled_bgra(rgba, (width, height), target, self.pixel_art());
         // Identical frames (common in GIFs that hold a pose) cost nothing.
         if let Some(previous) = self.frames.last_mut() {
             if previous.bgra == bgra {
@@ -470,8 +596,9 @@ impl<'a> FrameCollector<'a> {
             ) {
                 // Shrink now with headroom for as many frames again.
                 Some(smaller) => {
+                    let pixel_art = self.pixel_art();
                     for frame in &mut self.frames {
-                        frame.bgra = rescale_stored(frame, current, smaller);
+                        frame.bgra = rescale_stored(frame, current, smaller, pixel_art);
                     }
                     self.size = Some(smaller);
                 }
@@ -489,13 +616,58 @@ impl<'a> FrameCollector<'a> {
         if self.frames.len() < 2 {
             return None;
         }
+        let pixel_art = self.pixel_art();
         let (width, height) = self.size.unwrap_or((0, 0));
+        let mut frames = self.frames;
+        let background = border_color(&frames[0].bgra, width, height);
+        // Transparent pixels would otherwise show as black.
+        for frame in &mut frames {
+            for pixel in frame.bgra.chunks_exact_mut(4) {
+                if pixel[3] == 0 {
+                    pixel.copy_from_slice(&background);
+                } else {
+                    pixel[3] = 255;
+                }
+            }
+        }
         Some(Animation {
             width,
             height,
-            frames: self.frames,
+            frames,
+            pixel_art,
+            background,
         })
     }
+}
+
+/// Most common opaque colour on the image border (BGRA), black if none.
+fn border_color(bgra: &[u8], width: u32, height: u32) -> [u8; 4] {
+    use std::collections::HashMap;
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || bgra.len() < w * h * 4 {
+        return [0, 0, 0, 255];
+    }
+    let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+    let mut count = |x: usize, y: usize| {
+        let at = (y * w + x) * 4;
+        if bgra[at + 3] != 0 {
+            *counts
+                .entry([bgra[at], bgra[at + 1], bgra[at + 2]])
+                .or_default() += 1;
+        }
+    };
+    for x in 0..w {
+        count(x, 0);
+        count(x, h - 1);
+    }
+    for y in 0..h {
+        count(0, y);
+        count(w - 1, y);
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map_or([0, 0, 0, 255], |(c, _)| [c[0], c[1], c[2], 255])
 }
 
 /// Collect an iterator of RGBA frames (used by tests).
@@ -523,6 +695,7 @@ mod tests {
             max_bytes,
             max_frames,
             min_delay: Duration::from_millis(min_delay_ms),
+            scaling: crate::config::types::AnimationScaling::Auto,
         }
     }
 
@@ -683,10 +856,17 @@ mod tests {
             for pixel in rgba.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
-            // Transparent pixels only need to agree on transparency.
+            // Transparent pixels are filled with the background colour; only
+            // the opaque ones must match exactly.
+            let background = [
+                ours.background[2],
+                ours.background[1],
+                ours.background[0],
+                255,
+            ];
             for (a, b) in rgba.chunks_exact(4).zip(expected.as_raw().chunks_exact(4)) {
-                if a[3] == 0 || b[3] == 0 {
-                    assert_eq!(a[3], b[3], "frame {index} transparency");
+                if b[3] == 0 {
+                    assert_eq!(a, background, "frame {index} transparent fill");
                 } else {
                     assert_eq!(a, b, "frame {index} color");
                 }
@@ -721,6 +901,75 @@ mod tests {
         // Three identical black frames collapse into one 330 ms frame.
         assert_eq!(animation.frames.len(), 3);
         assert_eq!(animation.frames[0].delay, Duration::from_millis(330));
+    }
+
+    #[test]
+    fn upscaled_pixel_art_is_stored_at_native_size_with_nearest_sampling() {
+        use gif::{Encoder, Frame as GifFrame, Repeat};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pixel.gif");
+        // 32x32 art upscaled 4x to 128x128; index 2 is transparent.
+        let palette = [10, 20, 30, 200, 50, 50, 0, 0, 0];
+        {
+            let mut encoder =
+                Encoder::new(File::create(&path).unwrap(), 128, 128, &palette).unwrap();
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for shift in 0..3u16 {
+                let pixels: Vec<u8> = (0..128u16 * 128)
+                    .map(|i| {
+                        let (x, y) = (i % 128 / 4, i / 128 / 4);
+                        if x == 0 && y == 0 {
+                            2
+                        } else if (x + y + shift) % 5 == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                    .map(|v| v as u8)
+                    .collect();
+                let mut frame = GifFrame::from_indexed_pixels(128, 128, pixels, Some(2));
+                frame.delay = 10;
+                encoder.write_frame(&frame).unwrap();
+            }
+        }
+        let animation = decode_animation(&path, &budget(1 << 30, 100, 0))
+            .unwrap()
+            .unwrap();
+        assert!(animation.pixel_art);
+        assert_eq!((animation.width, animation.height), (32, 32));
+        assert_eq!(animation.frames.len(), 3);
+        // Border is mostly palette 0 (rgb 10,20,30) -> BGRA background.
+        assert_eq!(animation.background, [30, 20, 10, 255]);
+        // The transparent corner is filled with the background.
+        assert_eq!(&animation.frames[0].bgra[..4], &[30, 20, 10, 255]);
+        // Every stored pixel is exactly a palette colour (no blending).
+        for frame in &animation.frames {
+            for pixel in frame.bgra.chunks_exact(4) {
+                assert!(
+                    pixel == [30, 20, 10, 255] || pixel == [50, 50, 200, 255],
+                    "{pixel:?}"
+                );
+            }
+        }
+
+        let smooth = FrameBudget {
+            scaling: crate::config::types::AnimationScaling::Smooth,
+            ..budget(1 << 30, 100, 0)
+        };
+        let animation = decode_animation(&path, &smooth).unwrap().unwrap();
+        assert!(!animation.pixel_art);
+        assert_eq!((animation.width, animation.height), (128, 128));
+    }
+
+    #[test]
+    fn block_detection_rejects_photos_and_small_images() {
+        let mut rgba = vec![0u8; 64 * 64 * 4];
+        // Flat images are trivially blocky; the native-size floor caps it.
+        assert_eq!(pixel_block(&rgba, 64, 64), 2);
+        rgba[4 * 5] = 9; // one odd pixel at x=5
+        assert_eq!(pixel_block(&rgba, 64, 64), 1);
+        assert_eq!(pixel_block(&[0; 16 * 16 * 4], 16, 16), 1);
     }
 
     #[test]

@@ -111,6 +111,7 @@ animated {
     pause-when-covered true
     max-memory-mb 32
     max-frames 240
+    scaling "auto"
 }
 ```
 
@@ -128,6 +129,15 @@ Playback is bounded and power-aware:
   windows, and GPU device exist only while something animates.
 - **Frame rate:** frames shorter than `1 / max-fps` merge into their
   neighbours, and so do identical consecutive frames.
+- **Pixel art:** with `scaling "auto"`, frames that are made of uniform
+  NxN blocks count as upscaled pixel art. They are stored at their native
+  size, which uses N² times less memory. The GPU scales them up by the largest
+  whole factor that fits, with nearest-neighbour, so they stay crisp. They are
+  centered and never cropped, and the bars are filled with the art's edge
+  colour. `smooth` turns detection off; `nearest` always uses
+  nearest-neighbour.
+- **Transparency:** transparent pixels show the same edge colour instead of
+  black.
 - **GPU-resident frames:** each frame is uploaded to the GPU once. After that,
   playback is a draw and a present, with no per-frame CPU copy.
 - **Memory:** frames are downscaled to the display, and further until they fit

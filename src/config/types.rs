@@ -167,6 +167,32 @@ pub struct AnimatedConfig {
     pub max_memory_mb: u32,
     /// Frame budget per animation; longer animations drop evenly spaced frames.
     pub max_frames: u32,
+    /// How frames are resampled: `auto` detects upscaled pixel art.
+    pub scaling: AnimationScaling,
+}
+
+/// Resampling for animated wallpapers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationScaling {
+    /// Pixel art (frames made of uniform NxN blocks) is stored at its native
+    /// size and scaled by a whole factor with nearest-neighbour; everything
+    /// else is filtered smoothly.
+    #[default]
+    Auto,
+    Smooth,
+    /// Always nearest-neighbour, at a whole factor when the art fits.
+    Nearest,
+}
+
+impl AnimationScaling {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "smooth" | "linear" => Some(Self::Smooth),
+            "nearest" | "pixel" | "pixel-art" => Some(Self::Nearest),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AnimatedConfig {
@@ -178,6 +204,7 @@ impl Default for AnimatedConfig {
             pause_when_covered: true,
             max_memory_mb: 32,
             max_frames: 240,
+            scaling: AnimationScaling::Auto,
         }
     }
 }

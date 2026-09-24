@@ -576,6 +576,13 @@ fn apply_kv(
                     }
                     animated.max_memory_mb = mb;
                 }
+                "scaling" => {
+                    animated.scaling = AnimationScaling::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "animated scaling must be \"auto\", \"smooth\", or \"nearest\""
+                        )
+                    })?;
+                }
                 "max-frames" | "max_frames" => {
                     let frames = parse_u32(value)?;
                     if !(2..=2000).contains(&frames) {
@@ -736,6 +743,7 @@ mod tests {
                 pause_when_covered: false,
                 max_memory_mb: 96,
                 max_frames: 500,
+                scaling: AnimationScaling::Auto,
             }
         );
 
@@ -745,6 +753,7 @@ mod tests {
             "max-memory-mb 2",
             "max-memory-mb 4096",
             "max-frames 1",
+            "scaling blurry",
             "unknown 1",
         ] {
             assert!(

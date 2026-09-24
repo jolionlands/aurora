@@ -344,6 +344,7 @@ impl PlayerLoop {
             max_bytes: (self.config.max_memory_mb as usize) * 1024 * 1024,
             max_frames: self.config.max_frames as usize,
             min_delay: Duration::from_millis(1000 / u64::from(self.config.max_fps.max(1))),
+            scaling: self.config.scaling,
         };
         let path = display.path.clone();
         let monitor_id = monitor_id.to_string();
@@ -917,6 +918,8 @@ mod tests {
                         width: 1,
                         height: 1,
                         frames: Vec::new(),
+                        pixel_art: false,
+                        background: [0, 0, 0, 255],
                     },
                     pixels_released: false,
                     window: None,

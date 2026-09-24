@@ -74,4 +74,5 @@ animated {
     pause-when-covered true  // freeze a display under a maximized/fullscreen window
     max-memory-mb 32         // decoded frames per display (kept on the GPU while playing)
     max-frames 240           // longer animations drop evenly spaced frames
+    scaling "auto"           // auto | smooth | nearest (auto: crisp, uncropped pixel art)
 }
