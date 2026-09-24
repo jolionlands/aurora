@@ -330,6 +330,7 @@ Aurora keeps its state together under `%APPDATA%\aurora`:
 | `bans.txt` | Exact content hashes that Aurora must not display |
 | `autotag-batch.jsonl` | Default append-only batch audit trail |
 | `playlist-content.txn.json` | Transient recovery marker for coordinated playlist/content updates |
+| `aurora.log` | Daemon log when started without a console (rotated to `aurora.log.1` at 2 MB) |
 
 Single-file stores are written through synchronized temporary files before
 replacement. Updates spanning both `playlists.kdl` and `content.json` first

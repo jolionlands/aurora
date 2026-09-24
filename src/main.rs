@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         );
     }
     if args.register_autostart || args.unregister_autostart {
-        init_logging("info")?;
+        init_logging("info", None)?;
     }
 
     if args.register_autostart {
@@ -152,7 +152,7 @@ async fn run_daemon() -> Result<()> {
     let config = parse_kdl_config(&config_src)
         .with_context(|| format!("parse config {}", config_path.display()))?;
 
-    init_logging(&config.log_level)?;
+    init_logging(&config.log_level, config_path.parent())?;
     info!("aurora {} starting", env!("CARGO_PKG_VERSION"));
     if wrote_default_config {
         info!("Wrote default config to {}", config_path.display());
@@ -316,7 +316,11 @@ fn inspect_wallpapers() -> Result<()> {
     Ok(())
 }
 
-fn init_logging(default_filter: &str) -> Result<()> {
+/// Log to stderr when there is one; otherwise (the normal detached daemon)
+/// to a size-capped `aurora.log` in `log_dir`.
+fn init_logging(default_filter: &str, log_dir: Option<&Path>) -> Result<()> {
+    use aurora::logging::{stderr_is_usable, RotatingFile, LOG_FILENAME, MAX_LOG_BYTES};
+
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => EnvFilter::try_new(value).context("invalid RUST_LOG filter")?,
         Err(std::env::VarError::NotPresent) => EnvFilter::try_new(default_filter)
@@ -325,11 +329,23 @@ fn init_logging(default_filter: &str) -> Result<()> {
             anyhow::bail!("RUST_LOG is not valid Unicode")
         }
     };
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(filter)
-        .try_init()
-        .context("initialize logging")
+    let registry = tracing_subscriber::registry().with(filter);
+    match log_dir.filter(|_| !stderr_is_usable()) {
+        Some(dir) => {
+            let file = RotatingFile::open(&dir.join(LOG_FILENAME), MAX_LOG_BYTES)?;
+            registry
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file)),
+                )
+                .try_init()
+        }
+        None => registry
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .try_init(),
+    }
+    .context("initialize logging")
 }
 
 async fn wait_for_core_exit(

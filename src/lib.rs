@@ -7,6 +7,7 @@ pub mod hooks;
 pub mod index;
 pub mod integrations;
 pub mod ipc;
+pub mod logging;
 pub mod metrics;
 pub mod playlist;
 pub mod runtime;
