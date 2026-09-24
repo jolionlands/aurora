@@ -39,6 +39,12 @@ use render::Gpu;
 pub use frames::may_be_animated;
 
 const POLICY_INTERVAL: Duration = Duration::from_secs(1);
+/// Policy check interval while battery, lock, or display-off freezes all
+/// animation.
+const FROZEN_POLICY_INTERVAL: Duration = Duration::from_secs(5);
+/// After this long frozen everywhere, decoded frames and GPU objects are
+/// released; they are decoded again when playback may resume.
+const RELEASE_FROZEN_AFTER: Duration = Duration::from_secs(60);
 /// If playback falls this far behind (e.g. after sleep), resynchronise
 /// instead of fast-forwarding through the missed frames.
 const MAX_FRAME_LAG: Duration = Duration::from_secs(1);
@@ -199,6 +205,8 @@ struct Display {
     path: PathBuf,
     generation: u64,
     playing: Option<Playing>,
+    /// Frames were released during a long freeze; decode again on resume.
+    released: bool,
 }
 
 struct PlayerLoop {
@@ -212,6 +220,8 @@ struct PlayerLoop {
     next_generation: u64,
     next_policy: Instant,
     frozen_everywhere: bool,
+    /// When the current everywhere-freeze began.
+    frozen_since: Option<Instant>,
     power: Option<power::DisplayPowerWatch>,
     /// Direct3D/Direct2D objects; present only while something animates.
     gpu: Option<Gpu>,
@@ -234,6 +244,7 @@ impl PlayerLoop {
             next_generation: 0,
             next_policy: Instant::now(),
             frozen_everywhere: false,
+            frozen_since: None,
             power: None,
             gpu: None,
         }
@@ -254,9 +265,14 @@ impl PlayerLoop {
                 self.gpu = None;
             }
             let now = Instant::now();
-            if self.any_playing() && now >= self.next_policy {
+            if self.any_active() && now >= self.next_policy {
                 self.apply_policy(now);
-                self.next_policy = now + POLICY_INTERVAL;
+                let interval = if self.frozen_everywhere {
+                    FROZEN_POLICY_INTERVAL
+                } else {
+                    POLICY_INTERVAL
+                };
+                self.next_policy = now + interval;
             }
             self.advance_frames(Instant::now());
             let timeout = self.timeout(Instant::now());
@@ -268,15 +284,6 @@ impl PlayerLoop {
     fn handle(&mut self, command: Command) -> bool {
         match command {
             Command::Show(target, path) => {
-                self.next_generation += 1;
-                let generation = self.next_generation;
-                let budget = FrameBudget {
-                    display_width: target.bounds.width,
-                    display_height: target.bounds.height,
-                    max_bytes: (self.config.max_memory_mb as usize) * 1024 * 1024,
-                    max_frames: self.config.max_frames as usize,
-                    min_delay: Duration::from_millis(1000 / u64::from(self.config.max_fps.max(1))),
-                };
                 let monitor_id = target.monitor_id.clone();
                 // Replacing a display drops its old window right away; the
                 // new file's first frame is already the static wallpaper.
@@ -284,29 +291,13 @@ impl PlayerLoop {
                     monitor_id.clone(),
                     Display {
                         target,
-                        path: path.clone(),
-                        generation,
+                        path,
+                        generation: 0,
                         playing: None,
+                        released: false,
                     },
                 );
-                // Decode off this thread: it pumps messages for windows
-                // parented to Explorer and must never stall.
-                let results = self.results.clone();
-                let wake = Arc::clone(&self.wake);
-                let spawned = std::thread::Builder::new()
-                    .name("aurora-animation-decode".into())
-                    .spawn(move || {
-                        let result = frames::decode_animation(&path, &budget);
-                        let _ = results.send(Command::Decoded {
-                            monitor_id,
-                            generation,
-                            result,
-                        });
-                        wake.signal();
-                    });
-                if let Err(error) = spawned {
-                    warn!("could not start animation decode: {error}");
-                }
+                self.start_decode(&monitor_id);
             }
             Command::Hide(monitor_id) => {
                 self.displays.remove(&monitor_id);
@@ -323,6 +314,43 @@ impl PlayerLoop {
             }
         }
         true
+    }
+
+    /// Decode a display's file off this thread: it pumps messages for windows
+    /// parented to Explorer and must never stall.
+    fn start_decode(&mut self, monitor_id: &str) {
+        let Some(display) = self.displays.get_mut(monitor_id) else {
+            return;
+        };
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        display.generation = generation;
+        display.released = false;
+        let budget = FrameBudget {
+            display_width: display.target.bounds.width,
+            display_height: display.target.bounds.height,
+            max_bytes: (self.config.max_memory_mb as usize) * 1024 * 1024,
+            max_frames: self.config.max_frames as usize,
+            min_delay: Duration::from_millis(1000 / u64::from(self.config.max_fps.max(1))),
+        };
+        let path = display.path.clone();
+        let monitor_id = monitor_id.to_string();
+        let results = self.results.clone();
+        let wake = Arc::clone(&self.wake);
+        let spawned = std::thread::Builder::new()
+            .name("aurora-animation-decode".into())
+            .spawn(move || {
+                let result = frames::decode_animation(&path, &budget);
+                let _ = results.send(Command::Decoded {
+                    monitor_id,
+                    generation,
+                    result,
+                });
+                wake.signal();
+            });
+        if let Err(error) = spawned {
+            warn!("could not start animation decode: {error}");
+        }
     }
 
     fn install(&mut self, monitor_id: &str, generation: u64, result: Result<Option<Animation>>) {
@@ -370,6 +398,41 @@ impl PlayerLoop {
             .any(|display| display.playing.is_some())
     }
 
+    /// Something is playing or waiting to be decoded again after a freeze.
+    fn any_active(&self) -> bool {
+        self.displays
+            .values()
+            .any(|display| display.playing.is_some() || display.released)
+    }
+
+    /// Release or restore frames across long everywhere-freezes.
+    fn manage_long_freeze(&mut self, frozen_everywhere: bool, now: Instant) {
+        if !frozen_everywhere {
+            self.frozen_since = None;
+            let released: Vec<String> = self
+                .displays
+                .iter()
+                .filter(|(_, display)| display.released)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for monitor_id in released {
+                debug!(monitor = %monitor_id, "resuming animated wallpaper after freeze");
+                self.start_decode(&monitor_id);
+            }
+            return;
+        }
+        let since = *self.frozen_since.get_or_insert(now);
+        if now.duration_since(since) < RELEASE_FROZEN_AFTER {
+            return;
+        }
+        for entry in self.displays.values_mut() {
+            if entry.playing.take().is_some() {
+                entry.released = true;
+                debug!(path = %entry.path.display(), "released frozen animation frames");
+            }
+        }
+    }
+
     fn apply_policy(&mut self, now: Instant) {
         let display_off = self.power.as_ref().is_some_and(|power| power.display_off());
         let state = policy::sample_system_state(display_off);
@@ -382,6 +445,7 @@ impl PlayerLoop {
             );
             self.frozen_everywhere = frozen_everywhere;
         }
+        self.manage_long_freeze(frozen_everywhere, now);
         let covered = if self.config.pause_when_covered && !frozen_everywhere {
             policy::covered_monitor()
         } else {
@@ -531,7 +595,11 @@ impl PlayerLoop {
 
     /// How long the thread may sleep: forever when nothing plays.
     fn timeout(&self, now: Instant) -> Option<Duration> {
-        let mut deadline: Option<Instant> = None;
+        let mut deadline: Option<Instant> = self
+            .displays
+            .values()
+            .any(|display| display.released)
+            .then_some(self.next_policy);
         for playing in self
             .displays
             .values()
@@ -705,6 +773,74 @@ mod power {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_power_freeze_releases_frames_and_resume_redecodes() {
+        let (results, commands) = mpsc::channel();
+        let mut player = PlayerLoop::new(
+            AnimatedConfig {
+                enabled: true,
+                ..AnimatedConfig::default()
+            },
+            commands,
+            results,
+            Arc::new(WakeEvent::new().unwrap()),
+        );
+        let target = DisplayTarget {
+            monitor_id: "m".into(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            fit: WallpaperFit::Fill,
+        };
+        player.displays.insert(
+            "m".into(),
+            Display {
+                target,
+                path: PathBuf::from(r"C:\missing\loop.gif"),
+                generation: 1,
+                playing: Some(Playing {
+                    animation: Arc::new(Animation {
+                        width: 1,
+                        height: 1,
+                        frames: Vec::new(),
+                    }),
+                    window: None,
+                    frame: 0,
+                    next_due: Instant::now(),
+                    frozen: true,
+                    draw_failed: false,
+                }),
+                released: false,
+            },
+        );
+        player.next_generation = 1;
+        let start = Instant::now();
+        player.manage_long_freeze(true, start);
+        assert!(
+            player.displays["m"].playing.is_some(),
+            "short freezes keep frames"
+        );
+        player.manage_long_freeze(true, start + RELEASE_FROZEN_AFTER);
+        assert!(player.displays["m"].playing.is_none());
+        assert!(player.displays["m"].released);
+        assert!(player.any_active() && !player.any_playing());
+        assert!(
+            player.timeout(start).is_some(),
+            "released displays keep policy checks"
+        );
+
+        player.manage_long_freeze(false, start + RELEASE_FROZEN_AFTER * 2);
+        assert!(!player.displays["m"].released);
+        assert_eq!(
+            player.displays["m"].generation,
+            1 + 1,
+            "a new decode was started"
+        );
+    }
 
     #[test]
     fn disabled_config_creates_no_player() {

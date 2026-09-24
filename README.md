@@ -139,6 +139,10 @@ Playback is bounded and power-aware:
   - a maximized or fullscreen window covers that display
     (`pause-when-covered`).
 
+  A freeze caused by battery, battery saver, the lock screen, or the display
+  being off releases the decoded frames and the GPU device after a minute.
+  They are decoded again when playback resumes.
+
 To try a file without the daemon:
 
 ```powershell
