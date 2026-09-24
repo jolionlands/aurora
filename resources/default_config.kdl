@@ -61,3 +61,17 @@ metrics {
 cache {
     decoded-mb 256
 }
+
+// ---------------------------------------------------------------------------
+// Animated wallpapers (GIF / animated WebP) - off by default.
+// When off, animated files show their first frame like any other image.
+// Also add "gif" (and "webp") to a source's extensions to rotate them in.
+// ---------------------------------------------------------------------------
+animated {
+    enabled false
+    max-fps 15               // frames faster than this are merged
+    pause-on-battery true    // battery saver, lock screen, display off always pause
+    pause-when-covered true  // freeze a display under a maximized/fullscreen window
+    max-memory-mb 48         // decoded frames per display; larger animations are downscaled
+    max-frames 240           // longer animations drop evenly spaced frames
+}

@@ -15,6 +15,7 @@ pub struct Config {
     pub transitions: TransitionConfig,
     pub metrics: MetricsConfig,
     pub cache: CacheConfig,
+    pub animated: AnimatedConfig,
     pub log_level: String,
 }
 
@@ -27,6 +28,7 @@ impl Default for Config {
             transitions: TransitionConfig::default(),
             metrics: MetricsConfig::default(),
             cache: CacheConfig::default(),
+            animated: AnimatedConfig::default(),
             log_level: "info".to_string(),
         }
     }
@@ -141,5 +143,39 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self { decoded_mb: 256 }
+    }
+}
+
+/// Upper bound for `animated.max-fps`.
+pub const MAX_ANIMATION_FPS: u32 = 60;
+
+/// Opt-in playback of animated GIF and WebP wallpapers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimatedConfig {
+    pub enabled: bool,
+    /// Frames shown faster than this rate are merged at decode time.
+    pub max_fps: u32,
+    /// Freeze animation while the laptop runs on battery power. Battery saver
+    /// always freezes animation.
+    pub pause_on_battery: bool,
+    /// Freeze a display's animation while a fullscreen or maximized window
+    /// covers it.
+    pub pause_when_covered: bool,
+    /// Decoded-frame budget per display; larger animations are downscaled.
+    pub max_memory_mb: u32,
+    /// Frame budget per animation; longer animations drop evenly spaced frames.
+    pub max_frames: u32,
+}
+
+impl Default for AnimatedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_fps: 15,
+            pause_on_battery: true,
+            pause_when_covered: true,
+            max_memory_mb: 48,
+            max_frames: 240,
+        }
     }
 }

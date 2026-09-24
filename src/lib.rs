@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod apply;
 pub mod config;
 pub mod content;

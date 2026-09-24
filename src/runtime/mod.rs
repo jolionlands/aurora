@@ -15,7 +15,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::apply::{configured_global_fit, MonitorSnapshot};
+use crate::animation::{AnimationPlayer, DisplayTarget};
+use crate::apply::{configured_global_fit, MonitorInfo, MonitorSnapshot, WallpaperFit};
 use crate::config::types::{Config, DEFAULT_IMAGE_EXTENSIONS};
 use crate::content::{
     content_path, load_content, parse_content, persist_content, serialize_content,
@@ -76,6 +77,8 @@ pub struct Runtime {
     content_store: Arc<Mutex<ContentStore>>,
     /// Sequential cursor: playlist_name → next_index.
     playlist_cursor: std::collections::HashMap<String, usize>,
+    /// Animated GIF/WebP playback; `None` unless `animated.enabled`.
+    animation: Option<AnimationPlayer>,
 }
 
 const HISTORY_CAP: usize = 50;
@@ -706,13 +709,55 @@ fn runtime_state_from_snapshots(snapshots: Vec<MonitorSnapshot>) -> (RuntimeStat
     (state, complete)
 }
 
-fn initial_runtime_state() -> (RuntimeState, bool) {
+fn initial_runtime_state() -> (RuntimeState, bool, Vec<MonitorInfo>) {
     match inspect_wallpapers_in_child() {
-        Ok(snapshots) => runtime_state_from_snapshots(snapshots),
+        Ok(snapshots) => {
+            let monitors = snapshots
+                .iter()
+                .map(|snapshot| snapshot.monitor.clone())
+                .collect();
+            let (state, complete) = runtime_state_from_snapshots(snapshots);
+            (state, complete, monitors)
+        }
         Err(error) => {
             warn!("could not seed current wallpapers: {error:#}");
-            (RuntimeState::new(), false)
+            (RuntimeState::new(), false, Vec::new())
         }
+    }
+}
+
+fn display_target(monitor: &MonitorInfo, fit: WallpaperFit) -> DisplayTarget {
+    DisplayTarget {
+        monitor_id: monitor.id.clone(),
+        bounds: Rect {
+            x: monitor.x,
+            y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
+        },
+        fit,
+    }
+}
+
+/// Start or stop animated playback for the displays that just changed.
+fn update_animation(
+    player: &mut AnimationPlayer,
+    monitors: Option<&[MonitorInfo]>,
+    fit: WallpaperFit,
+    path: &Path,
+    successful_monitor_ids: &[String],
+) {
+    let Some(monitors) = monitors else {
+        // Without display geometry nothing can be placed; show the static
+        // all-monitor wallpaper instead.
+        player.hide_all();
+        return;
+    };
+    for monitor in monitors
+        .iter()
+        .filter(|monitor| successful_monitor_ids.contains(&monitor.id))
+    {
+        player.show(display_target(monitor, fit), path.to_path_buf());
     }
 }
 
@@ -1106,9 +1151,19 @@ impl Runtime {
             })?;
         }
 
-        let (state, complete_monitor_snapshot) = initial_runtime_state();
+        let (state, complete_monitor_snapshot, monitors) = initial_runtime_state();
         if complete_monitor_snapshot {
             scheduler_progress.seed_success();
+        }
+        let mut animation = AnimationPlayer::from_config(&config.animated);
+        if let Some(player) = animation.as_mut().filter(|_| !monitors.is_empty()) {
+            // Resume an animated wallpaper that was already showing.
+            let fit = configured_global_fit(config, &monitors);
+            for monitor in &monitors {
+                if let Some(path) = state.current_path.get(&monitor.id) {
+                    player.show(display_target(monitor, fit), path.clone());
+                }
+            }
         }
         for (monitor, path) in &state.current_path {
             metrics.set_current_photo(monitor, path.clone());
@@ -1127,6 +1182,7 @@ impl Runtime {
             playlist_store: Arc::new(Mutex::new(playlist_store)),
             content_store: Arc::new(Mutex::new(content_store)),
             playlist_cursor: std::collections::HashMap::new(),
+            animation,
         })
     }
 
@@ -1355,12 +1411,16 @@ impl Runtime {
             return Ok(());
         }
 
-        let (successful_monitors, failures, total_monitors) = if let Some(monitors) = monitors {
-            let fit = configured_global_fit(&self.config, &monitors).as_str();
+        let global_fit = monitors
+            .as_deref()
+            .map(|monitors| configured_global_fit(&self.config, monitors))
+            .unwrap_or(WallpaperFit::Fill);
+        let (successful_monitors, failures, total_monitors) = if let Some(monitors) = &monitors {
+            let fit = global_fit.as_str();
 
             let mut successful_monitors = Vec::new();
             let mut failures = Vec::new();
-            for monitor in &monitors {
+            for monitor in monitors {
                 let (tw, th) = (monitor.width, monitor.height);
                 let prev_path = self.state.current_path.get(&monitor.id).cloned();
                 let transition_images = if needs_transition_decode(
@@ -1457,6 +1517,15 @@ impl Runtime {
             (vec![ALL_MONITORS_ID.to_string()], Vec::new(), 1)
         };
 
+        if let Some(player) = &mut self.animation {
+            update_animation(
+                player,
+                monitors.as_deref(),
+                global_fit,
+                &new_path,
+                &successful_monitors,
+            );
+        }
         let successful = successful_monitors.len();
         commit_successful_monitors(
             &mut self.state,

@@ -238,6 +238,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                             | "transition"
                             | "metrics"
                             | "cache"
+                            | "animated"
                     ) | ("source", "extensions")
                 );
                 if !known {
@@ -550,6 +551,42 @@ fn apply_kv(
             _ => bail!("unknown key {:?} in cache", key),
         },
 
+        // ---- animated wallpaper block ----
+        "animated" => {
+            let animated = &mut config.animated;
+            match key {
+                "enabled" => animated.enabled = parse_bool(value)?,
+                "max-fps" | "max_fps" => {
+                    let fps = parse_u32(value)?;
+                    if fps == 0 || fps > MAX_ANIMATION_FPS {
+                        bail!("animated max-fps must be between 1 and {MAX_ANIMATION_FPS}");
+                    }
+                    animated.max_fps = fps;
+                }
+                "pause-on-battery" | "pause_on_battery" => {
+                    animated.pause_on_battery = parse_bool(value)?;
+                }
+                "pause-when-covered" | "pause_when_covered" => {
+                    animated.pause_when_covered = parse_bool(value)?;
+                }
+                "max-memory-mb" | "max_memory_mb" => {
+                    let mb = parse_u32(value)?;
+                    if !(4..=1024).contains(&mb) {
+                        bail!("animated max-memory-mb must be between 4 and 1024");
+                    }
+                    animated.max_memory_mb = mb;
+                }
+                "max-frames" | "max_frames" => {
+                    let frames = parse_u32(value)?;
+                    if !(2..=2000).contains(&frames) {
+                        bail!("animated max-frames must be between 2 and 2000");
+                    }
+                    animated.max_frames = frames;
+                }
+                _ => bail!("unknown key {:?} in animated", key),
+            }
+        }
+
         _ => bail!("unknown section {:?}", section),
     }
     Ok(())
@@ -676,6 +713,45 @@ mod tests {
                 .transitions
                 .enabled
         );
+    }
+
+    #[test]
+    fn animated_wallpapers_are_opt_in_and_bounded() {
+        let defaults = parse_kdl_config("").unwrap().animated;
+        assert_eq!(defaults, AnimatedConfig::default());
+        assert!(!defaults.enabled);
+
+        let config = parse_kdl_config(
+            "animated {\nenabled true\nmax-fps 24\npause-on-battery false\n\
+             pause-when-covered false\nmax-memory-mb 96\nmax-frames 500\n}",
+        )
+        .unwrap()
+        .animated;
+        assert_eq!(
+            config,
+            AnimatedConfig {
+                enabled: true,
+                max_fps: 24,
+                pause_on_battery: false,
+                pause_when_covered: false,
+                max_memory_mb: 96,
+                max_frames: 500,
+            }
+        );
+
+        for invalid in [
+            "max-fps 0",
+            "max-fps 61",
+            "max-memory-mb 2",
+            "max-memory-mb 4096",
+            "max-frames 1",
+            "unknown 1",
+        ] {
+            assert!(
+                parse_kdl_config(&format!("animated {{\n{invalid}\n}}")).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
     }
 
     #[test]

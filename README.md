@@ -11,7 +11,7 @@ Fast indexing. Smooth transitions. Content-aware playlists. Local control.
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Quick start](#quick-start) | [Transitions](#enable-transitions) | [Playlists](#playlists-and-metadata) | [Autotagging](#ai-assisted-tagging) | [Scheduling](#scheduling-behavior) | [Configuration](#configuration-and-storage)
+[Quick start](#quick-start) | [Transitions](#enable-transitions) | [Animated](#animated-wallpapers) | [Playlists](#playlists-and-metadata) | [Autotagging](#ai-assisted-tagging) | [Scheduling](#scheduling-behavior) | [Configuration](#configuration-and-storage)
 
 </div>
 
@@ -35,6 +35,7 @@ limit; with transitions disabled, wallpaper commits bypass that decode cache.
 | **Organized** | Static and dynamic playlists, ratings, frequency weights, grouped tags, and filters |
 | **Content-aware** | Exact BLAKE3 identity reconnects indexed renames and shares metadata across duplicates |
 | **Automatable** | Named-pipe IPC, real-time events, optional Prometheus metrics, and a companion CLI |
+| **Animated** | Opt-in GIF and animated WebP playback on the desktop layer, frozen on battery, fullscreen, and lock screen |
 | **Flexible** | Interval or fixed-time schedules, fullscreen/idle pauses, and optional wiri workspace triggers |
 
 Bundled decoding supports JPEG, PNG, GIF, WebP, BMP, TIFF, and ICO. Explicit
@@ -96,6 +97,53 @@ transitions skips only the animation—the normal commit remains per-display so
 one wallpaper change does not force an all-monitor desktop refresh. Aurora
 falls back to one native all-monitor commit only if Windows cannot enumerate
 the displays.
+
+## Animated wallpapers
+
+Animated GIF and WebP files always work as ordinary wallpapers: Windows shows
+their first frame. To play them, opt in and restart Aurora:
+
+```kdl
+animated {
+    enabled true
+    max-fps 15
+    pause-on-battery true
+    pause-when-covered true
+    max-memory-mb 48
+    max-frames 240
+}
+```
+
+Remember to include `gif` (and `webp`) in a source's `extensions`.
+
+Aurora still commits the file through `IDesktopWallpaper`, then draws the
+frames in a window on the desktop layer, below the icons. On Windows 11 24H2
+and later it uses the "raised desktop" layout, and a Direct3D swap chain
+presents the frames. That is the only presentation method the new layout
+composes. Older layouts use the classic `WorkerW` host.
+
+Playback is bounded and power-aware:
+
+- **Nothing runs** until an animated file is shown. The player thread,
+  windows, and GPU device exist only while something animates.
+- **Frame rate:** frames shorter than `1 / max-fps` merge into their
+  neighbours.
+- **Memory:** frames are downscaled to the display, and further until they fit
+  `max-memory-mb` per display. Past `max-frames`, evenly spaced frames are
+  dropped.
+- **Freezing:** animation freezes on the current frame when:
+  - battery saver is on;
+  - the session is locked;
+  - the display is off;
+  - the laptop is on battery power (`pause-on-battery`);
+  - a maximized or fullscreen window covers that display
+    (`pause-when-covered`).
+
+To try a file without the daemon:
+
+```powershell
+cargo run --release --example animated_preview -- "D:\Wallpapers\loop.gif" 15
+```
 
 ## Control
 
@@ -272,7 +320,7 @@ Aurora keeps its state together under `%APPDATA%\aurora`:
 
 | File | Purpose |
 | --- | --- |
-| `config.kdl` | Sources, scheduling, transitions, monitors, metrics, and cache limits |
+| `config.kdl` | Sources, scheduling, transitions, animation, monitors, metrics, and cache limits |
 | `playlists.kdl` | Playlist membership, order, shuffle, frequency, and compatibility metadata copies |
 | `content.json` | Versioned tags, ratings, dimensions, aliases, dynamic playlist markers and filters, and autotag provenance |
 | `index-cache.json` | Validated photo index used for fast restart and reload |
@@ -287,8 +335,8 @@ interrupted committed install. The marker is normally removed immediately
 after both files are installed.
 
 `aurora-ctl reload` refreshes configured sources, playlists, content metadata,
-and bans together. Schedule, transition, monitor, cache-budget, metrics, and
-log-level changes require a daemon restart.
+and bans together. Schedule, transition, animation, monitor, cache-budget,
+metrics, and log-level changes require a daemon restart.
 
 ## Development
 
