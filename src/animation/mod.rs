@@ -34,7 +34,7 @@ use crate::config::types::AnimatedConfig;
 use crate::transition::Rect;
 use desktop::{DesktopHost, PlayerWindow};
 use frames::{Animation, FrameBudget};
-use render::Gpu;
+use render::{Gpu, PresentError};
 
 pub use frames::may_be_animated;
 
@@ -191,7 +191,9 @@ impl Drop for AnimationPlayer {
 // ---------------------------------------------------------------------------
 
 struct Playing {
-    animation: Arc<Animation>,
+    animation: Animation,
+    /// CPU pixel copies were freed after every frame reached the GPU.
+    pixels_released: bool,
     window: Option<PlayerWindow>,
     frame: usize,
     next_due: Instant,
@@ -371,7 +373,8 @@ impl PlayerLoop {
                     "playing animated wallpaper"
                 );
                 entry.playing = Some(Playing {
-                    animation: Arc::new(animation),
+                    animation,
+                    pixels_released: false,
                     window: None,
                     frame: 0,
                     next_due: Instant::now(),
@@ -517,7 +520,7 @@ impl PlayerLoop {
             }
         }
         let mut failed = Vec::new();
-        let mut device_lost = false;
+        let mut outcomes = Vec::new();
         for (monitor_id, display) in &mut self.displays {
             let Some(playing) = &mut display.playing else {
                 continue;
@@ -529,7 +532,7 @@ impl PlayerLoop {
                 Ok(window) => {
                     playing.window = Some(window);
                     if let Some(gpu) = &self.gpu {
-                        device_lost |= !draw(gpu, playing, display.target.fit);
+                        outcomes.push((monitor_id.clone(), draw(gpu, playing, display.target.fit)));
                     }
                     playing.next_due = now + playing.animation.frames[playing.frame].delay;
                 }
@@ -542,8 +545,26 @@ impl PlayerLoop {
         for monitor_id in failed {
             self.displays.remove(&monitor_id);
         }
-        if device_lost {
+        self.handle_outcomes(outcomes);
+    }
+
+    /// Recover from failed presents: rebuild the GPU after a device loss and
+    /// decode again where the pixels were already released.
+    fn handle_outcomes(&mut self, outcomes: Vec<(String, DrawOutcome)>) {
+        if outcomes
+            .iter()
+            .any(|(_, outcome)| *outcome != DrawOutcome::Shown)
+        {
             self.reset_gpu();
+        }
+        for (monitor_id, outcome) in outcomes {
+            if outcome == DrawOutcome::NeedsDecode {
+                if let Some(display) = self.displays.get_mut(&monitor_id) {
+                    // The static first frame shows until the decode lands.
+                    display.playing = None;
+                }
+                self.start_decode(&monitor_id);
+            }
         }
     }
 
@@ -566,8 +587,8 @@ impl PlayerLoop {
         let Some(gpu) = &self.gpu else {
             return;
         };
-        let mut device_lost = false;
-        for display in self.displays.values_mut() {
+        let mut outcomes = Vec::new();
+        for (monitor_id, display) in &mut self.displays {
             let Some(playing) = &mut display.playing else {
                 continue;
             };
@@ -576,13 +597,13 @@ impl PlayerLoop {
             }
             if playing.frozen || now < playing.next_due {
                 if repaint {
-                    device_lost |= !draw(gpu, playing, display.target.fit);
+                    outcomes.push((monitor_id.clone(), draw(gpu, playing, display.target.fit)));
                 }
                 continue;
             }
             let count = playing.animation.frames.len();
             playing.frame = (playing.frame + 1) % count;
-            device_lost |= !draw(gpu, playing, display.target.fit);
+            outcomes.push((monitor_id.clone(), draw(gpu, playing, display.target.fit)));
             let delay = playing.animation.frames[playing.frame].delay;
             playing.next_due = if now.duration_since(playing.next_due) > MAX_FRAME_LAG {
                 now + delay
@@ -590,9 +611,8 @@ impl PlayerLoop {
                 playing.next_due + delay
             };
         }
-        if device_lost {
-            self.reset_gpu();
-        }
+        outcomes.retain(|(_, outcome)| *outcome != DrawOutcome::Shown);
+        self.handle_outcomes(outcomes);
     }
 
     /// How long the thread may sleep: forever when nothing plays.
@@ -618,22 +638,44 @@ impl PlayerLoop {
     }
 }
 
-/// Present the current frame. Returns false if the GPU device was lost.
-fn draw(gpu: &Gpu, playing: &mut Playing, fit: WallpaperFit) -> bool {
+/// What drawing a frame requires of the player loop.
+#[derive(Debug, PartialEq, Eq)]
+enum DrawOutcome {
+    Shown,
+    /// Recreate every GPU object (device loss).
+    DeviceLost,
+    /// The pixels are gone and the GPU copy too: decode the file again.
+    NeedsDecode,
+}
+
+/// Present the current frame, then free CPU pixels once all frames are on
+/// the GPU.
+fn draw(gpu: &Gpu, playing: &mut Playing, fit: WallpaperFit) -> DrawOutcome {
     let Some(window) = &mut playing.window else {
-        return true;
+        return DrawOutcome::Shown;
     };
     match window.show_frame(gpu, &playing.animation, playing.frame, fit) {
         Ok(()) => {
             playing.draw_failed = false;
-            true
+            if !playing.pixels_released && window.frames_resident() {
+                for frame in &mut playing.animation.frames {
+                    frame.bgra = Box::default();
+                }
+                playing.pixels_released = true;
+            }
+            DrawOutcome::Shown
         }
-        Err(error) => {
+        Err(PresentError::NotResident) => DrawOutcome::NeedsDecode,
+        Err(PresentError::Device(error)) => {
             if !playing.draw_failed {
                 warn!("animated wallpaper frame failed; recreating GPU resources: {error:#}");
             }
             playing.draw_failed = true;
-            false
+            if playing.pixels_released {
+                DrawOutcome::NeedsDecode
+            } else {
+                DrawOutcome::DeviceLost
+            }
         }
     }
 }
@@ -805,11 +847,12 @@ mod tests {
                 path: PathBuf::from(r"C:\missing\loop.gif"),
                 generation: 1,
                 playing: Some(Playing {
-                    animation: Arc::new(Animation {
+                    animation: Animation {
                         width: 1,
                         height: 1,
                         frames: Vec::new(),
-                    }),
+                    },
+                    pixels_released: false,
                     window: None,
                     frame: 0,
                     next_due: Instant::now(),

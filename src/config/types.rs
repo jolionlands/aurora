@@ -162,6 +162,8 @@ pub struct AnimatedConfig {
     /// covers it.
     pub pause_when_covered: bool,
     /// Decoded-frame budget per display; larger animations are downscaled.
+    /// While playing, frames live on the GPU, which on integrated GPUs is
+    /// system memory.
     pub max_memory_mb: u32,
     /// Frame budget per animation; longer animations drop evenly spaced frames.
     pub max_frames: u32,
@@ -174,7 +176,7 @@ impl Default for AnimatedConfig {
             max_fps: 15,
             pause_on_battery: true,
             pause_when_covered: true,
-            max_memory_mb: 48,
+            max_memory_mb: 32,
             max_frames: 240,
         }
     }

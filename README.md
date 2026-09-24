@@ -109,7 +109,7 @@ animated {
     max-fps 15
     pause-on-battery true
     pause-when-covered true
-    max-memory-mb 48
+    max-memory-mb 32
     max-frames 240
 }
 ```
@@ -127,7 +127,9 @@ Playback is bounded and power-aware:
 - **Nothing runs** until an animated file is shown. The player thread,
   windows, and GPU device exist only while something animates.
 - **Frame rate:** frames shorter than `1 / max-fps` merge into their
-  neighbours.
+  neighbours, and so do identical consecutive frames.
+- **GPU-resident frames:** each frame is uploaded to the GPU once. After that,
+  playback is a draw and a present, with no per-frame CPU copy.
 - **Memory:** frames are downscaled to the display, and further until they fit
   `max-memory-mb` per display. Past `max-frames`, evenly spaced frames are
   dropped.

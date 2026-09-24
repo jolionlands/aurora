@@ -72,6 +72,6 @@ animated {
     max-fps 15               // frames faster than this are merged
     pause-on-battery true    // battery saver, lock screen, display off always pause
     pause-when-covered true  // freeze a display under a maximized/fullscreen window
-    max-memory-mb 48         // decoded frames per display; larger animations are downscaled
+    max-memory-mb 32         // decoded frames per display (kept on the GPU while playing)
     max-frames 240           // longer animations drop evenly spaced frames
 }

@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::frames::Animation;
-use super::render::{Gpu, Surface};
+use super::render::{Gpu, PresentError, Surface};
 use crate::apply::WallpaperFit;
 use crate::transition::Rect;
 
@@ -271,28 +271,24 @@ impl PlayerWindow {
         }
     }
 
-    /// Draw `frame` of `animation` now. An error means the GPU device was
-    /// lost; the caller recreates it and every surface.
+    /// Draw `frame` of `animation` now. Frames whose pixels were released
+    /// must already be on this window's GPU surface.
     pub fn show_frame(
         &mut self,
         gpu: &Gpu,
         animation: &Animation,
         frame: usize,
         fit: WallpaperFit,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PresentError> {
         let Some(pixels) = animation.frames.get(frame) else {
             return Ok(());
         };
         if self.surface.is_none() {
-            self.surface = Some(Surface::new(
-                gpu,
-                self.hwnd,
-                self.width,
-                self.height,
-                animation,
-            )?);
+            let surface = Surface::new(gpu, self.hwnd, self.width, self.height, animation)
+                .map_err(PresentError::Device)?;
+            self.surface = Some(surface);
         }
-        let Some(surface) = &self.surface else {
+        let Some(surface) = &mut self.surface else {
             return Ok(());
         };
         let full = (0, 0, self.width as i32, self.height as i32);
@@ -303,11 +299,17 @@ impl PlayerWindow {
             full.2,
             full.3,
         );
-        let result = surface.present(gpu, &pixels.bgra, src, dst, dst != full);
-        if result.is_err() {
+        let pixels = (!pixels.bgra.is_empty()).then_some(&*pixels.bgra);
+        let result = surface.present(gpu, frame, pixels, src, dst, dst != full);
+        if matches!(result, Err(PresentError::Device(_))) {
             self.surface = None;
         }
         result
+    }
+
+    /// True once every frame lives on the GPU, so CPU copies can go.
+    pub fn frames_resident(&self) -> bool {
+        self.surface.as_ref().is_some_and(Surface::all_resident)
     }
 
     /// Release GPU objects tied to a device that is being replaced.

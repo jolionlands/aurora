@@ -97,12 +97,24 @@ fn created3d_device(driver: D3D_DRIVER_TYPE) -> Result<ID3D11Device> {
     device.context("Direct3D returned no device")
 }
 
-/// Per-window swap chain plus the bitmap frames are uploaded into.
+/// Per-window swap chain plus one GPU bitmap per animation frame.
+///
+/// Each frame is uploaded the first time it is shown and then stays on the
+/// GPU, so steady-state playback is a draw and a present with no CPU copy.
 pub struct Surface {
     swapchain: IDXGISwapChain1,
     target: ID2D1Bitmap1,
-    frame: ID2D1Bitmap1,
+    frames: Vec<Option<ID2D1Bitmap1>>,
     frame_size: (u32, u32),
+}
+
+/// Why a frame could not be presented.
+#[derive(Debug)]
+pub enum PresentError {
+    /// The frame is not on the GPU and its pixels were already released.
+    NotResident,
+    /// Device loss or another GPU failure; recreate every GPU object.
+    Device(anyhow::Error),
 }
 
 impl Surface {
@@ -146,45 +158,66 @@ impl Surface {
                     }),
                 )
                 .context("wrap swap chain buffer")?;
-            let frame_size = (animation.width, animation.height);
-            let frame = gpu
-                .context
-                .CreateBitmap(
-                    D2D_SIZE_U {
-                        width: frame_size.0,
-                        height: frame_size.1,
-                    },
-                    None,
-                    0,
-                    &D2D1_BITMAP_PROPERTIES1 {
-                        pixelFormat: PIXEL_FORMAT,
-                        dpiX: 96.0,
-                        dpiY: 96.0,
-                        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-                        ..Default::default()
-                    },
-                )
-                .context("create frame bitmap")?;
             Ok(Self {
                 swapchain,
                 target,
-                frame,
-                frame_size,
+                frames: vec![None; animation.frames.len()],
+                frame_size: (animation.width, animation.height),
             })
         }
     }
 
-    /// Upload `pixels` (BGRA rows of the animation's size) and present them,
-    /// cropping `src` into `dst` (both `(x, y, w, h)` in pixels). Errors mean
-    /// the device was lost and every GPU object must be recreated.
+    /// True once every frame has been uploaded.
+    pub fn all_resident(&self) -> bool {
+        self.frames.iter().all(Option::is_some)
+    }
+
+    fn upload(&mut self, gpu: &Gpu, index: usize, pixels: &[u8]) -> Result<()> {
+        let bitmap = unsafe {
+            gpu.context.CreateBitmap(
+                D2D_SIZE_U {
+                    width: self.frame_size.0,
+                    height: self.frame_size.1,
+                },
+                Some(pixels.as_ptr().cast()),
+                self.frame_size.0 * 4,
+                &D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: PIXEL_FORMAT,
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                    ..Default::default()
+                },
+            )
+        }
+        .context("upload animation frame")?;
+        self.frames[index] = Some(bitmap);
+        Ok(())
+    }
+
+    /// Present frame `index`, cropping `src` into `dst` (both `(x, y, w, h)`
+    /// in pixels). `pixels` is needed only the first time a frame is shown.
     pub fn present(
-        &self,
+        &mut self,
         gpu: &Gpu,
-        pixels: &[u8],
+        index: usize,
+        pixels: Option<&[u8]>,
         src: PixelRect,
         dst: PixelRect,
         letterbox: bool,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PresentError> {
+        if self.frames.get(index).is_none_or(Option::is_none) {
+            let expected = (self.frame_size.0 as usize) * (self.frame_size.1 as usize) * 4;
+            match pixels {
+                Some(pixels) if index < self.frames.len() && pixels.len() == expected => self
+                    .upload(gpu, index, pixels)
+                    .map_err(PresentError::Device)?,
+                _ => return Err(PresentError::NotResident),
+            }
+        }
+        let Some(Some(frame)) = self.frames.get(index) else {
+            return Err(PresentError::NotResident);
+        };
         let rect = |(x, y, w, h): PixelRect| D2D_RECT_F {
             left: x as f32,
             top: y as f32,
@@ -192,9 +225,6 @@ impl Surface {
             bottom: (y + h) as f32,
         };
         unsafe {
-            self.frame
-                .CopyFromMemory(None, pixels.as_ptr().cast(), self.frame_size.0 * 4)
-                .context("upload animation frame")?;
             let context = &gpu.context;
             context.SetTarget(&self.target);
             context.BeginDraw();
@@ -207,7 +237,7 @@ impl Surface {
                 }));
             }
             context.DrawBitmap(
-                &self.frame,
+                frame,
                 Some(&rect(dst)),
                 1.0,
                 D2D1_INTERPOLATION_MODE_LINEAR,
@@ -216,11 +246,16 @@ impl Surface {
             );
             let drawn = context.EndDraw(None, None);
             context.SetTarget(None);
-            drawn.context("draw animation frame")?;
+            drawn
+                .context("draw animation frame")
+                .map_err(PresentError::Device)?;
+            // Sync interval 0: flip-model presents are composed by DWM on its
+            // own schedule; waiting for a vblank only adds wakeups.
             self.swapchain
-                .Present(1, DXGI_PRESENT(0))
+                .Present(0, DXGI_PRESENT(0))
                 .ok()
                 .context("present animation frame")
+                .map_err(PresentError::Device)
         }
     }
 }
