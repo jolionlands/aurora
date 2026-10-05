@@ -16,10 +16,17 @@ pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 pub const LOG_FILENAME: &str = "aurora.log";
 
 /// True when this process has a real stderr (console or redirection).
+#[cfg(windows)]
 pub fn stderr_is_usable() -> bool {
     use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
     unsafe { GetStdHandle(STD_ERROR_HANDLE) }
         .is_ok_and(|handle| !handle.is_invalid() && !handle.0.is_null())
+}
+
+#[cfg(unix)]
+pub fn stderr_is_usable() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
 }
 
 /// Append-only log file that rotates to `<name>.1` at `max_bytes`.

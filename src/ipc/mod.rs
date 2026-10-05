@@ -4,6 +4,7 @@ pub mod server;
 pub use messages::{IpcEvent, IpcMessage};
 pub use server::IpcServer;
 
+#[cfg(windows)]
 fn current_session_id() -> anyhow::Result<u32> {
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 
@@ -13,24 +14,29 @@ fn current_session_id() -> anyhow::Result<u32> {
 }
 
 /// Named pipe path used by the daemon and ctl in the current Windows session.
+#[cfg(windows)]
 pub fn pipe_path() -> anyhow::Result<String> {
     Ok(pipe_path_for_session(current_session_id()?))
 }
 
+#[cfg(windows)]
 fn pipe_path_for_session(session_id: u32) -> String {
     format!(r"\\.\pipe\aurora-{session_id}")
 }
 
 /// Held for the daemon lifetime so a brief gap between pipe instances cannot
 /// admit a second daemon in the same Windows session.
+#[cfg(windows)]
 pub struct SingletonGuard(windows::Win32::Foundation::HANDLE);
 
+#[cfg(windows)]
 impl SingletonGuard {
     pub fn acquire() -> anyhow::Result<Self> {
         acquire_named_singleton(&format!(r"Local\Aurora-{}", current_session_id()?))
     }
 }
 
+#[cfg(windows)]
 fn acquire_named_singleton(name: &str) -> anyhow::Result<SingletonGuard> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
@@ -50,6 +56,7 @@ fn acquire_named_singleton(name: &str) -> anyhow::Result<SingletonGuard> {
     Ok(SingletonGuard(handle))
 }
 
+#[cfg(windows)]
 impl Drop for SingletonGuard {
     fn drop(&mut self) {
         use windows::Win32::Foundation::CloseHandle;
@@ -59,6 +66,11 @@ impl Drop for SingletonGuard {
         }
     }
 }
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::{open_pipe_client, pipe_path, SingletonGuard};
 
 /// Maximum JSON payload in one IPC frame.
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -161,6 +173,7 @@ where
 }
 
 /// Wait briefly for a free server instance when Windows reports a busy pipe.
+#[cfg(windows)]
 pub async fn open_pipe_client(
     path: &str,
     timeout: std::time::Duration,
@@ -222,6 +235,7 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    #[cfg(windows)]
     #[test]
     fn pipe_name_is_scoped_to_session() {
         assert_eq!(pipe_path_for_session(0), r"\\.\pipe\aurora-0");
@@ -229,6 +243,7 @@ mod tests {
         assert_ne!(pipe_path_for_session(1), pipe_path_for_session(2));
     }
 
+    #[cfg(windows)]
     #[test]
     fn singleton_rejects_a_second_owner() {
         let name = format!(r"Local\Aurora-test-{}", std::process::id());
@@ -254,6 +269,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn pipe_client_retries_busy_instances_and_explains_failures() {
         use tokio::net::windows::named_pipe::ServerOptions;

@@ -3,6 +3,7 @@
 //! transition, applies the new wallpaper via IDesktopWallpaper, updates metrics.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -522,7 +523,7 @@ impl Runtime {
                 let (tw, th) = (monitor.width, monitor.height);
                 let prev_path = self.state.current_path.get(&monitor.id).cloned();
                 let transition_images = if needs_transition_decode(
-                    self.config.transitions.enabled,
+                    self.config.transitions.enabled && cfg!(windows),
                     prev_path.is_some(),
                 ) {
                     let t0 = std::time::Instant::now();
@@ -2321,7 +2322,12 @@ mod tests {
         let mut initial = PlaylistStore::default();
         initial.create("ambiguous").unwrap();
         initial.add_path("ambiguous", "photo.jpg").unwrap();
-        initial.add_path("ambiguous", ".\\photo.jpg").unwrap();
+        initial
+            .add_path(
+                "ambiguous",
+                &Path::new(".").join("photo.jpg").to_string_lossy(),
+            )
+            .unwrap();
         let store = Arc::new(Mutex::new(initial));
         let handle = make_playlist_handle(directory.path().join("playlists.kdl"), store);
         *handle.source_roots.write() = vec![directory.path().to_path_buf()];
@@ -2802,6 +2808,7 @@ mod tests {
         assert_eq!(*roots.read(), vec![directory.path().to_path_buf()]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn reload_initializes_com_for_wic_only_extensions() {
         use image::{ImageBuffer, ImageFormat, Rgb};
@@ -3185,6 +3192,7 @@ mod tests {
         assert_eq!(cache_capacity(cache_budget_bytes(256)), MAX_CACHE_ENTRIES);
     }
 
+    #[cfg(windows)]
     #[test]
     fn canonical_paths_find_scanned_entries_without_rehashing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3222,6 +3230,7 @@ mod tests {
         assert!(needs_transition_decode(true, true));
     }
 
+    #[cfg(windows)]
     #[test]
     fn hung_apply_helper_is_killed_at_timeout() {
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -3251,6 +3260,7 @@ mod tests {
             .contains("timed out after 50 milliseconds"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn helper_output_larger_than_a_pipe_buffer_does_not_deadlock() {
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;

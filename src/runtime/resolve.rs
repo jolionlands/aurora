@@ -195,7 +195,7 @@ pub(super) fn resolve_content(
             }));
         }
         if hash_unindexed {
-            let (width, height) = crate::decode::validate_image_file(&canonical)
+            let (width, height) = crate::index::validate_index_wallpaper(&canonical)
                 .with_context(|| format!("identify playlist content {}", canonical.display()))?;
             return Ok(Some(ResolvedContent {
                 hash: crate::index::hash_file(&canonical)?,

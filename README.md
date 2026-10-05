@@ -2,12 +2,13 @@
 
 # Aurora
 
-**Native, multi-monitor wallpaper rotation for Windows.**
+**Native, multi-monitor wallpaper rotation for Windows and KDE Plasma 6.**
 
 Fast indexing. Smooth transitions. Content-aware playlists. Local control.
 
 [![CI](https://github.com/jolionlands/aurora/actions/workflows/ci.yml/badge.svg)](https://github.com/jolionlands/aurora/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
+![Linux](https://img.shields.io/badge/platform-KDE_Plasma_6-1D99F3?logo=kde)
 ![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -15,8 +16,8 @@ Fast indexing. Smooth transitions. Content-aware playlists. Local control.
 
 </div>
 
-Aurora is a small Windows daemon that keeps each display fresh without getting
-in your way. It uses native Windows wallpaper and graphics APIs, exposes a
+Aurora is a small wallpaper daemon that keeps each display fresh without getting
+in your way. It uses native Windows APIs or a KDE Plasma wallpaper plugin, exposes a
 scriptable command-line client, and remembers image metadata by exact content
 rather than fragile file paths.
 
@@ -71,6 +72,78 @@ Register or remove startup with Windows:
 .\target\release\aurora.exe --register-autostart
 .\target\release\aurora.exe --unregister-autostart
 ```
+
+## Linux / KDE Plasma 6
+
+Aurora supports Plasma 6 on **Wayland and X11**. Wallpapers render inside
+Plasma, below desktop icons; video playback uses Qt Multimedia and FFmpeg.
+The scheduler, history, playlists, content metadata, events, and CLI are
+shared with Windows. Linux control uses a private Unix socket, restricted
+to the current user, instead of a Windows named pipe.
+
+Install a stable Rust toolchain, `qdbus6`, Qt 6 Multimedia with its FFmpeg
+backend, and `ffmpeg`. On Arch/Garuda these runtime packages are
+`qt6-tools qt6-multimedia qt6-multimedia-ffmpeg ffmpeg`.
+
+```bash
+./scripts/install-linux.sh --autostart
+~/.local/bin/aurora
+```
+
+Add `~/.local/bin` to your `PATH` if needed. Configuration is stored in
+`${XDG_CONFIG_HOME:-~/.config}/aurora/config.kdl`. The first launch creates
+a Linux default using `~/Pictures`; add image or video folders and restart.
+The Plasma plugin is installed automatically in
+`${XDG_DATA_HOME:-~/.local/share}/plasma/wallpapers/io.github.jolionlands.aurora`
+when a wallpaper is first applied. It also appears as **Aurora** in Plasma's
+wallpaper settings.
+
+```bash
+aurora-ctl set ~/Videos/wallpaper.mp4
+aurora-ctl status
+aurora-ctl current-wallpaper
+aurora-ctl next
+aurora-ctl events
+```
+
+Explicitly include `mp4,m4v,webm,mkv,mov,avi` in a source's `extensions`
+to rotate videos. Video files are validated with `ffprobe`, indexed by
+content, and streamed by Qt; they are not decoded into Aurora's image cache.
+GIF and animated WebP use Plasma's `AnimatedImage` when `animated.enabled`
+is true. Looping video audio is muted by default:
+
+```kdl
+video {
+    muted false
+    volume 50
+}
+```
+
+Playback can pause on battery power, behind fullscreen/maximized windows,
+and while the screen is locked. Battery and covered-window settings use the
+existing `animated` section. Desktop changes can trigger rotation with
+`schedule.on-workspace-change true`. Monitor names are `plasma-screen-0`,
+`plasma-screen-1`, etc.; `monitor` fit overrides apply separately per screen.
+
+Linux limitations: wallpaper changes are immediate; Direct2D transitions,
+Windows animation frame/memory/FPS limits, and pixel-art scaling are specific
+to the Windows backend. Video tile/span modes fill each screen, and video
+center mode uses aspect fit. On Wayland, fullscreen windows pause playback
+in the plugin but do not pause the daemon's rotation schedule. Idle-based
+rotation pauses depend on the desktop exposing `GetSessionIdleTime`; Plasma
+Wayland currently does not. Use the Linux defaults (`pause-when-fullscreen
+false`, `pause-when-idle-secs 0`) and the plugin's playback pauses.
+
+Autostart uses a user desktop entry:
+
+```bash
+aurora --register-autostart
+aurora --unregister-autostart
+```
+
+Verify a port with `cargo test --all-targets`, `cargo clippy --all-targets --
+-D warnings`, and `cargo fmt --all -- --check`. The CI runs on both Linux and
+Windows. The sections below describe Windows rendering details.
 
 ## Enable transitions
 

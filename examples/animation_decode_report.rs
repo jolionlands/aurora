@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use aurora::animation::frames::{decode_animation, FrameBudget};
 use aurora::config::types::AnimatedConfig;
 
+#[cfg(windows)]
 fn peak_working_set_mb() -> f64 {
     use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows::Win32::System::Threading::GetCurrentProcess;
@@ -26,6 +27,13 @@ fn peak_working_set_mb() -> f64 {
         let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb);
     }
     counters.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+}
+
+#[cfg(unix)]
+fn peak_working_set_mb() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    usage.ru_maxrss as f64 / 1024.0
 }
 
 fn decode_one(path: &Path, width: u32, height: u32) {

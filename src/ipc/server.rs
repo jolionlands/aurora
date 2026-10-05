@@ -1,7 +1,9 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{broadcast, oneshot, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use tracing::error;
+use tracing::{debug, info, warn};
 
 use super::messages::{IpcEvent, IpcMessage};
 use super::{
@@ -31,7 +33,10 @@ const VALID_EVENT_TYPES: &[&str] = &[
 
 pub struct IpcServer {
     pipe_path: String,
+    #[cfg(windows)]
     initial_pipe: parking_lot::Mutex<Option<tokio::net::windows::named_pipe::NamedPipeServer>>,
+    #[cfg(unix)]
+    initial_pipe: parking_lot::Mutex<Option<tokio::net::UnixListener>>,
     event_tx: broadcast::Sender<IpcEvent>,
     shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     runtime: parking_lot::Mutex<Option<RuntimeHandle>>,
@@ -43,11 +48,14 @@ impl IpcServer {
     /// Reserve the session's authoritative endpoint before daemon startup work.
     pub fn bind() -> Result<Self> {
         let pipe_path = pipe_path()?;
+        #[cfg(windows)]
         let initial_pipe = create_pipe_with_sa(&pipe_path, true).map_err(|e| {
             anyhow::anyhow!(
                 "cannot reserve IPC endpoint {pipe_path}; another instance may already be running: {e}"
             )
         })?;
+        #[cfg(unix)]
+        let initial_pipe = super::unix::bind_listener(&pipe_path)?;
         let (event_tx, _) = broadcast::channel(64);
         Ok(Self {
             pipe_path,
@@ -79,6 +87,7 @@ impl IpcServer {
     }
 
     /// Start the accept loop.  Returns only on fatal pipe error.
+    #[cfg(windows)]
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!(
             "IPC server starting on {} (ACL: Admins+Owner only)",
@@ -142,9 +151,36 @@ impl IpcServer {
         }
     }
 
+    #[cfg(unix)]
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        info!(
+            "IPC server starting on {} (current user only)",
+            self.pipe_path
+        );
+        let listener = self
+            .initial_pipe
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("IPC server already started"))?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+                warn!("rejected IPC connection from a different user");
+                continue;
+            }
+            let permit = Arc::clone(&self.handler_slots).acquire_owned().await?;
+            let ipc = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = ipc.handle_client(stream, permit).await {
+                    debug!(%error, "IPC client handler failed");
+                }
+            });
+        }
+    }
+
     async fn handle_client(
         &self,
-        mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+        mut pipe: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         _permit: OwnedSemaphorePermit,
     ) -> Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -624,6 +660,7 @@ fn event_type(event: &IpcEvent) -> &'static str {
 // Pipe creation with ACL (Admins + Owner only)
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
 fn create_pipe_with_sa(
     path: &str,
     first_instance: bool,
@@ -645,10 +682,12 @@ fn create_pipe_with_sa(
     })
 }
 
+#[cfg(windows)]
 struct OwnedPipeSecurityAttributes {
     raw: windows::Win32::Security::SECURITY_ATTRIBUTES,
 }
 
+#[cfg(windows)]
 impl Drop for OwnedPipeSecurityAttributes {
     fn drop(&mut self) {
         if !self.raw.lpSecurityDescriptor.is_null() {
@@ -662,6 +701,7 @@ impl Drop for OwnedPipeSecurityAttributes {
     }
 }
 
+#[cfg(windows)]
 fn build_pipe_security_attributes() -> Result<OwnedPipeSecurityAttributes, anyhow::Error> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Authorization::{
@@ -699,6 +739,7 @@ fn build_pipe_security_attributes() -> Result<OwnedPipeSecurityAttributes, anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::ipc::{read_frame, write_frame};
 
     fn server_with_swap_sender(
@@ -748,6 +789,40 @@ mod tests {
             command_response(Err(anyhow::anyhow!("failed"))),
             serde_json::json!({ "success": false, "error": "failed" })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_status_and_quit_return_framed_responses_before_shutdown() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let server = Arc::new(server_with_swap_sender(tx));
+        for message in [IpcMessage::Status, IpcMessage::Quit] {
+            let quitting = matches!(message, IpcMessage::Quit);
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+            server.set_shutdown_sender(shutdown_tx);
+            let (mut client, stream) = tokio::net::UnixStream::pair().unwrap();
+            let permit = Arc::clone(&server.handler_slots)
+                .acquire_owned()
+                .await
+                .unwrap();
+            let ipc = Arc::clone(&server);
+            let task = tokio::spawn(async move { ipc.handle_client(stream, permit).await });
+            super::super::write_frame(&mut client, &serde_json::to_vec(&message).unwrap())
+                .await
+                .unwrap();
+            let payload = super::super::read_frame_with_timeout(&mut client, FRAME_IO_TIMEOUT)
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(response["success"], true);
+            task.await.unwrap().unwrap();
+            if quitting {
+                shutdown_rx.await.unwrap();
+            } else {
+                assert!(shutdown_rx.try_recv().is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -855,12 +930,14 @@ mod tests {
             .contains("targeted playlist commands"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn pipe_security_attributes_build_and_drop() {
         let attrs = build_pipe_security_attributes().expect("build pipe ACL");
         assert!(!attrs.raw.lpSecurityDescriptor.is_null());
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn first_instance_cannot_be_recreated() {
         let path = format!(r"\\.\pipe\aurora-test-first-{}", std::process::id());
@@ -868,6 +945,7 @@ mod tests {
         assert!(create_pipe_with_sa(&path, true).is_err());
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn quit_ack_survives_supervisor_shutdown() {
         use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
@@ -1042,6 +1120,7 @@ mod tests {
         assert_eq!(response["error"], "runtime swap queue is busy");
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn test_ipc_status_roundtrip() {
         use tokio::io::AsyncWriteExt;

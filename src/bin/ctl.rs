@@ -1770,7 +1770,7 @@ fn bgra_to_rgba(width: u32, height: u32, mut pixels: Vec<u8>) -> anyhow::Result<
             pixels.len()
         );
     }
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
         pixel.swap(0, 2);
     }
     Ok(pixels)
@@ -2211,6 +2211,7 @@ fn load_api_key(env_name: &str, file: Option<&Path>) -> anyhow::Result<String> {
     Ok(key.to_string())
 }
 
+#[cfg(windows)]
 fn http_post_json(
     url: &str,
     bearer: &str,
@@ -2338,8 +2339,93 @@ struct ParsedHttpUrl {
     path: String,
 }
 
+#[cfg(unix)]
+fn parse_http_url(value: &str, allow_http: bool) -> anyhow::Result<ParsedHttpUrl> {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '#' | '\\'))
+    {
+        anyhow::bail!("invalid model endpoint URL");
+    }
+    let url = url::Url::parse(value).context("invalid model endpoint URL")?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("model endpoint URL must not contain credentials");
+    }
+    let secure = match url.scheme() {
+        "https" => true,
+        "http" if allow_http => false,
+        "http" => anyhow::bail!(
+            "plaintext HTTP is disabled; use HTTPS or pass --allow-http for a trusted endpoint"
+        ),
+        _ => anyhow::bail!("unsupported model endpoint scheme; use https://"),
+    };
+    let host = url
+        .host_str()
+        .context("model endpoint is missing a host")?
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .context("model endpoint is missing a port")?;
+    let mut path = url.path().to_owned();
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok(ParsedHttpUrl {
+        secure,
+        host,
+        port,
+        path,
+    })
+}
+
+#[cfg(unix)]
+fn http_post_json(
+    url: &str,
+    bearer: &str,
+    body: &Value,
+    timeout_secs: u64,
+    allow_http: bool,
+) -> anyhow::Result<Value> {
+    use std::io::Read;
+    let parsed = parse_http_url(url, allow_http)?;
+    // Reading every component here also ensures both platform parsers expose
+    // the same host, port, and request-target contract.
+    let _ = (parsed.secure, parsed.host, parsed.port, parsed.path);
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout_secs.max(1))))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent
+        .post(url)
+        .header("Authorization", &format!("Bearer {bearer}"))
+        .header("Accept", "application/json")
+        .send_json(body)
+        .context("request model gateway")?;
+    let status = response.status().as_u16();
+    const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        anyhow::bail!("model gateway response exceeds {MAX_RESPONSE_BYTES} byte limit");
+    }
+    if !(200..300).contains(&status) {
+        let text: String = String::from_utf8_lossy(&bytes).chars().take(1024).collect();
+        anyhow::bail!("HTTP {status} from model gateway: {text}");
+    }
+    serde_json::from_slice(&bytes).context("parse gateway JSON")
+}
+
+#[cfg(windows)]
 struct WinHttpHandle(*mut std::ffi::c_void);
 
+#[cfg(windows)]
 impl WinHttpHandle {
     fn new(raw: *mut std::ffi::c_void, operation: &str) -> anyhow::Result<Self> {
         if raw.is_null() {
@@ -2349,6 +2435,7 @@ impl WinHttpHandle {
     }
 }
 
+#[cfg(windows)]
 impl Drop for WinHttpHandle {
     fn drop(&mut self) {
         unsafe {
@@ -2357,6 +2444,7 @@ impl Drop for WinHttpHandle {
     }
 }
 
+#[cfg(windows)]
 fn parse_http_url(url: &str, allow_http: bool) -> anyhow::Result<ParsedHttpUrl> {
     use windows::Win32::Networking::WinHttp::{
         WinHttpCrackUrl, ICU_REJECT_USERPWD, URL_COMPONENTS, WINHTTP_INTERNET_SCHEME_HTTP,
@@ -2869,21 +2957,21 @@ mod tests {
 
     #[test]
     fn ipc_paths_resolve_relative_to_the_callers_directory_without_fs_lookup() {
-        let current_dir = Path::new(r"C:\Users\test\wallpapers");
-        let relative = Path::new(r"missing\future.jpg");
+        let current_dir = std::env::temp_dir();
+        let relative = Path::new("missing").join("future.jpg");
 
         assert_eq!(
-            ipc_path_from(relative, current_dir).unwrap(),
+            ipc_path_from(&relative, &current_dir).unwrap(),
             current_dir.join(relative).to_str().unwrap()
         );
     }
 
     #[test]
     fn ipc_paths_preserve_absolute_paths() {
-        let absolute = Path::new(r"D:\wallpapers\photo.jpg");
+        let absolute = std::env::temp_dir().join("wallpapers").join("photo.jpg");
 
         assert_eq!(
-            ipc_path_from(absolute, Path::new("not-absolute")).unwrap(),
+            ipc_path_from(&absolute, Path::new("not-absolute")).unwrap(),
             absolute.to_str().unwrap()
         );
     }
@@ -2891,10 +2979,16 @@ mod tests {
     #[test]
     fn ipc_paths_reject_non_utf8_paths() {
         use std::ffi::OsString;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+        #[cfg(windows)]
         use std::os::windows::ffi::OsStringExt;
 
+        #[cfg(windows)]
         let invalid = PathBuf::from(OsString::from_wide(&[0xD800]));
-        let error = ipc_path_from(&invalid, Path::new(r"C:\wallpapers"))
+        #[cfg(unix)]
+        let invalid = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let error = ipc_path_from(&invalid, &std::env::temp_dir())
             .unwrap_err()
             .to_string();
 
@@ -3184,6 +3278,9 @@ mod tests {
 
     #[test]
     fn folder_scan_deduplicates_aliases_and_cycles_when_available() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
         use std::os::windows::fs::symlink_dir;
 
         let directory = tempfile::tempdir().unwrap();

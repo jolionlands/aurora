@@ -1,0 +1,14 @@
+{
+  "KPackageStructure": "Plasma/Wallpaper",
+  "KPlugin": {
+    "Id": "io.github.jolionlands.aurora",
+    "Name": "Aurora",
+    "Description": "Images and looping videos controlled by Aurora",
+    "Icon": "preferences-desktop-wallpaper",
+    "Version": "0.1.0",
+    "License": "MIT",
+    "Authors": [{ "Name": "jolionlands" }]
+  },
+  "X-Plasma-API-Minimum-Version": "6.0",
+  "X-KDE-ParentApp": "org.kde.plasmashell"
+}

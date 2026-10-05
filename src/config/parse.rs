@@ -239,6 +239,7 @@ pub fn parse_kdl_config(input: &str) -> Result<Config> {
                             | "metrics"
                             | "cache"
                             | "animated"
+                            | "video"
                     ) | ("source", "extensions")
                 );
                 if !known {
@@ -552,6 +553,17 @@ fn apply_kv(
         },
 
         // ---- animated wallpaper block ----
+        "video" => match key {
+            "muted" | "mute" => config.video.muted = parse_bool(value)?,
+            "volume" => {
+                let volume = parse_u32(value)?;
+                if volume > 100 {
+                    bail!("video.volume must be between 0 and 100");
+                }
+                config.video.volume = volume;
+            }
+            _ => bail!("unknown key {:?} in video", key),
+        },
         "animated" => {
             let animated = &mut config.animated;
             match key {
@@ -607,6 +619,7 @@ pub fn default_config_path() -> PathBuf {
     dirs_or_appdata().join("aurora").join("config.kdl")
 }
 
+#[cfg(windows)]
 fn dirs_or_appdata() -> PathBuf {
     // %APPDATA%  e.g. C:\Users\kalli\AppData\Roaming
     if let Some(p) = std::env::var_os("APPDATA") {
@@ -619,9 +632,28 @@ fn dirs_or_appdata() -> PathBuf {
     PathBuf::from(".")
 }
 
+#[cfg(unix)]
+fn dirs_or_appdata() -> PathBuf {
+    crate::linux::config_home()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_default_accepts_video_audio_and_playback_settings() {
+        let src = include_str!("../../resources/default_config_linux.kdl")
+            .replace("@HOME@", "/home/test");
+        let config = parse_kdl_config(&src).unwrap();
+        assert!(config.video.muted);
+        assert_eq!(config.video.volume, 50);
+        assert!(config.animated.enabled);
+        assert!(!config.schedule.pause_when_fullscreen);
+        assert!(config.sources[0].extensions.contains(&"mp4".to_owned()));
+        assert!(parse_kdl_config("video {\nvolume 101\n}\n").is_err());
+        assert!(parse_kdl_config("video {\nvolume -1\n}\n").is_err());
+    }
 
     #[test]
     fn test_config_default_parses() {

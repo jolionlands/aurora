@@ -2,7 +2,7 @@
 name = "aurora"
 version = "0.1.0"
 edition = "2021"
-description = "Efficient desktop background swapper for Windows with IPC and multi-monitor support"
+description = "Desktop wallpaper daemon for Windows and KDE Plasma with IPC and multi-monitor support"
 license = "MIT"
 authors = ["jolionlands"]
 
@@ -28,6 +28,13 @@ gif = "0.14"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp", "ico"] }
 rand = "0.8"
 blake3 = "1.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+url = "2"
+ureq = { version = "3", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",

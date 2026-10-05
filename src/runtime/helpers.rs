@@ -9,6 +9,7 @@ pub(super) fn apply_direct_in_child(
     fit: Option<&str>,
     monitor_id: Option<&str>,
 ) -> Result<()> {
+    #[cfg(windows)]
     use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
@@ -22,8 +23,9 @@ pub(super) fn apply_direct_in_child(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW.0);
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW.0);
     let child = command.spawn().context("start wallpaper apply helper")?;
     let output = wait_for_helper_child(child, DIRECT_APPLY_TIMEOUT)?;
     if !output.status.success() {
@@ -36,6 +38,7 @@ pub(super) fn apply_direct_in_child(
 }
 
 pub(super) fn inspect_wallpapers_in_child() -> Result<Vec<MonitorSnapshot>> {
+    #[cfg(windows)]
     use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let mut command = Command::new(std::env::current_exe().context("locate aurora executable")?);
@@ -43,8 +46,9 @@ pub(super) fn inspect_wallpapers_in_child() -> Result<Vec<MonitorSnapshot>> {
         .arg("--inspect-wallpapers")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW.0);
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW.0);
     let child = command
         .spawn()
         .context("start wallpaper inspection helper")?;
@@ -59,10 +63,12 @@ pub(super) fn inspect_wallpapers_in_child() -> Result<Vec<MonitorSnapshot>> {
 }
 
 /// Largest helper stdout/stderr Aurora keeps; helpers print a few KB at most.
+#[cfg(windows)]
 pub(super) const MAX_HELPER_OUTPUT: u64 = 1024 * 1024;
 
 /// Wait for a helper without polling, draining its pipes concurrently so a
 /// chatty helper cannot block on a full pipe until the timeout kills it.
+#[cfg(windows)]
 pub(super) fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Result<Output> {
     use std::io::Read;
     use std::os::windows::io::AsRawHandle;
@@ -127,4 +133,9 @@ pub(super) fn wait_for_helper_child(mut child: Child, timeout: Duration) -> Resu
         stdout: collect(stdout),
         stderr: collect(stderr),
     })
+}
+
+#[cfg(unix)]
+pub(super) fn wait_for_helper_child(child: Child, timeout: Duration) -> Result<Output> {
+    crate::linux::wait_for_child(child, timeout)
 }

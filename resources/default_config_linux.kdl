@@ -1,0 +1,38 @@
+// Aurora on KDE Plasma 6. Configuration: ~/.config/aurora/config.kdl
+log-level "info"
+source {
+    path "@HOME@/Pictures"
+    recursive true
+    extensions "jpg,jpeg,png,gif,webp,bmp,tif,tiff,ico,mp4,m4v,webm,mkv,mov,avi"
+    min-width 0
+    min-height 0
+}
+schedule {
+    mode "interval"
+    interval-secs 1800
+    on-workspace-change false
+    // Wayland does not expose other apps' fullscreen state to the daemon.
+    // The wallpaper plugin pauses playback when covered instead.
+    pause-when-fullscreen false
+    pause-when-idle-secs 0
+    min-repeat-window 20
+}
+transitions {
+    enabled false
+}
+metrics {
+    enabled false
+}
+cache {
+    decoded-mb 32
+}
+animated {
+    enabled true
+    pause-on-battery true
+    pause-when-covered true
+}
+// MP4/WebM video playback uses Qt Multimedia. Audio is muted by default.
+video {
+    muted true
+    volume 50
+}

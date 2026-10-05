@@ -2,10 +2,14 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
@@ -35,7 +39,7 @@ pub struct PhotoIndex {
 
 const INDEX_CACHE_VERSION: u32 = 2;
 // Bump whenever validate_image_file's acceptance rules change.
-const INDEX_VALIDATOR_VERSION: u32 = 1;
+const INDEX_VALIDATOR_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFingerprint {
@@ -382,12 +386,12 @@ fn build_entry_cached(
     landscape_only: bool,
     state: &mut ScanState,
 ) -> Result<Option<PhotoEntry>> {
-    if meta.len() > crate::decode::MAX_IMAGE_FILE_BYTES {
+    if meta.len() > wallpaper_file_limit(path) {
         tracing::warn!(
             "skipping oversized image {}: {} bytes exceeds {} byte limit",
             path.display(),
             meta.len(),
-            crate::decode::MAX_IMAGE_FILE_BYTES
+            wallpaper_file_limit(path)
         );
         return Ok(None);
     }
@@ -412,7 +416,7 @@ fn build_entry_cached(
         cached
     } else {
         state.cache_misses += 1;
-        let (width, height) = crate::decode::validate_image_file(path)
+        let (width, height) = validate_index_wallpaper(path)
             .with_context(|| format!("invalid or unsupported image {}", path.display()))?;
         CachedPhoto::new(canonical_path, fingerprint, width, height)
     };
@@ -448,7 +452,50 @@ fn build_entry_cached(
     }))
 }
 
+fn wallpaper_file_limit(path: &Path) -> u64 {
+    #[cfg(unix)]
+    if crate::apply::is_video(path) {
+        return crate::apply::MAX_VIDEO_FILE_BYTES;
+    }
+    let _ = path;
+    crate::decode::MAX_IMAGE_FILE_BYTES
+}
+
+pub(crate) fn validate_index_wallpaper(path: &Path) -> Result<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        crate::apply::validate_wallpaper(path)
+    }
+    #[cfg(windows)]
+    {
+        crate::decode::validate_image_file(path)
+    }
+}
+
 impl FileFingerprint {
+    #[cfg(unix)]
+    fn read(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        let mut file_id = [0; 16];
+        file_id[..8].copy_from_slice(&meta.ino().to_le_bytes());
+        Ok(Self {
+            size: meta.len(),
+            creation_time: 0,
+            last_write_time: meta
+                .mtime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.mtime_nsec()),
+            change_time: meta
+                .ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec()),
+            volume_serial_number: meta.dev(),
+            file_id,
+        })
+    }
+
+    #[cfg(windows)]
     fn read(path: &Path) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES.0)
@@ -503,9 +550,9 @@ impl CachedPhoto {
     }
 
     fn is_valid(&self) -> bool {
-        self.fingerprint
-            .is_some_and(|fingerprint| fingerprint.size <= crate::decode::MAX_IMAGE_FILE_BYTES)
-            && self.width > 0
+        self.fingerprint.is_some_and(|fingerprint| {
+            fingerprint.size <= wallpaper_file_limit(Path::new(&self.path))
+        }) && self.width > 0
             && self.height > 0
             && u64::from(self.width) * u64::from(self.height) <= crate::decode::MAX_IMAGE_PIXELS
             && self.hash.as_deref().is_none_or(valid_blake3_hash)
@@ -597,9 +644,11 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     // ponytail: fixed read-ahead; retune only from cold-library scan measurements.
     const READ_BUFFER_BYTES: usize = 1024 * 1024;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN.0)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN.0);
+    let file = options
         .open(path)
         .with_context(|| format!("cannot open {:?} for hashing", path))?;
     let mut file = BufReader::with_capacity(READ_BUFFER_BYTES, file);
@@ -999,7 +1048,11 @@ mod tests {
         let link = nested.join("back-to-root");
 
         #[cfg(windows)]
-        if std::os::windows::fs::symlink_dir(dir.path(), &link).is_err() {
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(dir.path(), &link);
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(dir.path(), &link);
+        if created.is_err() {
             return;
         }
         #[cfg(unix)]

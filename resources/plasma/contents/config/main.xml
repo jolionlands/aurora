@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"><kcfgfile name=""/>
+  <group name="General">
+    <entry name="Source" type="String"><default></default></entry>
+    <entry name="Kind" type="String"><default>image</default></entry>
+    <entry name="FillMode" type="Int"><default>2</default></entry>
+    <entry name="Muted" type="Bool"><default>true</default></entry>
+    <entry name="Volume" type="Int"><default>50</default></entry>
+    <entry name="PauseOnBattery" type="Bool"><default>true</default></entry>
+    <entry name="PauseWhenCovered" type="Bool"><default>true</default></entry>
+    <entry name="PlaybackPaused" type="Bool"><default>false</default></entry>
+  </group>
+</kcfg>
