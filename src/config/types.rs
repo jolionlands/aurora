@@ -149,11 +149,12 @@ impl Default for CacheConfig {
 /// Upper bound for `animated.max-fps`.
 pub const MAX_ANIMATION_FPS: u32 = 60;
 
-/// Opt-in playback of animated GIF and WebP wallpapers.
+/// Opt-in GIF/WebP playback and streaming MP4/WebM through native mpv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnimatedConfig {
     pub enabled: bool,
-    /// Frames shown faster than this rate are merged at decode time.
+    /// GIF/WebP frames shown faster than this rate are merged at decode time.
+    /// Streaming video preserves the source frame rate.
     pub max_fps: u32,
     /// Freeze animation while the laptop runs on battery power. Battery saver
     /// always freezes animation.
@@ -175,12 +176,12 @@ pub struct AnimatedConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnimationScaling {
     /// Pixel art (frames made of uniform NxN blocks) is stored at its native
-    /// size and scaled by a whole factor with nearest-neighbour; everything
-    /// else is filtered smoothly.
+    /// size and scaled with nearest-neighbour; everything else is filtered
+    /// smoothly. Wallpaper fit controls cropping and letterboxing.
     #[default]
     Auto,
     Smooth,
-    /// Always nearest-neighbour, at a whole factor when the art fits.
+    /// Always nearest-neighbour; contain uses whole factors when the art fits.
     Nearest,
 }
 

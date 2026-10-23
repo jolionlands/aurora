@@ -145,6 +145,8 @@ impl WallpaperApplier {
 
     /// Set the wallpaper on a specific monitor.
     pub fn set_for_monitor(&self, monitor_id: &str, path: &Path) -> Result<()> {
+        let poster = crate::media::poster_path(path)?;
+        let path = poster.as_path();
         let monitor_wide: Vec<u16> = monitor_id
             .encode_utf16()
             .chain(std::iter::once(0u16))
@@ -199,6 +201,8 @@ impl WallpaperApplier {
     }
 
     pub fn set_for_all_monitors(&self, path: &Path) -> Result<()> {
+        let poster = crate::media::poster_path(path)?;
+        let path = poster.as_path();
         let path_wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()

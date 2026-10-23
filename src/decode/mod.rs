@@ -63,6 +63,8 @@ fn validate_pixel_dimensions(width: u32, height: u32) -> Result<()> {
 /// pass WIC-only formats must initialize COM on the current thread first.
 pub fn validate_image_file(path: &Path) -> Result<(u32, u32)> {
     validate_file_size(path)?;
+    let poster = crate::media::poster_path(path)?;
+    let path = poster.as_path();
     match image::image_dimensions(path) {
         Ok(dimensions) => {
             validate_pixel_dimensions(dimensions.0, dimensions.1)?;
@@ -100,6 +102,8 @@ pub fn validate_image_file(path: &Path) -> Result<(u32, u32)> {
 /// Callers using the fallback must initialize COM on the current thread.
 pub fn decode_image(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedImage> {
     validate_file_size(path)?;
+    let poster = crate::media::poster_path(path)?;
+    let path = poster.as_path();
     // `image_dimensions` reads only the format header. If this format is
     // WIC-only, the fallback validates dimensions after opening its frame.
     if let Ok((src_w, src_h)) = image::image_dimensions(path) {

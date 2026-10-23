@@ -175,6 +175,11 @@ pub struct PlayerWindow {
 }
 
 impl PlayerWindow {
+    /// Native parent for a streaming player's child window.
+    pub(super) fn hwnd_id(&self) -> usize {
+        self.hwnd.0 as usize
+    }
+
     pub fn create(host: &DesktopHost, bounds: Rect) -> Result<Self> {
         register_class()?;
         let width = i32::try_from(bounds.width).context("display width")?;
@@ -294,6 +299,7 @@ impl PlayerWindow {
         let full = (0, 0, self.width as i32, self.height as i32);
         let (src, dst) = if animation.pixel_art {
             pixel_art_placement(
+                fit,
                 animation.width as i32,
                 animation.height as i32,
                 full.2,
@@ -389,14 +395,19 @@ unsafe extern "system" fn player_wnd_proc(
     }
 }
 
-/// Whole art centered at the largest integer scale that fits the display
-/// (never cropped), or scaled down to fit when the art is larger.
+/// Honor the wallpaper fit for pixel art. Contain centers the whole art at
+/// the largest integer scale that fits, or shrinks larger art to fit.
+/// Fill covers the display with the same centered crop as other wallpapers.
 pub(crate) fn pixel_art_placement(
+    fit: WallpaperFit,
     src_w: i32,
     src_h: i32,
     dst_w: i32,
     dst_h: i32,
 ) -> (PixelRect, PixelRect) {
+    if fit != WallpaperFit::Contain {
+        return placement(fit, src_w, src_h, dst_w, dst_h);
+    }
     if src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 {
         return ((0, 0, src_w, src_h), (0, 0, dst_w, dst_h));
     }
@@ -492,16 +503,36 @@ mod tests {
     }
 
     #[test]
-    fn pixel_art_uses_whole_scale_factors_and_is_never_cropped() {
+    fn pixel_art_contain_uses_whole_scale_factors_without_cropping() {
         // 377 px art on a 2560x1600 panel: 4x = 1508, centered.
         assert_eq!(
-            pixel_art_placement(377, 377, 2560, 1600),
+            pixel_art_placement(WallpaperFit::Contain, 377, 377, 2560, 1600),
             ((0, 0, 377, 377), (526, 46, 1508, 1508))
         );
         // Larger than the display: shrink to fit, still uncropped.
-        let (src, dst) = pixel_art_placement(2000, 2000, 1280, 800);
+        let (src, dst) = pixel_art_placement(WallpaperFit::Contain, 2000, 2000, 1280, 800);
         assert_eq!(src, (0, 0, 2000, 2000));
         assert_eq!((dst.2, dst.3), (800, 800));
+    }
+
+    #[test]
+    fn pixel_art_fill_covers_the_laptop_panel_instead_of_letterboxing() {
+        // The current wallpaper is native 377x377 art on a 2560x1600 panel.
+        let (src, dst) = pixel_art_placement(WallpaperFit::Fill, 377, 377, 2560, 1600);
+        assert_eq!(dst, (0, 0, 2560, 1600));
+        assert_eq!(src, (0, 71, 377, 235));
+        assert!((src.2 as f64 / src.3 as f64 - 2560.0 / 1600.0).abs() < 0.01);
+
+        // Wide art on a portrait display crops the sides and still covers it.
+        let (src, dst) = pixel_art_placement(WallpaperFit::Fill, 480, 270, 800, 1280);
+        assert_eq!(dst, (0, 0, 800, 1280));
+        assert_eq!(src, (156, 0, 168, 270));
+
+        // An explicit stretch request also applies to pixel art.
+        assert_eq!(
+            pixel_art_placement(WallpaperFit::Stretch, 377, 377, 2560, 1600),
+            ((0, 0, 377, 377), (0, 0, 2560, 1600))
+        );
     }
 
     #[test]

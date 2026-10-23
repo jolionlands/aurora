@@ -35,7 +35,7 @@ limit; with transitions disabled, wallpaper commits bypass that decode cache.
 | **Organized** | Static and dynamic playlists, ratings, frequency weights, grouped tags, and filters |
 | **Content-aware** | Exact BLAKE3 identity reconnects indexed renames and shares metadata across duplicates |
 | **Automatable** | Named-pipe IPC, real-time events, optional Prometheus metrics, and a companion CLI |
-| **Animated** | Opt-in GIF and animated WebP playback on the desktop layer, frozen on battery, fullscreen, and lock screen |
+| **Animated** | Opt-in GIF/WebP and native streaming MP4/WebM playback on the desktop layer, frozen on battery, fullscreen, and lock screen |
 | **Flexible** | Interval or fixed-time schedules, fullscreen/idle pauses, and optional wiri workspace triggers |
 
 Bundled decoding supports JPEG, PNG, GIF, WebP, BMP, TIFF, and ICO. Explicit
@@ -117,6 +117,24 @@ animated {
 
 Remember to include `gif` (and `webp`) in a source's `extensions`.
 
+For video wallpapers, also include `mp4` or `webm` and install a native mpv
+build. Aurora looks for `mpv.exe` beside its executable, then at
+`%LOCALAPPDATA%/aurora/mpv/mpv.exe`, then on `PATH`; `AURORA_MPV` overrides this
+location. Match the player architecture to Windows (ARM64 on Snapdragon).
+Aurora embeds the player below the desktop icons, streams the original file
+with hardware decoding when available, and preserves its resolution and frame
+rate. GIF limits (`max-fps`, `max-frames`, `max-memory-mb`, `scaling`) do not
+downsample videos. The demuxer cache is bounded to 8 MiB; decoder/render buffers
+are managed by mpv. Playback is silent and loops. `fill` covers the display with
+a centered aspect-preserving crop, `contain` keeps the whole frame, and
+`stretch` fills without preserving aspect.
+
+Windows receives a lossless full-resolution first-frame poster as the static
+fallback. Its cache stores a content-checked link to the original clip, so
+Aurora restores video playback after restart. The same power and cover policy
+pauses video; a long power freeze releases the player. Aurora owns each child
+process in a Windows job, so changing wallpaper or exiting also stops playback.
+
 Aurora still commits the file through `IDesktopWallpaper`, then draws the
 frames in a window on the desktop layer, below the icons. On Windows 11 24H2
 and later it uses the "raised desktop" layout, and a Direct3D swap chain
@@ -131,11 +149,12 @@ Playback is bounded and power-aware:
   neighbours, and so do identical consecutive frames.
 - **Pixel art:** with `scaling "auto"`, frames that are made of uniform
   NxN blocks count as upscaled pixel art. They are stored at their native
-  size, which uses N² times less memory. The GPU scales them up by the largest
-  whole factor that fits, with nearest-neighbour, so they stay crisp. They are
-  centered and never cropped, and the bars are filled with the art's edge
-  colour. `smooth` turns detection off; `nearest` always uses
-  nearest-neighbour.
+  size, which uses N² times less memory. The GPU uses nearest-neighbour so they
+  stay crisp, and honors the wallpaper's `fit` setting. The default `fill`
+  covers the display with a centered crop that preserves the aspect ratio.
+  `contain` shows the whole image at the largest integer scale that fits, with
+  bars filled by the art's edge colour. `smooth` turns detection off;
+  `nearest` always uses nearest-neighbour.
 - **Transparency:** transparent pixels show the same edge colour instead of
   black.
 - **GPU-resident frames:** each frame is uploaded to the GPU once. After that,

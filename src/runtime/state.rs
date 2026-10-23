@@ -158,6 +158,7 @@ pub(super) fn runtime_state_from_snapshots(
     let expected_monitors = snapshots.len();
     for snapshot in snapshots {
         if let Some(path) = snapshot.current_path.filter(|path| path.is_file()) {
+            let path = crate::media::source_path(&path);
             state.current_path.insert(snapshot.monitor.id, path);
         }
     }

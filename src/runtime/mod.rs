@@ -72,7 +72,7 @@ pub struct Runtime {
     content_store: Arc<Mutex<ContentStore>>,
     /// Sequential cursor: playlist_name → next_index.
     playlist_cursor: std::collections::HashMap<String, usize>,
-    /// Animated GIF/WebP playback; `None` unless `animated.enabled`.
+    /// Animated GIF/WebP and streaming video playback; `None` unless enabled.
     animation: Option<AnimationPlayer>,
 }
 
