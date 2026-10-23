@@ -72,6 +72,18 @@ Register or remove startup with Windows:
 .\target\release\aurora.exe --unregister-autostart
 ```
 
+Autostart runs the registered executable in place, and `cargo clean` deletes
+`target\`. For everyday use, install a copy outside the build tree:
+
+```powershell
+.\install-aurora.ps1                      # from target\release
+.\install-aurora.ps1 -From <build output>  # e.g. a cross-compiled ARM64 build
+```
+
+It copies `aurora.exe` and `aurora-ctl.exe` to
+`%LOCALAPPDATA%\Programs\aurora`, keeps the binaries it replaces under
+`previous\`, registers that copy for autostart and restarts the daemon.
+
 ## Enable transitions
 
 Transitions are off in the default configuration, so wallpaper changes are
@@ -123,17 +135,28 @@ build. Aurora looks for `mpv.exe` beside its executable, then at
 location. Match the player architecture to Windows (ARM64 on Snapdragon).
 Aurora embeds the player below the desktop icons, streams the original file
 with hardware decoding when available, and preserves its resolution and frame
-rate. GIF limits (`max-fps`, `max-frames`, `max-memory-mb`, `scaling`) do not
+rate. GIF limits (`max-fps`, `max-frames`, `max-memory-mb`) do not
 downsample videos. The demuxer cache is bounded to 8 MiB; decoder/render buffers
 are managed by mpv. Playback is silent and loops. `fill` covers the display with
 a centered aspect-preserving crop, `contain` keeps the whole frame, and
 `stretch` fills without preserving aspect.
 
+Each video frame is scaled to the display in one bilinear pass (mpv's `fast`
+profile with 8-bit intermediates). mpv's default convolution scalers add
+full-screen passes: on a 1080p60 clip filling a 2560x1600 Snapdragon X panel
+they kept the GPU's 3D engine 43 % busy and the player at 224 MiB, against
+8 % and 145 MiB with the fast path. `scaling "nearest"` uses mpv's
+`oversample` scaler instead, which keeps pixel art crisp at fractional scales
+for about 12 % GPU and 160 MiB.
+
 Windows receives a lossless full-resolution first-frame poster as the static
 fallback. Its cache stores a content-checked link to the original clip, so
 Aurora restores video playback after restart. The same power and cover policy
-pauses video; a long power freeze releases the player. Aurora owns each child
-process in a Windows job, so changing wallpaper or exiting also stops playback.
+pauses video. After 30 seconds covered, or a minute of a power freeze, the
+player exits and the poster shows; it starts again when the display is visible.
+A new player's window stays hidden until mpv has drawn, so the poster never
+flashes black. Aurora owns each child process in a Windows job, so changing
+wallpaper or exiting also stops playback.
 
 Aurora still commits the file through `IDesktopWallpaper`, then draws the
 frames in a window on the desktop layer, below the icons. On Windows 11 24H2
@@ -172,7 +195,8 @@ Playback is bounded and power-aware:
 
   A freeze caused by battery, battery saver, the lock screen, or the display
   being off releases the decoded frames and the GPU device after a minute.
-  They are decoded again when playback resumes.
+  They are decoded again when playback resumes. A covered video stops its
+  player after 30 seconds.
 
 To try a file without the daemon:
 

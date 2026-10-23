@@ -11,10 +11,12 @@
 //! * enabled with only static wallpapers: no thread;
 //! * GIF/WebP playing: one GPU present per frame (at most `max-fps`), one policy
 //!   check per second, and at most `max-memory-mb` of frames per display;
-//! * video playing: source-resolution streaming at source FPS, bounded demuxer
-//!   buffers, and one policy check per second;
+//! * video playing: source-resolution streaming at source FPS, one bilinear
+//!   (or oversample) pass per frame, bounded demuxer buffers, and one policy
+//!   check per second;
 //! * frozen (fullscreen/maximized window, battery, battery saver, lock screen,
-//!   display off): one policy check per second and no drawing.
+//!   display off): one policy check per second and no drawing; a video's
+//!   player exits after 30 s covered or 60 s frozen everywhere.
 
 pub mod desktop;
 pub mod frames;
@@ -52,6 +54,9 @@ const FROZEN_POLICY_INTERVAL: Duration = Duration::from_secs(60);
 /// After this long frozen everywhere, decoded frames and GPU objects are
 /// released; they are decoded again when playback may resume.
 const RELEASE_FROZEN_AFTER: Duration = Duration::from_secs(60);
+/// Covered this long, a video's player exits and the static poster shows
+/// through; it starts again when the display is visible.
+const RELEASE_COVERED_VIDEO_AFTER: Duration = Duration::from_secs(30);
 /// If playback falls this far behind (e.g. after sleep), resynchronise
 /// instead of fast-forwarding through the missed frames.
 const MAX_FRAME_LAG: Duration = Duration::from_secs(1);
@@ -217,6 +222,17 @@ struct Display {
     video: Option<video::VideoPlayback>,
     /// Frames were released during a long freeze; decode again on resume.
     released: bool,
+    /// When a maximized or fullscreen window started covering this display.
+    covered_since: Option<Instant>,
+}
+
+/// Track how long a display has been covered; true once its player may go.
+fn covered_long_enough(since: &mut Option<Instant>, covered: bool, now: Instant) -> bool {
+    if !covered {
+        *since = None;
+        return false;
+    }
+    now.duration_since(*since.get_or_insert(now)) >= RELEASE_COVERED_VIDEO_AFTER
 }
 
 struct PlayerLoop {
@@ -235,6 +251,8 @@ struct PlayerLoop {
     power: Option<power::PowerWatch>,
     /// Direct3D/Direct2D objects; present only while something animates.
     gpu: Option<Gpu>,
+    /// Next check for a hidden video window whose player may have drawn.
+    reveal_due: Option<Instant>,
 }
 
 impl PlayerLoop {
@@ -257,6 +275,7 @@ impl PlayerLoop {
             frozen_since: None,
             power: None,
             gpu: None,
+            reveal_due: None,
         }
     }
 
@@ -287,6 +306,7 @@ impl PlayerLoop {
                 self.next_policy = now + interval;
             }
             self.advance_frames(Instant::now());
+            self.reveal_due = self.poll_reveals(Instant::now());
             let timeout = self.timeout(Instant::now());
             wait_and_pump(&self.wake, timeout);
             if power::take_change() {
@@ -312,6 +332,7 @@ impl PlayerLoop {
                         playing: None,
                         video: None,
                         released: false,
+                        covered_since: None,
                     },
                 );
                 self.start_decode(&monitor_id);
@@ -505,15 +526,19 @@ impl PlayerLoop {
 
         let mut failed_videos = Vec::new();
         for (monitor_id, display) in &mut self.displays {
-            let frozen = frozen_everywhere
-                || covered
-                    .iter()
-                    .any(|rect| policy::same_rect(rect, &display.target.bounds));
+            let covered_here = covered
+                .iter()
+                .any(|rect| policy::same_rect(rect, &display.target.bounds));
+            let frozen = frozen_everywhere || covered_here;
+            let release = covered_long_enough(&mut display.covered_since, covered_here, now);
             if let Some(video) = &mut display.video {
                 if let Err(error) = video.update_policy(frozen) {
                     let path = &display.path;
                     warn!(path = %path.display(), "video wallpaper failed: {error:#}");
                     failed_videos.push(monitor_id.clone());
+                } else if release && video.release_player() {
+                    let path = &display.path;
+                    info!(path = %path.display(), "video wallpaper covered; stopped its player until visible");
                 }
             }
             let Some(playing) = &mut display.playing else {
@@ -565,10 +590,12 @@ impl PlayerLoop {
             return;
         };
         let mut failed_videos = Vec::new();
+        let scaling = self.config.scaling;
         for (monitor_id, display) in &mut self.displays {
             if let Some(video) = &mut display.video {
                 if video.needs_window() {
-                    if let Err(error) = video.start(&host, &display.target, &display.path) {
+                    if let Err(error) = video.start(&host, &display.target, &display.path, scaling)
+                    {
                         let path = &display.path;
                         warn!(path = %path.display(), "cannot start video wallpaper: {error:#}");
                         failed_videos.push(monitor_id.clone());
@@ -689,6 +716,15 @@ impl PlayerLoop {
         self.handle_outcomes(outcomes);
     }
 
+    /// Show hidden video windows whose player has drawn; returns when to look
+    /// again for those still hidden.
+    fn poll_reveals(&mut self, now: Instant) -> Option<Instant> {
+        self.displays
+            .values_mut()
+            .filter_map(|display| display.video.as_mut()?.poll_reveal(now))
+            .min()
+    }
+
     /// How long the thread may sleep: forever when nothing plays.
     fn timeout(&self, now: Instant) -> Option<Duration> {
         let mut deadline: Option<Instant> = self
@@ -696,6 +732,9 @@ impl PlayerLoop {
             .values()
             .any(|display| display.released || display.video.is_some())
             .then_some(self.next_policy);
+        if let Some(reveal) = self.reveal_due {
+            deadline = Some(deadline.map_or(reveal, |current| current.min(reveal)));
+        }
         for playing in self
             .displays
             .values()
@@ -983,6 +1022,7 @@ mod tests {
                 }),
                 released: false,
                 video: None,
+                covered_since: None,
             },
         );
         player.next_generation = 1;
@@ -1076,6 +1116,7 @@ mod tests {
                 generation: 1,
                 video: None,
                 released: false,
+                covered_since: None,
                 playing: Some(Playing {
                     animation: Animation {
                         width: 1,
@@ -1149,6 +1190,33 @@ mod tests {
         assert!(!player.displays["video"].released);
         player.handle(Command::Hide("video".into()));
         assert!(!player.any_active());
+    }
+
+    #[test]
+    fn covered_videos_release_after_a_delay_and_the_timer_restarts_when_visible() {
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!covered_long_enough(&mut since, true, start));
+        assert!(!covered_long_enough(
+            &mut since,
+            true,
+            start + RELEASE_COVERED_VIDEO_AFTER - Duration::from_secs(1)
+        ));
+        assert!(covered_long_enough(
+            &mut since,
+            true,
+            start + RELEASE_COVERED_VIDEO_AFTER
+        ));
+        assert!(!covered_long_enough(
+            &mut since,
+            false,
+            start + RELEASE_COVERED_VIDEO_AFTER * 2
+        ));
+        assert_eq!(since, None);
+        assert!(
+            !covered_long_enough(&mut since, true, start + RELEASE_COVERED_VIDEO_AFTER * 3),
+            "a new cover starts a new timer"
+        );
     }
 
     #[test]
