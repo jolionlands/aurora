@@ -15,6 +15,7 @@ pub mod ipc;
 #[cfg(unix)]
 pub mod linux;
 pub mod logging;
+pub mod media;
 pub mod metrics;
 pub mod playlist;
 pub mod runtime;

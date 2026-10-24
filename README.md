@@ -36,7 +36,7 @@ limit; with transitions disabled, wallpaper commits bypass that decode cache.
 | **Organized** | Static and dynamic playlists, ratings, frequency weights, grouped tags, and filters |
 | **Content-aware** | Exact BLAKE3 identity reconnects indexed renames and shares metadata across duplicates |
 | **Automatable** | Named-pipe IPC, real-time events, optional Prometheus metrics, and a companion CLI |
-| **Animated** | Opt-in GIF and animated WebP playback on the desktop layer, frozen on battery, fullscreen, and lock screen |
+| **Animated** | Opt-in GIF/WebP and native streaming MP4/WebM playback on the desktop layer, frozen on battery, fullscreen, and lock screen |
 | **Flexible** | Interval or fixed-time schedules, fullscreen/idle pauses, and optional wiri workspace triggers |
 
 Bundled decoding supports JPEG, PNG, GIF, WebP, BMP, TIFF, and ICO. Explicit
@@ -66,12 +66,28 @@ terminal:
 .\target\release\aurora-ctl.exe resume
 ```
 
+`pause` without a duration lasts across restarts and logins until `resume`;
+Aurora remembers it in `%APPDATA%\aurora\paused`. A timed pause
+(`pause --duration 30m`) ends with the session.
+
 Register or remove startup with Windows:
 
 ```powershell
 .\target\release\aurora.exe --register-autostart
 .\target\release\aurora.exe --unregister-autostart
 ```
+
+Autostart runs the registered executable in place, and `cargo clean` deletes
+`target\`. For everyday use, install a copy outside the build tree:
+
+```powershell
+.\install-aurora.ps1                      # from target\release
+.\install-aurora.ps1 -From <build output>  # e.g. a cross-compiled ARM64 build
+```
+
+It copies `aurora.exe` and `aurora-ctl.exe` to
+`%LOCALAPPDATA%\Programs\aurora`, keeps the binaries it replaces under
+`previous\`, registers that copy for autostart and restarts the daemon.
 
 ## Linux / KDE Plasma 6
 
@@ -190,6 +206,35 @@ animated {
 
 Remember to include `gif` (and `webp`) in a source's `extensions`.
 
+For video wallpapers, also include `mp4` or `webm` and install a native mpv
+build. Aurora looks for `mpv.exe` beside its executable, then at
+`%LOCALAPPDATA%/aurora/mpv/mpv.exe`, then on `PATH`; `AURORA_MPV` overrides this
+location. Match the player architecture to Windows (ARM64 on Snapdragon).
+Aurora embeds the player below the desktop icons, streams the original file
+with hardware decoding when available, and preserves its resolution and frame
+rate. GIF limits (`max-fps`, `max-frames`, `max-memory-mb`) do not
+downsample videos. The demuxer cache is bounded to 8 MiB; decoder/render buffers
+are managed by mpv. Playback is silent and loops. `fill` covers the display with
+a centered aspect-preserving crop, `contain` keeps the whole frame, and
+`stretch` fills without preserving aspect.
+
+Each video frame is scaled to the display in one bilinear pass (mpv's `fast`
+profile with 8-bit intermediates). mpv's default convolution scalers add
+full-screen passes: on a 1080p60 clip filling a 2560x1600 Snapdragon X panel
+they kept the GPU's 3D engine 43 % busy and the player at 224 MiB, against
+8 % and 145 MiB with the fast path. `scaling "nearest"` uses mpv's
+`oversample` scaler instead, which keeps pixel art crisp at fractional scales
+for about 12 % GPU and 160 MiB.
+
+Windows receives a lossless full-resolution first-frame poster as the static
+fallback. Its cache stores a content-checked link to the original clip, so
+Aurora restores video playback after restart. The same power and cover policy
+pauses video. After 30 seconds covered, or a minute of a power freeze, the
+player exits and the poster shows; it starts again when the display is visible.
+A new player's window stays hidden until mpv has drawn, so the poster never
+flashes black. Aurora owns each child process in a Windows job, so changing
+wallpaper or exiting also stops playback.
+
 Aurora still commits the file through `IDesktopWallpaper`, then draws the
 frames in a window on the desktop layer, below the icons. On Windows 11 24H2
 and later it uses the "raised desktop" layout, and a Direct3D swap chain
@@ -204,11 +249,12 @@ Playback is bounded and power-aware:
   neighbours, and so do identical consecutive frames.
 - **Pixel art:** with `scaling "auto"`, frames that are made of uniform
   NxN blocks count as upscaled pixel art. They are stored at their native
-  size, which uses N² times less memory. The GPU scales them up by the largest
-  whole factor that fits, with nearest-neighbour, so they stay crisp. They are
-  centered and never cropped, and the bars are filled with the art's edge
-  colour. `smooth` turns detection off; `nearest` always uses
-  nearest-neighbour.
+  size, which uses N² times less memory. The GPU uses nearest-neighbour so they
+  stay crisp, and honors the wallpaper's `fit` setting. The default `fill`
+  covers the display with a centered crop that preserves the aspect ratio.
+  `contain` shows the whole image at the largest integer scale that fits, with
+  bars filled by the art's edge colour. `smooth` turns detection off;
+  `nearest` always uses nearest-neighbour.
 - **Transparency:** transparent pixels show the same edge colour instead of
   black.
 - **GPU-resident frames:** each frame is uploaded to the GPU once. After that,
@@ -221,12 +267,14 @@ Playback is bounded and power-aware:
   - the session is locked;
   - the display is off;
   - the laptop is on battery power (`pause-on-battery`);
-  - a maximized or fullscreen window covers that display
-    (`pause-when-covered`).
+  - a maximized or fullscreen window covers that display, or windows
+    together leave less than 2 % of its desktop visible, as snapped or tiled
+    layouts do (`pause-when-covered`).
 
   A freeze caused by battery, battery saver, the lock screen, or the display
   being off releases the decoded frames and the GPU device after a minute.
-  They are decoded again when playback resumes.
+  They are decoded again when playback resumes. A covered video stops its
+  player after 30 seconds.
 
 To try a file without the daemon:
 

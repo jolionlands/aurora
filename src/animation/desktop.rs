@@ -28,9 +28,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowExW, FindWindowW,
     GetWindowLongPtrW, IsWindow, RegisterClassExW, SendMessageTimeoutW, SetLayeredWindowAttributes,
     SetParent, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_BOTTOM, LWA_ALPHA,
-    SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    SET_WINDOW_POS_FLAGS, SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, WM_ERASEBKGND, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use super::frames::Animation;
@@ -175,7 +176,50 @@ pub struct PlayerWindow {
 }
 
 impl PlayerWindow {
+    /// Native parent for a streaming player's child window.
+    pub(super) fn hwnd_id(&self) -> usize {
+        self.hwnd.0 as usize
+    }
+
     pub fn create(host: &DesktopHost, bounds: Rect) -> Result<Self> {
+        Self::create_with(host, bounds, true)
+    }
+
+    /// Created but not yet shown: the static wallpaper stays visible until
+    /// [`PlayerWindow::reveal`].
+    pub fn create_hidden(host: &DesktopHost, bounds: Rect) -> Result<Self> {
+        Self::create_with(host, bounds, false)
+    }
+
+    /// Show a window made by [`PlayerWindow::create_hidden`] in its place.
+    pub fn reveal(&self) {
+        let shown = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            )
+        };
+        if let Err(error) = shown {
+            tracing::warn!("cannot show animated wallpaper window: {error}");
+        }
+    }
+
+    /// An embedded player (mpv) has created its own window inside this one.
+    pub fn has_child(&self) -> bool {
+        unsafe { FindWindowExW(self.hwnd, HWND::default(), PCWSTR::null(), PCWSTR::null()) }.is_ok()
+    }
+
+    /// Visible in its own right (the shell parent decides the rest).
+    pub fn is_shown(&self) -> bool {
+        unsafe { GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 }
+    }
+
+    fn create_with(host: &DesktopHost, bounds: Rect, visible: bool) -> Result<Self> {
         register_class()?;
         let width = i32::try_from(bounds.width).context("display width")?;
         let height = i32::try_from(bounds.height).context("display height")?;
@@ -223,6 +267,11 @@ impl PlayerWindow {
                     // the style bits: a window made visible by SetWindowLong
                     // alone is never shown to DWM.
                     SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS).0 as isize);
+                    let show = if visible {
+                        SWP_SHOWWINDOW
+                    } else {
+                        SET_WINDOW_POS_FLAGS(0)
+                    };
                     SetWindowPos(
                         hwnd,
                         *icons,
@@ -230,7 +279,7 @@ impl PlayerWindow {
                         origin.y,
                         width,
                         height,
-                        SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                        SWP_NOACTIVATE | SWP_FRAMECHANGED | show,
                     )
                     .context("position animated wallpaper window")?;
                     if let Some(workerw) = workerw {
@@ -250,7 +299,11 @@ impl PlayerWindow {
                     WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     CLASS_NAME,
                     PCWSTR::null(),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                    if visible {
+                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS
+                    } else {
+                        WS_CHILD | WS_CLIPSIBLINGS
+                    },
                     origin.x,
                     origin.y,
                     width,
@@ -294,6 +347,7 @@ impl PlayerWindow {
         let full = (0, 0, self.width as i32, self.height as i32);
         let (src, dst) = if animation.pixel_art {
             pixel_art_placement(
+                fit,
                 animation.width as i32,
                 animation.height as i32,
                 full.2,
@@ -389,14 +443,19 @@ unsafe extern "system" fn player_wnd_proc(
     }
 }
 
-/// Whole art centered at the largest integer scale that fits the display
-/// (never cropped), or scaled down to fit when the art is larger.
+/// Honor the wallpaper fit for pixel art. Contain centers the whole art at
+/// the largest integer scale that fits, or shrinks larger art to fit.
+/// Fill covers the display with the same centered crop as other wallpapers.
 pub(crate) fn pixel_art_placement(
+    fit: WallpaperFit,
     src_w: i32,
     src_h: i32,
     dst_w: i32,
     dst_h: i32,
 ) -> (PixelRect, PixelRect) {
+    if fit != WallpaperFit::Contain {
+        return placement(fit, src_w, src_h, dst_w, dst_h);
+    }
     if src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 {
         return ((0, 0, src_w, src_h), (0, 0, dst_w, dst_h));
     }
@@ -492,21 +551,101 @@ mod tests {
     }
 
     #[test]
-    fn pixel_art_uses_whole_scale_factors_and_is_never_cropped() {
+    fn pixel_art_contain_uses_whole_scale_factors_without_cropping() {
         // 377 px art on a 2560x1600 panel: 4x = 1508, centered.
         assert_eq!(
-            pixel_art_placement(377, 377, 2560, 1600),
+            pixel_art_placement(WallpaperFit::Contain, 377, 377, 2560, 1600),
             ((0, 0, 377, 377), (526, 46, 1508, 1508))
         );
         // Larger than the display: shrink to fit, still uncropped.
-        let (src, dst) = pixel_art_placement(2000, 2000, 1280, 800);
+        let (src, dst) = pixel_art_placement(WallpaperFit::Contain, 2000, 2000, 1280, 800);
         assert_eq!(src, (0, 0, 2000, 2000));
         assert_eq!((dst.2, dst.3), (800, 800));
+    }
+
+    #[test]
+    fn pixel_art_fill_covers_the_laptop_panel_instead_of_letterboxing() {
+        // The current wallpaper is native 377x377 art on a 2560x1600 panel.
+        let (src, dst) = pixel_art_placement(WallpaperFit::Fill, 377, 377, 2560, 1600);
+        assert_eq!(dst, (0, 0, 2560, 1600));
+        assert_eq!(src, (0, 71, 377, 235));
+        assert!((src.2 as f64 / src.3 as f64 - 2560.0 / 1600.0).abs() < 0.01);
+
+        // Wide art on a portrait display crops the sides and still covers it.
+        let (src, dst) = pixel_art_placement(WallpaperFit::Fill, 480, 270, 800, 1280);
+        assert_eq!(dst, (0, 0, 800, 1280));
+        assert_eq!(src, (156, 0, 168, 270));
+
+        // An explicit stretch request also applies to pixel art.
+        assert_eq!(
+            pixel_art_placement(WallpaperFit::Stretch, 377, 377, 2560, 1600),
+            ((0, 0, 377, 377), (0, 0, 2560, 1600))
+        );
     }
 
     #[test]
     fn raised_layout_is_detected_from_progman_style() {
         assert!(is_raised_layout(0x0020_0080));
         assert!(!is_raised_layout(0x0000_0080));
+    }
+
+    #[test]
+    fn hidden_player_window_waits_for_a_child_then_reveals() {
+        // A hidden parent keeps the test off the user's desktop.
+        struct HiddenParent(HWND);
+        impl Drop for HiddenParent {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let parent = HiddenParent(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                PCWSTR::null(),
+                Default::default(),
+                0,
+                0,
+                8,
+                8,
+                HWND::default(),
+                None,
+                HINSTANCE::default(),
+                None,
+            )
+            .unwrap()
+        });
+        let host = DesktopHost::Classic { workerw: parent.0 };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let window = PlayerWindow::create_hidden(&host, bounds).unwrap();
+        assert!(!window.is_shown());
+        assert!(!window.has_child());
+        let child = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                PCWSTR::null(),
+                WS_CHILD,
+                0,
+                0,
+                8,
+                8,
+                window.hwnd,
+                None,
+                HINSTANCE::default(),
+                None,
+            )
+            .unwrap()
+        };
+        assert!(window.has_child(), "mpv's own window counts as drawn");
+        window.reveal();
+        assert!(window.is_shown());
+        assert!(PlayerWindow::create(&host, bounds).unwrap().is_shown());
+        let _ = unsafe { DestroyWindow(child) };
     }
 }

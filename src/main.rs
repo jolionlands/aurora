@@ -242,10 +242,14 @@ async fn run_daemon() -> Result<()> {
         config_path.clone(),
         runtime.playlist_arc(),
         default_playlists_path(),
-    );
+    )
+    .with_persistent_pause();
 
     // Extract the shared pause Arc so Runtime::run can check IPC pause state.
     let pause_arc = runtime_handle.pause_arc();
+    if pause_arc.lock().paused {
+        info!("rotation paused by a previous session (aurora-ctl resume to rotate again)");
+    }
 
     // ---------------------------------------------------------------------------
     // 7. Start IPC server

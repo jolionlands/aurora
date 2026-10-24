@@ -50,7 +50,7 @@ pub struct Animation {
     pub width: u32,
     pub height: u32,
     pub frames: Vec<Frame>,
-    /// Scale with nearest-neighbour at whole factors (pixel art).
+    /// Scale with nearest-neighbour (pixel art); placement follows wallpaper fit.
     pub pixel_art: bool,
     /// Opaque BGRA fill for letterbox bars and transparent pixels, sampled
     /// from the first frame's border.
@@ -527,7 +527,7 @@ impl<'a> FrameCollector<'a> {
         let block = self.pixel_block;
         *self.size.get_or_insert_with(|| {
             let (w, h) = if block > 1 {
-                // Native art size; the GPU scales it up by a whole factor.
+                // Native art size; the GPU scales it using nearest-neighbour.
                 (width / block, height / block)
             } else {
                 cover_size(

@@ -1,23 +1,28 @@
-//! Opt-in animated wallpapers (GIF and animated WebP).
+//! Opt-in animated wallpapers (GIF, animated WebP and native streaming MP4/WebM).
 //!
 //! The normal static commit through `IDesktopWallpaper` always happens first,
 //! so Windows keeps showing the file's first frame whenever animation is off,
 //! frozen, or unavailable. When `animated { enabled true }` is configured, a
-//! single player thread draws the frames into a desktop-layer window per
-//! display (see [`desktop`]).
+//! single player thread hosts playback in a desktop-layer window per display
+//! (see [`desktop`]). GIF/WebP frames use Direct3D; videos stream through mpv.
 //!
 //! Cost model:
 //! * disabled: no thread, no windows, no decoding;
 //! * enabled with only static wallpapers: no thread;
-//! * playing: one GDI blit per frame (at most `max-fps`), one policy check per
-//!   second, and at most `max-memory-mb` of frames per display;
+//! * GIF/WebP playing: one GPU present per frame (at most `max-fps`), one policy
+//!   check per second, and at most `max-memory-mb` of frames per display;
+//! * video playing: source-resolution streaming at source FPS, one bilinear
+//!   (or oversample) pass per frame, bounded demuxer buffers, and one policy
+//!   check per second;
 //! * frozen (fullscreen/maximized window, battery, battery saver, lock screen,
-//!   display off): one policy check per second and no drawing.
+//!   display off): one policy check per second and no drawing; a video's
+//!   player exits after 30 s covered or 60 s frozen everywhere.
 
 pub mod desktop;
 pub mod frames;
 pub mod policy;
 mod render;
+mod video;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,6 +54,9 @@ const FROZEN_POLICY_INTERVAL: Duration = Duration::from_secs(60);
 /// After this long frozen everywhere, decoded frames and GPU objects are
 /// released; they are decoded again when playback may resume.
 const RELEASE_FROZEN_AFTER: Duration = Duration::from_secs(60);
+/// Covered this long, a video's player exits and the static poster shows
+/// through; it starts again when the display is visible.
+const RELEASE_COVERED_VIDEO_AFTER: Duration = Duration::from_secs(30);
 /// If playback falls this far behind (e.g. after sleep), resynchronise
 /// instead of fast-forwarding through the missed frames.
 const MAX_FRAME_LAG: Duration = Duration::from_secs(1);
@@ -130,10 +138,10 @@ impl AnimationPlayer {
         })
     }
 
-    /// Play `path` on `target` if it is an animated GIF/WebP; otherwise make
+    /// Play `path` on `target` if it is an animated GIF/WebP or video; otherwise make
     /// sure nothing covers that display's static wallpaper.
     pub fn show(&mut self, target: DisplayTarget, path: PathBuf) {
-        if !may_be_animated(&path) {
+        if !may_be_animated(&path) && !crate::media::is_video(&path) {
             self.hide(&target.monitor_id);
             return;
         }
@@ -211,8 +219,20 @@ struct Display {
     path: PathBuf,
     generation: u64,
     playing: Option<Playing>,
+    video: Option<video::VideoPlayback>,
     /// Frames were released during a long freeze; decode again on resume.
     released: bool,
+    /// When a maximized or fullscreen window started covering this display.
+    covered_since: Option<Instant>,
+}
+
+/// Track how long a display has been covered; true once its player may go.
+fn covered_long_enough(since: &mut Option<Instant>, covered: bool, now: Instant) -> bool {
+    if !covered {
+        *since = None;
+        return false;
+    }
+    now.duration_since(*since.get_or_insert(now)) >= RELEASE_COVERED_VIDEO_AFTER
 }
 
 struct PlayerLoop {
@@ -231,6 +251,8 @@ struct PlayerLoop {
     power: Option<power::PowerWatch>,
     /// Direct3D/Direct2D objects; present only while something animates.
     gpu: Option<Gpu>,
+    /// Next check for a hidden video window whose player may have drawn.
+    reveal_due: Option<Instant>,
 }
 
 impl PlayerLoop {
@@ -253,6 +275,7 @@ impl PlayerLoop {
             frozen_since: None,
             power: None,
             gpu: None,
+            reveal_due: None,
         }
     }
 
@@ -283,6 +306,7 @@ impl PlayerLoop {
                 self.next_policy = now + interval;
             }
             self.advance_frames(Instant::now());
+            self.reveal_due = self.poll_reveals(Instant::now());
             let timeout = self.timeout(Instant::now());
             wait_and_pump(&self.wake, timeout);
             if power::take_change() {
@@ -306,7 +330,9 @@ impl PlayerLoop {
                         path,
                         generation: 0,
                         playing: None,
+                        video: None,
                         released: false,
+                        covered_since: None,
                     },
                 );
                 self.start_decode(&monitor_id);
@@ -338,6 +364,11 @@ impl PlayerLoop {
         let generation = self.next_generation;
         display.generation = generation;
         display.released = false;
+        if crate::media::is_video(&display.path) {
+            display.video = Some(video::VideoPlayback::pending(generation));
+            self.next_policy = Instant::now();
+            return;
+        }
         let budget = FrameBudget {
             display_width: display.target.bounds.width,
             display_height: display.target.bounds.height,
@@ -419,6 +450,7 @@ impl PlayerLoop {
                 .playing
                 .as_ref()
                 .is_some_and(|playing| !playing.frozen)
+                || display.video.as_ref().is_some_and(|video| !video.frozen)
         })
     }
 
@@ -426,7 +458,7 @@ impl PlayerLoop {
     fn any_active(&self) -> bool {
         self.displays
             .values()
-            .any(|display| display.playing.is_some() || display.released)
+            .any(|display| display.playing.is_some() || display.video.is_some() || display.released)
     }
 
     /// Release or restore frames across long everywhere-freezes.
@@ -450,7 +482,9 @@ impl PlayerLoop {
             return;
         }
         for entry in self.displays.values_mut() {
-            if entry.playing.take().is_some() {
+            let had_frames = entry.playing.take().is_some();
+            let had_video = entry.video.take().is_some();
+            if had_frames || had_video {
                 entry.released = true;
                 debug!(path = %entry.path.display(), "released frozen animation frames");
             }
@@ -481,13 +515,32 @@ impl PlayerLoop {
             info!("desktop host changed; re-attaching animated wallpapers");
             self.host = None;
             for display in self.displays.values_mut() {
+                if let Some(video) = &mut display.video {
+                    video.reset_window();
+                }
                 if let Some(playing) = &mut display.playing {
                     playing.window = None;
                 }
             }
         }
 
-        for display in self.displays.values_mut() {
+        let mut failed_videos = Vec::new();
+        for (monitor_id, display) in &mut self.displays {
+            let covered_here = covered
+                .iter()
+                .any(|rect| policy::same_rect(rect, &display.target.bounds));
+            let frozen = frozen_everywhere || covered_here;
+            let release = covered_long_enough(&mut display.covered_since, covered_here, now);
+            if let Some(video) = &mut display.video {
+                if let Err(error) = video.update_policy(frozen) {
+                    let path = &display.path;
+                    warn!(path = %path.display(), "video wallpaper failed: {error:#}");
+                    failed_videos.push(monitor_id.clone());
+                } else if release && video.release_player() {
+                    let path = &display.path;
+                    info!(path = %path.display(), "video wallpaper covered; stopped its player until visible");
+                }
+            }
             let Some(playing) = &mut display.playing else {
                 continue;
             };
@@ -498,14 +551,13 @@ impl PlayerLoop {
             {
                 playing.window = None;
             }
-            let frozen = frozen_everywhere
-                || covered
-                    .iter()
-                    .any(|rect| policy::same_rect(rect, &display.target.bounds));
             if playing.frozen && !frozen {
                 playing.next_due = now; // resume promptly, from the current frame
             }
             playing.frozen = frozen;
+        }
+        for monitor_id in failed_videos {
+            self.displays.remove(&monitor_id);
         }
 
         // Create windows lazily, and never while frozen, so a wallpaper that
@@ -516,7 +568,13 @@ impl PlayerLoop {
                 .as_ref()
                 .is_some_and(|playing| !playing.frozen && playing.window.is_none())
         });
-        if needs_window && self.host.is_none() {
+        let needs_video = self.displays.values().any(|display| {
+            display
+                .video
+                .as_ref()
+                .is_some_and(video::VideoPlayback::needs_window)
+        });
+        if (needs_window || needs_video) && self.host.is_none() {
             match DesktopHost::find() {
                 Ok(host) => {
                     debug!(
@@ -531,6 +589,28 @@ impl PlayerLoop {
         let Some(host) = self.host else {
             return;
         };
+        let mut failed_videos = Vec::new();
+        let scaling = self.config.scaling;
+        for (monitor_id, display) in &mut self.displays {
+            if let Some(video) = &mut display.video {
+                if video.needs_window() {
+                    if let Err(error) = video.start(&host, &display.target, &display.path, scaling)
+                    {
+                        let path = &display.path;
+                        warn!(path = %path.display(), "cannot start video wallpaper: {error:#}");
+                        failed_videos.push(monitor_id.clone());
+                    }
+                }
+            }
+        }
+        for monitor_id in failed_videos {
+            self.displays.remove(&monitor_id);
+        }
+        // Existing GIF windows also need a device rebuilt after a lost GPU.
+        // Streaming players own their GPU; a video-only loop needs none here.
+        if !self.any_playing() {
+            return;
+        }
         if self.gpu.is_none() {
             match Gpu::new() {
                 Ok(gpu) => self.gpu = Some(gpu),
@@ -636,13 +716,25 @@ impl PlayerLoop {
         self.handle_outcomes(outcomes);
     }
 
+    /// Show hidden video windows whose player has drawn; returns when to look
+    /// again for those still hidden.
+    fn poll_reveals(&mut self, now: Instant) -> Option<Instant> {
+        self.displays
+            .values_mut()
+            .filter_map(|display| display.video.as_mut()?.poll_reveal(now))
+            .min()
+    }
+
     /// How long the thread may sleep: forever when nothing plays.
     fn timeout(&self, now: Instant) -> Option<Duration> {
         let mut deadline: Option<Instant> = self
             .displays
             .values()
-            .any(|display| display.released)
+            .any(|display| display.released || display.video.is_some())
             .then_some(self.next_policy);
+        if let Some(reveal) = self.reveal_due {
+            deadline = Some(deadline.map_or(reveal, |current| current.min(reveal)));
+        }
         for playing in self
             .displays
             .values()
@@ -929,6 +1021,8 @@ mod tests {
                     draw_failed: false,
                 }),
                 released: false,
+                video: None,
+                covered_since: None,
             },
         );
         player.next_generation = 1;
@@ -953,6 +1047,175 @@ mod tests {
             player.displays["m"].generation,
             1 + 1,
             "a new decode was started"
+        );
+    }
+
+    #[test]
+    fn device_reset_rebuilds_gpu_for_an_existing_gif_window() {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::HINSTANCE;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        // The parent remains hidden: exercise actual window/device recovery
+        // without attaching a test wallpaper to the user's desktop.
+        struct HiddenParent(HWND);
+        impl Drop for HiddenParent {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let parent = HiddenParent(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                PCWSTR::null(),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                8,
+                8,
+                HWND::default(),
+                None,
+                HINSTANCE::default(),
+                None,
+            )
+            .unwrap()
+        });
+        let host = DesktopHost::Classic { workerw: parent.0 };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let window = PlayerWindow::create(&host, bounds).unwrap();
+        let (results, commands) = mpsc::channel();
+        let mut player = PlayerLoop::new(
+            AnimatedConfig {
+                enabled: true,
+                pause_on_battery: false,
+                pause_when_covered: false,
+                ..AnimatedConfig::default()
+            },
+            commands,
+            results,
+            Arc::new(WakeEvent::new().unwrap()),
+        );
+        player.host = Some(host);
+        player.gpu = Some(Gpu::new().unwrap());
+        player.displays.insert(
+            "existing".into(),
+            Display {
+                target: DisplayTarget {
+                    monitor_id: "existing".into(),
+                    bounds,
+                    fit: WallpaperFit::Fill,
+                },
+                path: PathBuf::from("fixture.gif"),
+                generation: 1,
+                video: None,
+                released: false,
+                covered_since: None,
+                playing: Some(Playing {
+                    animation: Animation {
+                        width: 1,
+                        height: 1,
+                        pixel_art: false,
+                        background: [0, 0, 0, 255],
+                        frames: vec![frames::Frame {
+                            bgra: vec![0, 0, 0, 255].into_boxed_slice(),
+                            delay: Duration::from_millis(100),
+                        }],
+                    },
+                    pixels_released: false,
+                    window: Some(window),
+                    frame: 0,
+                    next_due: Instant::now(),
+                    frozen: false,
+                    draw_failed: false,
+                }),
+            },
+        );
+        player.reset_gpu();
+        assert!(player.gpu.is_none());
+        assert!(player.displays["existing"]
+            .playing
+            .as_ref()
+            .unwrap()
+            .window
+            .is_some());
+        player.apply_policy(Instant::now());
+        assert!(
+            player.gpu.is_some(),
+            "an existing GIF window still needs its GPU rebuilt"
+        );
+        drop(player);
+    }
+
+    #[test]
+    fn video_freeze_releases_and_recreates_stream_without_frame_cache() {
+        let (results, commands) = mpsc::channel();
+        let mut player = PlayerLoop::new(
+            AnimatedConfig {
+                enabled: true,
+                ..AnimatedConfig::default()
+            },
+            commands,
+            results,
+            Arc::new(WakeEvent::new().unwrap()),
+        );
+        let target = DisplayTarget {
+            monitor_id: "video".into(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1600,
+            },
+            fit: WallpaperFit::Fill,
+        };
+        player.handle(Command::Show(target, PathBuf::from("fixture.mp4")));
+        assert!(player.displays["video"].video.is_some());
+        assert!(player.displays["video"].playing.is_none());
+        assert!(player.any_active());
+        let start = Instant::now();
+        player.manage_long_freeze(true, start);
+        player.manage_long_freeze(true, start + RELEASE_FROZEN_AFTER);
+        assert!(player.displays["video"].video.is_none());
+        assert!(player.displays["video"].released);
+        assert!(player.timeout(start).is_some());
+        player.manage_long_freeze(false, start + RELEASE_FROZEN_AFTER * 2);
+        assert!(player.displays["video"].video.is_some());
+        assert!(!player.displays["video"].released);
+        player.handle(Command::Hide("video".into()));
+        assert!(!player.any_active());
+    }
+
+    #[test]
+    fn covered_videos_release_after_a_delay_and_the_timer_restarts_when_visible() {
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!covered_long_enough(&mut since, true, start));
+        assert!(!covered_long_enough(
+            &mut since,
+            true,
+            start + RELEASE_COVERED_VIDEO_AFTER - Duration::from_secs(1)
+        ));
+        assert!(covered_long_enough(
+            &mut since,
+            true,
+            start + RELEASE_COVERED_VIDEO_AFTER
+        ));
+        assert!(!covered_long_enough(
+            &mut since,
+            false,
+            start + RELEASE_COVERED_VIDEO_AFTER * 2
+        ));
+        assert_eq!(since, None);
+        assert!(
+            !covered_long_enough(&mut since, true, start + RELEASE_COVERED_VIDEO_AFTER * 3),
+            "a new cover starts a new timer"
         );
     }
 
