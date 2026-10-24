@@ -2,19 +2,31 @@
 //! mpv is external, native to the host architecture, and never decodes the
 //! whole clip into Aurora's GIF frame cache.
 
-use anyhow::{bail, Context, Result};
-use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::CommandExt;
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
+// mpv playback and poster extraction are the Windows backend; Linux streams
+// videos through the Plasma plugin.
+#[cfg(windows)]
+use anyhow::Context;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
 use std::sync::Mutex;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+#[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 pub fn is_video(path: &Path) -> bool {
@@ -23,6 +35,7 @@ pub fn is_video(path: &Path) -> bool {
         .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "webm"))
 }
 
+#[cfg(windows)]
 pub fn mpv_executable() -> PathBuf {
     if let Some(path) = std::env::var_os("AURORA_MPV") {
         return PathBuf::from(path);
@@ -49,11 +62,13 @@ pub fn local_dir() -> PathBuf {
 }
 
 /// Keep child processes scoped to Aurora, including abrupt daemon exit.
+#[cfg(windows)]
 pub(crate) struct OwnedProcess {
     child: Child,
     job: HANDLE,
 }
 
+#[cfg(windows)]
 impl OwnedProcess {
     pub(crate) fn spawn(mut command: Command) -> Result<Self> {
         command
@@ -100,6 +115,7 @@ impl OwnedProcess {
     }
 }
 
+#[cfg(windows)]
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -114,11 +130,20 @@ struct PosterSource {
     hash: String,
 }
 
+#[cfg(windows)]
 static POSTER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Linux streams videos through the Plasma plugin; every path is its own
+/// static fallback.
+#[cfg(unix)]
+pub fn poster_path(path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
 
 /// Extract one lossless full-resolution frame; the movie itself stays intact.
 /// Content and source path identify the cache so edits and aliases cannot
 /// accidentally resume a different video.
+#[cfg(windows)]
 pub fn poster_path(path: &Path) -> Result<PathBuf> {
     if !is_video(path) {
         return Ok(path.to_path_buf());
@@ -233,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     #[ignore = "requires native mpv and AURORA_VIDEO_TEST_SOURCE fixture"]
     fn original_video_poster_and_owned_process_lifecycle() {
         let fixture = PathBuf::from(std::env::var_os("AURORA_VIDEO_TEST_SOURCE").unwrap());
