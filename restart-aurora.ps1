@@ -19,7 +19,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($AuroraDir)) {
-    $AuroraDir = Join-Path $PSScriptRoot 'target\release'
+    # Prefer the copy install-aurora.ps1 made: autostart runs that one.
+    $installed = Join-Path $env:LOCALAPPDATA 'Programs\aurora'
+    $AuroraDir = if (Test-Path (Join-Path $installed 'aurora.exe')) { $installed } else { Join-Path $PSScriptRoot 'target\release' }
 }
 $exe = [IO.Path]::GetFullPath((Join-Path $AuroraDir 'aurora.exe'))
 $ctl = Join-Path $AuroraDir 'aurora-ctl.exe'

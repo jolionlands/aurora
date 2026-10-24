@@ -60,7 +60,12 @@ fn input_desktop_locked() -> bool {
     }
 }
 
-/// Monitors hidden behind a visible maximized or fullscreen window.
+/// A display counts as covered when windows leave less than this share of its
+/// work area visible, as snapped or tiled layouts do.
+const MIN_VISIBLE_DESKTOP: f64 = 0.02;
+
+/// Monitors hidden behind a visible maximized or fullscreen window, or behind
+/// windows that together leave almost none of the desktop visible.
 ///
 /// Every top-level window is considered, not just the foreground one: a
 /// maximized editor stays in front of the desktop while a small dialog has
@@ -70,26 +75,128 @@ pub fn covered_monitors() -> Vec<Rect> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
 
+    #[derive(Default)]
+    struct Scan {
+        covered: Vec<Rect>,
+        frames: Vec<RECT>,
+    }
+
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let covered = &mut *(lparam.0 as *mut Vec<Rect>);
-        if let Some(rect) = monitor_covered_by(hwnd) {
-            if !covered.iter().any(|known| same_rect(known, &rect)) {
-                covered.push(rect);
+        let scan = &mut *(lparam.0 as *mut Scan);
+        if let Some((frame, alone)) = opaque_window(hwnd) {
+            scan.frames.push(frame);
+            if let Some(rect) = alone {
+                if !scan.covered.iter().any(|known| same_rect(known, &rect)) {
+                    scan.covered.push(rect);
+                }
             }
         }
         BOOL(1)
     }
 
-    let mut covered = Vec::new();
+    let mut scan = Scan::default();
     unsafe {
-        let _ = EnumWindows(Some(visit), LPARAM(&mut covered as *mut Vec<Rect> as isize));
+        let _ = EnumWindows(Some(visit), LPARAM(&mut scan as *mut Scan as isize));
     }
-    covered
+    for (monitor, work) in monitors() {
+        let rect = rect_from(&monitor);
+        if !scan.covered.iter().any(|known| same_rect(known, &rect))
+            && hidden_by_windows(&work, &scan.frames)
+        {
+            scan.covered.push(rect);
+        }
+    }
+    scan.covered
 }
 
-/// The monitor `hwnd` hides, if it is a visible maximized/fullscreen window.
-unsafe fn monitor_covered_by(hwnd: windows::Win32::Foundation::HWND) -> Option<Rect> {
-    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+/// Every display's full and work-area rectangles.
+fn monitors() -> Vec<(RECT, RECT)> {
+    use windows::Win32::Foundation::{BOOL, LPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    unsafe extern "system" fn visit(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let found = &mut *(lparam.0 as *mut Vec<(RECT, RECT)>);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            found.push((info.rcMonitor, info.rcWork));
+        }
+        BOOL(1)
+    }
+
+    let mut found = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(visit),
+            LPARAM(&mut found as *mut Vec<(RECT, RECT)> as isize),
+        );
+    }
+    found
+}
+
+/// Windows leave less than [`MIN_VISIBLE_DESKTOP`] of `work` visible.
+fn hidden_by_windows(work: &RECT, windows: &[RECT]) -> bool {
+    visible_fraction(work, windows) < MIN_VISIBLE_DESKTOP
+}
+
+/// Share of `work` that no rectangle in `windows` overlaps.
+fn visible_fraction(work: &RECT, windows: &[RECT]) -> f64 {
+    let area =
+        |r: &RECT| f64::from((r.right - r.left).max(0)) * f64::from((r.bottom - r.top).max(0));
+    let total = area(work);
+    if total == 0.0 {
+        return 0.0;
+    }
+    let clipped: Vec<RECT> = windows
+        .iter()
+        .map(|w| RECT {
+            left: w.left.max(work.left),
+            top: w.top.max(work.top),
+            right: w.right.min(work.right),
+            bottom: w.bottom.min(work.bottom),
+        })
+        .filter(|r| r.left < r.right && r.top < r.bottom)
+        .collect();
+    // Split the work area at every window edge: each cell is then wholly
+    // inside or outside every window, so overlaps count once.
+    let edges = |a: i32, b: i32, pick: fn(&RECT) -> [i32; 2]| {
+        let mut edges: Vec<i32> = clipped.iter().flat_map(pick).chain([a, b]).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        edges
+    };
+    let xs = edges(work.left, work.right, |r| [r.left, r.right]);
+    let ys = edges(work.top, work.bottom, |r| [r.top, r.bottom]);
+    let mut hidden = 0.0;
+    for x in xs.windows(2) {
+        for y in ys.windows(2) {
+            let inside =
+                |r: &RECT| r.left <= x[0] && x[0] < r.right && r.top <= y[0] && y[0] < r.bottom;
+            if clipped.iter().any(inside) {
+                hidden += f64::from(x[1] - x[0]) * f64::from(y[1] - y[0]);
+            }
+        }
+    }
+    1.0 - hidden / total
+}
+
+/// A visible, opaque, uncloaked application window: its visible frame, and
+/// the monitor it hides on its own if it is maximized or fullscreen.
+unsafe fn opaque_window(hwnd: windows::Win32::Foundation::HWND) -> Option<(RECT, Option<Rect>)> {
+    use windows::Win32::Graphics::Dwm::{
+        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    };
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
     };
@@ -134,13 +241,22 @@ unsafe fn monitor_covered_by(hwnd: windows::Win32::Foundation::HWND) -> Option<R
     }
     let mut window = RECT::default();
     GetWindowRect(hwnd, &mut window).ok()?;
-    covers(
+    // The visible frame, without the invisible resize borders.
+    let mut frame = window;
+    let _ = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        (&mut frame as *mut RECT).cast(),
+        std::mem::size_of::<RECT>() as u32,
+    );
+    let alone = covers(
         IsZoomed(hwnd).as_bool(),
         &window,
         &info.rcMonitor,
         &info.rcWork,
     )
-    .then(|| rect_from(&info.rcMonitor))
+    .then(|| rect_from(&info.rcMonitor));
+    Some((frame, alone))
 }
 
 fn is_desktop_class(class: &str) -> bool {
@@ -256,5 +372,46 @@ mod tests {
         assert!(!covers(true, &windowed, &monitor, &work));
         assert!(is_desktop_class("Progman"));
         assert!(!is_desktop_class("Chrome_WidgetWin_1"));
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn snapped_and_tiled_windows_hide_the_desktop_together() {
+        let work = rect(0, 0, 1280, 752);
+        assert_eq!(visible_fraction(&work, &[]), 1.0);
+        let halves = [rect(0, 0, 640, 752), rect(640, 0, 1280, 752)];
+        assert_eq!(visible_fraction(&work, &halves), 0.0);
+        assert!(hidden_by_windows(&work, &halves));
+
+        // Three tiles with a thin gutter still count as covered.
+        let tiles = [
+            rect(0, 0, 638, 752),
+            rect(642, 0, 1280, 374),
+            rect(642, 378, 1280, 752),
+        ];
+        assert!(hidden_by_windows(&work, &tiles));
+    }
+
+    #[test]
+    fn partly_visible_desktops_keep_playing() {
+        let work = rect(0, 0, 1000, 1000);
+        let left = rect(0, 0, 600, 1000);
+        assert!((visible_fraction(&work, &[left]) - 0.4).abs() < 1e-9);
+        // Overlaps count once; windows on other monitors do not count.
+        let overlapping = [left, rect(300, 0, 700, 1000), rect(1000, 0, 2000, 1000)];
+        assert!((visible_fraction(&work, &overlapping) - 0.3).abs() < 1e-9);
+        assert!(!hidden_by_windows(&work, &overlapping));
+        // A small visible corner is enough to keep animating.
+        let corner_open = [rect(0, 0, 1000, 800), rect(0, 800, 750, 1000)];
+        assert!((visible_fraction(&work, &corner_open) - 0.05).abs() < 1e-9);
+        assert!(!hidden_by_windows(&work, &corner_open));
     }
 }

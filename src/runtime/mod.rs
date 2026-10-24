@@ -3331,6 +3331,66 @@ mod tests {
         assert!(pause.pause_until.is_none());
     }
 
+    fn handle_with_config_at(config_path: PathBuf) -> RuntimeHandle {
+        let (tx, _rx) = mpsc::channel(4);
+        RuntimeHandle::new(
+            tx,
+            Arc::new(Mutex::new(RuntimeStateSnapshot::default())),
+            RuntimeShared::new(
+                Arc::new(RwLock::new(PhotoIndex::default())),
+                Arc::new(RwLock::new(Vec::new())),
+                BanGate::new(HashSet::new()),
+                Arc::new(Mutex::new(ContentStore::default())),
+            ),
+            Metrics::new(),
+            config_path,
+            Arc::new(Mutex::new(PlaylistStore::default())),
+            PathBuf::from("playlists.kdl"),
+        )
+    }
+
+    #[test]
+    fn indefinite_pause_survives_a_restart_until_resumed() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.kdl");
+        let first = handle_with_config_at(config_path.clone()).with_persistent_pause();
+        assert!(!first.pause_arc().lock().paused);
+        first.pause(None);
+
+        let restarted = handle_with_config_at(config_path.clone()).with_persistent_pause();
+        {
+            let pause = restarted.pause_arc();
+            let pause = pause.lock();
+            assert!(pause.paused, "an indefinite pause is remembered");
+            assert!(pause.pause_until.is_none());
+        }
+        restarted.resume();
+
+        let again = handle_with_config_at(config_path).with_persistent_pause();
+        assert!(!again.pause_arc().lock().paused, "resume is remembered too");
+    }
+
+    #[test]
+    fn timed_pauses_and_unopted_handles_are_not_remembered() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.kdl");
+        let handle = handle_with_config_at(config_path.clone()).with_persistent_pause();
+        handle.pause(None);
+        handle.pause(Some(Duration::from_secs(60)));
+        let restarted = handle_with_config_at(config_path.clone()).with_persistent_pause();
+        assert!(
+            !restarted.pause_arc().lock().paused,
+            "a timed pause ends with the session"
+        );
+
+        handle_with_config_at(config_path).pause(None);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "only the daemon's handle writes pause state"
+        );
+    }
+
     #[test]
     fn timed_pause_expires_when_status_is_read() {
         let (tx, _rx) = mpsc::channel(4);

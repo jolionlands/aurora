@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Sidecar beside the config that keeps an indefinite pause across restarts.
+const PAUSE_FILENAME: &str = "paused";
+
 /// A lightweight, Clone handle that IPC commands dispatch through.
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -15,6 +18,8 @@ pub struct RuntimeHandle {
     /// Pause state is managed separately so IPC can set it without going
     /// through the swap channel (which would need runtime to drain it).
     pub(super) paused: Arc<Mutex<PauseState>>,
+    /// Where an indefinite pause is remembered; `None` keeps it in memory.
+    pub(super) pause_file: Option<Arc<PathBuf>>,
     /// Path to the config file on disk, used by reload_from_disk().
     pub(super) config_path: Arc<std::path::PathBuf>,
     /// Serializes source scans without delaying unrelated ban updates.
@@ -54,6 +59,7 @@ impl RuntimeHandle {
                 paused: false,
                 pause_until: None,
             })),
+            pause_file: None,
             config_path: Arc::new(config_path),
             source_updates: Arc::new(Mutex::new(())),
             persistence: Arc::new(Mutex::new(())),
@@ -78,18 +84,59 @@ impl RuntimeHandle {
         })
     }
 
+    /// Remember an indefinite pause beside the config file across restarts,
+    /// and start paused if a previous session saved one.
+    pub fn with_persistent_pause(mut self) -> Self {
+        let file = self.config_path.with_file_name(PAUSE_FILENAME);
+        if file.exists() {
+            let mut pause = self.paused.lock();
+            pause.paused = true;
+            pause.pause_until = None;
+        }
+        self.pause_file = Some(Arc::new(file));
+        self
+    }
+
     /// Pause cycling, optionally for a fixed duration.
     pub fn pause(&self, duration: Option<Duration>) {
-        let mut p = self.paused.lock();
-        p.paused = true;
-        p.pause_until = checked_pause_deadline(duration);
+        let indefinite = {
+            let mut p = self.paused.lock();
+            p.paused = true;
+            p.pause_until = checked_pause_deadline(duration);
+            p.pause_until.is_none()
+        };
+        self.remember_pause(indefinite);
     }
 
     /// Resume from pause.
     pub fn resume(&self) {
-        let mut p = self.paused.lock();
-        p.paused = false;
-        p.pause_until = None;
+        {
+            let mut p = self.paused.lock();
+            p.paused = false;
+            p.pause_until = None;
+        }
+        self.remember_pause(false);
+    }
+
+    /// Only an indefinite pause outlives the session; a timed one ends with it.
+    fn remember_pause(&self, indefinite: bool) {
+        let Some(file) = &self.pause_file else {
+            return;
+        };
+        let saved = if indefinite {
+            std::fs::write(
+                file.as_ref(),
+                "Rotation is paused (aurora-ctl pause); aurora-ctl resume removes this file.\n",
+            )
+        } else {
+            match std::fs::remove_file(file.as_ref()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        };
+        if let Err(error) = saved {
+            warn!("cannot save rotation pause to {}: {error}", file.display());
+        }
     }
 
     /// Force-apply a specific path.

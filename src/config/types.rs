@@ -160,7 +160,7 @@ pub struct AnimatedConfig {
     /// always freezes animation.
     pub pause_on_battery: bool,
     /// Freeze a display's animation while a fullscreen or maximized window
-    /// covers it.
+    /// covers it, or windows together leave almost none of it visible.
     pub pause_when_covered: bool,
     /// Decoded-frame budget per display; larger animations are downscaled.
     /// While playing, frames live on the GPU, which on integrated GPUs is

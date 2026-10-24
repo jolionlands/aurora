@@ -65,6 +65,10 @@ terminal:
 .\target\release\aurora-ctl.exe resume
 ```
 
+`pause` without a duration lasts across restarts and logins until `resume`;
+Aurora remembers it in `%APPDATA%\aurora\paused`. A timed pause
+(`pause --duration 30m`) ends with the session.
+
 Register or remove startup with Windows:
 
 ```powershell
@@ -190,8 +194,9 @@ Playback is bounded and power-aware:
   - the session is locked;
   - the display is off;
   - the laptop is on battery power (`pause-on-battery`);
-  - a maximized or fullscreen window covers that display
-    (`pause-when-covered`).
+  - a maximized or fullscreen window covers that display, or windows
+    together leave less than 2 % of its desktop visible, as snapped or tiled
+    layouts do (`pause-when-covered`).
 
   A freeze caused by battery, battery saver, the lock screen, or the display
   being off releases the decoded frames and the GPU device after a minute.
