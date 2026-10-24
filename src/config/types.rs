@@ -16,6 +16,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub cache: CacheConfig,
     pub animated: AnimatedConfig,
+    pub video: VideoConfig,
     pub log_level: String,
 }
 
@@ -29,6 +30,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             cache: CacheConfig::default(),
             animated: AnimatedConfig::default(),
+            video: VideoConfig::default(),
             log_level: "info".to_string(),
         }
     }
@@ -206,6 +208,21 @@ impl Default for AnimatedConfig {
             max_memory_mb: 32,
             max_frames: 240,
             scaling: AnimationScaling::Auto,
+        }
+    }
+}
+
+/// KDE video wallpaper audio preferences.
+#[derive(Debug, Clone)]
+pub struct VideoConfig {
+    pub muted: bool,
+    pub volume: u32,
+}
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            muted: true,
+            volume: 50,
         }
     }
 }

@@ -413,6 +413,7 @@ pub fn parse_hhmm(s: &str) -> Result<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 /// Local wall-clock `(hour, minute, second)`.
+#[cfg(windows)]
 fn local_time() -> (u32, u32, u32) {
     let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     (
@@ -447,6 +448,7 @@ fn until_next_at_time(
 }
 
 /// Returns true if the foreground window covers an entire monitor.
+#[cfg(windows)]
 fn is_fullscreen_active() -> bool {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::{
@@ -485,6 +487,7 @@ fn is_fullscreen_active() -> bool {
     }
 }
 
+#[cfg(windows)]
 fn should_pause_for_window(
     is_shell_desktop: bool,
     is_maximized: bool,
@@ -500,6 +503,7 @@ fn should_pause_for_window(
 }
 
 /// Returns how many seconds the system has been idle (no keyboard/mouse input).
+#[cfg(windows)]
 fn get_idle_secs() -> u64 {
     use windows::Win32::System::SystemInformation::GetTickCount;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
@@ -516,6 +520,7 @@ fn get_idle_secs() -> u64 {
     }
 }
 
+#[cfg(any(windows, test))]
 fn idle_millis(now_ms: u32, last_input_ms: u32) -> u32 {
     now_ms.wrapping_sub(last_input_ms)
 }
@@ -523,6 +528,28 @@ fn idle_millis(now_ms: u32, last_input_ms: u32) -> u32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn local_time() -> (u32, u32, u32) {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut local) };
+    (
+        local.tm_hour as u32,
+        local.tm_min as u32,
+        local.tm_sec as u32,
+    )
+}
+
+#[cfg(unix)]
+fn is_fullscreen_active() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn get_idle_secs() -> u64 {
+    crate::apply::session_idle_secs().unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -713,6 +740,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn fullscreen_pause_ignores_desktop_and_allows_invisible_borders() {
         use windows::Win32::Foundation::RECT;

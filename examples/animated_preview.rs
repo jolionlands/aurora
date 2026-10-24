@@ -7,15 +7,23 @@
 //! Add `--policy` to apply the default battery and covered-window pauses.
 //! The static wallpaper is not changed; only the animation window is shown.
 
+#[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use aurora::animation::{AnimationPlayer, DisplayTarget};
+#[cfg(windows)]
 use aurora::apply::{WallpaperApplier, WallpaperFit};
+#[cfg(windows)]
 use aurora::config::types::AnimatedConfig;
+#[cfg(windows)]
 use aurora::runtime::ComApartment;
+#[cfg(windows)]
 use aurora::transition::Rect;
 
+#[cfg(windows)]
 fn synthetic_gif() -> anyhow::Result<PathBuf> {
     use image::codecs::gif::{GifEncoder, Repeat};
     let path = std::env::temp_dir().join("aurora-preview.gif");
@@ -32,6 +40,7 @@ fn synthetic_gif() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -87,4 +96,11 @@ fn main() -> anyhow::Result<()> {
     }
     std::thread::sleep(Duration::from_secs(seconds));
     Ok(())
+}
+
+#[cfg(unix)]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "On KDE, preview with aurora-ctl set <path>; playback is part of the wallpaper plugin"
+    )
 }

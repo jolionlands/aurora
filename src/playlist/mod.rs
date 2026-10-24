@@ -611,6 +611,7 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("flush temporary file {}", path.display()))
 }
 
+#[cfg(windows)]
 pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::{
@@ -625,6 +626,16 @@ pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
         )
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Load the playlist store from disk (creates an empty one if the file does not exist).

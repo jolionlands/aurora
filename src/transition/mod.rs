@@ -1,12 +1,16 @@
 pub use crate::decode::DecodedImage;
 use anyhow::Result;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
+#[cfg(windows)]
 pub mod cpu;
+#[cfg(windows)]
 pub mod gpu;
 
+#[cfg(windows)]
 pub(crate) fn transition_window_ex_style() -> WINDOW_EX_STYLE {
     WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT
 }
@@ -26,6 +30,7 @@ pub struct Rect {
 
 /// Resize an image to cover the monitor while preserving aspect ratio, then
 /// crop the centered excess. This matches `IDesktopWallpaper`'s `fill` mode.
+#[cfg(any(windows, test))]
 pub(crate) fn scale_to_cover(
     src: &[u8],
     src_w: u32,
@@ -127,16 +132,35 @@ impl Backend {
 pub struct TransitionRenderer {
     pub style: TransitionStyle,
     pub duration_ms: u32,
+    #[cfg(windows)]
     requested: Backend,
+    #[cfg(windows)]
     resolved: ResolvedBackend,
 }
 
+#[cfg(any(windows, test))]
 enum ResolvedBackend {
     Gpu,
     Cpu,
 }
 
 impl TransitionRenderer {
+    #[cfg(unix)]
+    pub fn new(style: TransitionStyle, duration_ms: u32, _backend: Backend) -> Self {
+        Self { style, duration_ms }
+    }
+    #[cfg(unix)]
+    pub fn run_with_commit(
+        &self,
+        _: Rect,
+        _: &DecodedImage,
+        _: &DecodedImage,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        commit()
+    }
+
+    #[cfg(windows)]
     pub fn new(style: TransitionStyle, duration_ms: u32, backend: Backend) -> Self {
         let resolved = match &backend {
             Backend::Gpu => ResolvedBackend::Gpu,
@@ -170,6 +194,7 @@ impl TransitionRenderer {
 
     /// Show the first overlay frame, commit the desktop behind it, then finish
     /// the animation before the overlay is destroyed.
+    #[cfg(windows)]
     pub fn run_with_commit(
         &self,
         monitor_bounds: Rect,
@@ -226,6 +251,7 @@ impl TransitionRenderer {
     }
 }
 
+#[cfg(any(windows, test))]
 struct CommitOnce<F>
 where
     F: FnOnce() -> Result<()>,
@@ -234,6 +260,7 @@ where
     failure: Option<String>,
 }
 
+#[cfg(any(windows, test))]
 impl<F> CommitOnce<F>
 where
     F: FnOnce() -> Result<()>,
@@ -456,5 +483,21 @@ mod tests {
 
         assert_eq!(error.to_string(), "GPU failed");
         assert_eq!(cpu_runs.get(), 0);
+    }
+
+    #[test]
+    fn cpu_backend_does_not_probe_gpu() {
+        let cpu_runs = Cell::new(0);
+        run_selected_backend(
+            &Backend::Cpu,
+            &ResolvedBackend::Cpu,
+            || panic!("CPU backend must not use GPU"),
+            || {
+                cpu_runs.set(cpu_runs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(cpu_runs.get(), 1);
     }
 }

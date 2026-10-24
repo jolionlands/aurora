@@ -76,15 +76,22 @@ pub fn validate_image_file(path: &Path) -> Result<(u32, u32)> {
                 path,
                 image_error
             );
+            #[cfg(unix)]
+            return Err(image_error)
+                .with_context(|| format!("unsupported or invalid image {}", path.display()));
+            #[cfg(windows)]
             let frame = open_wic_frame(path).with_context(|| {
                 format!(
                     "read image dimensions for {:?} (image crate failed: {})",
                     path, image_error
                 )
             })?;
-            validate_pixel_dimensions(frame.width, frame.height)?;
-            copy_wic_bgra(&frame, 1, 1).context("decode one WIC pixel")?;
-            Ok((frame.width, frame.height))
+            #[cfg(windows)]
+            {
+                validate_pixel_dimensions(frame.width, frame.height)?;
+                copy_wic_bgra(&frame, 1, 1).context("decode one WIC pixel")?;
+                Ok((frame.width, frame.height))
+            }
         }
     }
 }
@@ -123,8 +130,15 @@ pub fn decode_image(path: &Path, target_w: u32, target_h: u32) -> Result<Decoded
     }
 
     // Best-effort WIC fallback for explicitly configured or direct formats.
-    decode_via_wic(path, target_w, target_h)
-        .with_context(|| format!("WIC fallback also failed for {:?}", path))
+    #[cfg(windows)]
+    {
+        decode_via_wic(path, target_w, target_h)
+            .with_context(|| format!("WIC fallback also failed for {:?}", path))
+    }
+    #[cfg(unix)]
+    {
+        anyhow::bail!("unsupported or invalid image {}", path.display())
+    }
 }
 
 /// Scale dimensions to fit within (max_w, max_h) preserving aspect ratio.
@@ -162,7 +176,7 @@ fn decode_via_image_crate(path: &Path, target_w: u32, target_h: u32) -> Result<D
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     let mut bgra = rgba.into_raw();
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0.iter_mut() {
         pixel.swap(0, 2);
     }
 
@@ -173,6 +187,7 @@ fn decode_via_image_crate(path: &Path, target_w: u32, target_h: u32) -> Result<D
     })
 }
 
+#[cfg(windows)]
 struct WicFrame {
     factory: windows::Win32::Graphics::Imaging::IWICImagingFactory,
     _decoder: windows::Win32::Graphics::Imaging::IWICBitmapDecoder,
@@ -184,6 +199,7 @@ struct WicFrame {
     _com: crate::com::ComApartment,
 }
 
+#[cfg(windows)]
 fn open_wic_frame(path: &Path) -> Result<WicFrame> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::GENERIC_READ;
@@ -221,6 +237,7 @@ fn open_wic_frame(path: &Path) -> Result<WicFrame> {
     }
 }
 
+#[cfg(windows)]
 fn copy_wic_bgra(wic: &WicFrame, width: u32, height: u32) -> Result<Vec<u8>> {
     use windows::Win32::Graphics::Imaging::{
         GUID_WICPixelFormat32bppBGRA, IWICBitmapScaler, IWICFormatConverter,
@@ -269,6 +286,7 @@ fn copy_wic_bgra(wic: &WicFrame, width: u32, height: u32) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(windows)]
 fn decode_via_wic(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedImage> {
     let wic = open_wic_frame(path)?;
     validate_pixel_dimensions(wic.width, wic.height)?;
@@ -520,6 +538,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(windows)]
     #[test]
     fn wic_validation_decodes_one_bgra_pixel() {
         use image::{ImageBuffer, ImageFormat, Rgb};

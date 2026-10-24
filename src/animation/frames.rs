@@ -324,7 +324,7 @@ impl GifCanvas {
             let source = &frame.buffer[row * source_width..][..width];
             let start = ((top + row) * self.width + left) * 4;
             let target = &mut self.rgba[start..start + width * 4];
-            for (pixel, &index) in target.chunks_exact_mut(4).zip(source) {
+            for (pixel, &index) in target.as_chunks_mut::<4>().0.iter_mut().zip(source) {
                 if Some(index) == frame.transparent {
                     continue;
                 }
@@ -445,7 +445,7 @@ fn scaled_bgra(rgba: &[u8], from: (u32, u32), to: (u32, u32), pixel_art: bool) -
             None => vec![0; frame_bytes(to.0, to.1)],
         }
     };
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0.iter_mut() {
         pixel.swap(0, 2);
     }
     out.into_boxed_slice()
@@ -622,7 +622,7 @@ impl<'a> FrameCollector<'a> {
         let background = border_color(&frames[0].bgra, width, height);
         // Transparent pixels would otherwise show as black.
         for frame in &mut frames {
-            for pixel in frame.bgra.chunks_exact_mut(4) {
+            for pixel in frame.bgra.as_chunks_mut::<4>().0.iter_mut() {
                 if pixel[3] == 0 {
                     pixel.copy_from_slice(&background);
                 } else {
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(ours.frames.len(), 4);
         for (index, (frame, expected)) in ours.frames.iter().zip(&reference).enumerate() {
             let mut rgba = frame.bgra.to_vec();
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.swap(0, 2);
             }
             // Transparent pixels are filled with the background colour; only
@@ -864,9 +864,14 @@ mod tests {
                 ours.background[0],
                 255,
             ];
-            for (a, b) in rgba.chunks_exact(4).zip(expected.as_raw().chunks_exact(4)) {
+            for (a, b) in rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(expected.as_raw().as_chunks::<4>().0.iter())
+            {
                 if b[3] == 0 {
-                    assert_eq!(a, background, "frame {index} transparent fill");
+                    assert_eq!(*a, background, "frame {index} transparent fill");
                 } else {
                     assert_eq!(a, b, "frame {index} color");
                 }
@@ -945,9 +950,9 @@ mod tests {
         assert_eq!(&animation.frames[0].bgra[..4], &[30, 20, 10, 255]);
         // Every stored pixel is exactly a palette colour (no blending).
         for frame in &animation.frames {
-            for pixel in frame.bgra.chunks_exact(4) {
+            for pixel in frame.bgra.as_chunks::<4>().0.iter() {
                 assert!(
-                    pixel == [30, 20, 10, 255] || pixel == [50, 50, 200, 255],
+                    *pixel == [30, 20, 10, 255] || *pixel == [50, 50, 200, 255],
                     "{pixel:?}"
                 );
             }

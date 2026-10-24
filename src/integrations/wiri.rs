@@ -1,18 +1,25 @@
+#[cfg(any(windows, test))]
+use anyhow::bail;
+#[cfg(windows)]
+use anyhow::Context;
 /// Wiri IPC integration — subscribes to workspace_switched events.
 ///
 /// Connects to \\.\pipe\wiri_control, sends a subscribe message, and
 /// forwards workspace-change events to the scheduler's swap channel.
 ///
 /// If wiri is not running, retries every 30 seconds.
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::time::Duration;
+#[cfg(any(windows, test))]
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 
 use crate::scheduler::{SwapReason, SwapRequest};
 
+#[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\wiri_control";
 const RETRY_SECS: u64 = 30;
+#[cfg(windows)]
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Subscribe to wiri workspace events and forward them as SwapRequests.
@@ -35,9 +42,30 @@ pub async fn subscribe_wiri_events(swap_tx: mpsc::Sender<SwapRequest>) -> Result
 }
 
 async fn try_connect_and_subscribe(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
-    connect_windows(swap_tx).await
+    #[cfg(windows)]
+    {
+        connect_windows(swap_tx).await
+    }
+    #[cfg(unix)]
+    {
+        let mut previous = crate::apply::current_workspace()?;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current = tokio::task::spawn_blocking(crate::apply::current_workspace).await??;
+            if current != previous {
+                previous = current;
+                swap_tx
+                    .send(SwapRequest {
+                        reason: SwapReason::WorkspaceChange,
+                        specific: None,
+                    })
+                    .await?;
+            }
+        }
+    }
 }
 
+#[cfg(windows)]
 async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ClientOptions;
@@ -96,6 +124,7 @@ async fn connect_windows(swap_tx: &mpsc::Sender<SwapRequest>) -> Result<()> {
 // Event parsing
 // ---------------------------------------------------------------------------
 
+#[cfg(any(windows, test))]
 fn verify_subscription_ack(line: &[u8]) -> Result<()> {
     let value: serde_json::Value = serde_json::from_slice(line)?;
     if value.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -110,6 +139,7 @@ fn verify_subscription_ack(line: &[u8]) -> Result<()> {
     )
 }
 
+#[cfg(any(windows, test))]
 fn parse_event(line: &[u8]) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_slice(line)?;
     Ok(matches!(
@@ -118,6 +148,7 @@ fn parse_event(line: &[u8]) -> Result<bool> {
     ))
 }
 
+#[cfg(any(windows, test))]
 fn enqueue_workspace(swap_tx: &mpsc::Sender<SwapRequest>) -> bool {
     match swap_tx.try_send(SwapRequest {
         reason: SwapReason::WorkspaceChange,
@@ -132,6 +163,7 @@ fn enqueue_workspace(swap_tx: &mpsc::Sender<SwapRequest>) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
@@ -157,6 +189,7 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+#[cfg(windows)]
 fn verify_server_session(pipe: &tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
@@ -177,6 +210,7 @@ fn verify_server_session(pipe: &tokio::net::windows::named_pipe::NamedPipeClient
     ensure_same_session(server_session, current_session)
 }
 
+#[cfg(any(windows, test))]
 fn ensure_same_session(server_session: u32, current_session: u32) -> Result<()> {
     if server_session != current_session {
         bail!(

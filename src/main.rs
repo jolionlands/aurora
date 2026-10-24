@@ -21,7 +21,11 @@ use aurora::runtime::{ComApartment, Runtime, RuntimeHandle};
 use aurora::scheduler::Scheduler;
 
 /// Bundled default configuration — written to disk on first run.
+#[cfg(windows)]
 const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl");
+
+#[cfg(unix)]
+const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config_linux.kdl");
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -30,7 +34,7 @@ const DEFAULT_CONFIG_KDL: &str = include_str!("../resources/default_config.kdl")
 #[derive(Parser)]
 #[command(
     name = "aurora",
-    about = "Wallpaper cycling daemon for Windows",
+    about = "Wallpaper cycling daemon for Windows and KDE Plasma",
     version
 )]
 struct Args {
@@ -46,13 +50,27 @@ struct Args {
     #[arg(long, hide = true, conflicts_with = "apply_once")]
     inspect_wallpapers: bool,
 
-    /// Register aurora in the Windows Run key so it starts with Windows.
+    /// Start Aurora automatically at desktop login.
     #[arg(long)]
     register_autostart: bool,
 
-    /// Remove aurora from the Windows Run key.
+    /// Remove Aurora from desktop autostart.
     #[arg(long)]
     unregister_autostart: bool,
+}
+
+fn default_config_text() -> String {
+    #[cfg(windows)]
+    {
+        DEFAULT_CONFIG_KDL.to_owned()
+    }
+    #[cfg(unix)]
+    {
+        DEFAULT_CONFIG_KDL.replace(
+            "@HOME@",
+            &std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+        )
+    }
 }
 
 fn main() -> Result<()> {
@@ -81,7 +99,7 @@ fn main() -> Result<()> {
         match mgr.register() {
             Ok(()) => {
                 info!(
-                    "autostart: registered aurora in Windows Run key ({})",
+                    "autostart: registered aurora ({})",
                     mgr.get_registered_path().unwrap_or_default()
                 );
                 println!("aurora registered for autostart.");
@@ -98,7 +116,7 @@ fn main() -> Result<()> {
         let mgr = StartupManager;
         match mgr.unregister() {
             Ok(()) => {
-                info!("autostart: removed aurora from Windows Run key");
+                info!("autostart: removed aurora");
                 println!("aurora removed from autostart.");
             }
             Err(e) => {
@@ -143,7 +161,7 @@ async fn run_daemon() -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create config dir {}", parent.display()))?;
         }
-        std::fs::write(&config_path, DEFAULT_CONFIG_KDL)
+        std::fs::write(&config_path, default_config_text())
             .with_context(|| format!("write default config to {}", config_path.display()))?;
     }
 
@@ -158,6 +176,17 @@ async fn run_daemon() -> Result<()> {
         info!("Wrote default config to {}", config_path.display());
     }
     info!("Config loaded from {}", config_path.display());
+
+    #[cfg(unix)]
+    {
+        if config.transitions.enabled {
+            tracing::warn!("KDE wallpaper changes are immediate; Windows transition renderers are unavailable on Linux");
+        }
+        if config.schedule.pause_when_fullscreen {
+            tracing::warn!("KDE's wallpaper plugin pauses covered playback; fullscreen does not pause wallpaper rotation on Linux");
+        }
+        tokio::spawn(aurora::apply::maintain_playback_policy());
+    }
 
     // Log autostart status.
     {
@@ -401,6 +430,7 @@ async fn abort_and_join<T>(task: &mut JoinHandle<T>) {
     let _ = task.await;
 }
 
+#[cfg(windows)]
 fn enable_dpi_awareness() {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -409,6 +439,9 @@ fn enable_dpi_awareness() {
     // Must happen before Aurora creates transition HWNDs or queries monitor geometry.
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
+
+#[cfg(unix)]
+fn enable_dpi_awareness() {}
 
 #[cfg(test)]
 mod tests {
