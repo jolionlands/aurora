@@ -1220,6 +1220,62 @@ mod tests {
     }
 
     #[test]
+    fn covered_release_boundary_and_cancellation_are_exact() {
+        assert_eq!(RELEASE_COVERED_VIDEO_AFTER, Duration::from_secs(30));
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!covered_long_enough(&mut since, true, start));
+        let almost = start + RELEASE_COVERED_VIDEO_AFTER - Duration::from_nanos(1);
+        assert!(!covered_long_enough(&mut since, true, almost));
+        // Uncover at the deadline must cancel, rather than release the player.
+        let deadline = start + RELEASE_COVERED_VIDEO_AFTER;
+        assert!(!covered_long_enough(&mut since, false, deadline));
+        assert_eq!(since, None);
+        assert!(!covered_long_enough(&mut since, true, deadline));
+        assert!(!covered_long_enough(
+            &mut since,
+            true,
+            deadline + Duration::from_secs(29)
+        ));
+        assert!(covered_long_enough(
+            &mut since,
+            true,
+            deadline + Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn repeated_cover_cycles_do_not_inherit_elapsed_time() {
+        let start = Instant::now();
+        let mut since = None;
+        for cycle in 0..8 {
+            let covered = start + Duration::from_secs(cycle * 100);
+            assert!(!covered_long_enough(&mut since, true, covered));
+            assert!(!covered_long_enough(
+                &mut since,
+                true,
+                covered + Duration::from_secs(29)
+            ));
+            assert!(covered_long_enough(
+                &mut since,
+                true,
+                covered + Duration::from_secs(30)
+            ));
+            assert!(covered_long_enough(
+                &mut since,
+                true,
+                covered + Duration::from_secs(60)
+            ));
+            assert!(!covered_long_enough(
+                &mut since,
+                false,
+                covered + Duration::from_secs(61)
+            ));
+            assert_eq!(since, None);
+        }
+    }
+
+    #[test]
     fn disabled_config_creates_no_player() {
         assert!(AnimationPlayer::from_config(&AnimatedConfig::default()).is_none());
         let enabled = AnimatedConfig {
