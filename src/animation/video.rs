@@ -252,6 +252,53 @@ mod tests {
     }
 
     #[test]
+    fn repeated_release_reset_and_drop_reap_owned_processes() {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        let mut video = VideoPlayback::pending(99);
+        for cycle in 0..6 {
+            video.update_policy(false).unwrap();
+            assert!(video.needs_window());
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            let process = OwnedProcess::spawn(command).unwrap();
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, process.id()).unwrap() };
+            video.process = Some(process);
+            video.started = Some(Instant::now());
+            video.child_seen = Some(Instant::now());
+            video.pause_sent = Some(false);
+            video.update_policy(true).unwrap();
+            if cycle % 2 == 0 {
+                assert!(video.release_player());
+                assert!(!video.release_player(), "release is idempotent");
+            } else {
+                video.reset_window();
+            }
+            let exited = unsafe { WaitForSingleObject(handle, 1000) };
+            let _ = unsafe { CloseHandle(handle) };
+            assert_eq!(exited, WAIT_OBJECT_0, "the old owned process must exit");
+            assert!(video.process.is_none() && video.window.is_none());
+            assert!(video.started.is_none() && video.child_seen.is_none());
+            assert_eq!(video.pause_sent, None);
+            assert!(!video.needs_window(), "covered playback stays stopped");
+        }
+        let mut command = Command::new("ping");
+        command.args(["-n", "60", "127.0.0.1"]);
+        let process = OwnedProcess::spawn(command).unwrap();
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, process.id()).unwrap() };
+        video.process = Some(process);
+        drop(video);
+        let exited = unsafe { WaitForSingleObject(handle, 1000) };
+        let _ = unsafe { CloseHandle(handle) };
+        assert_eq!(
+            exited, WAIT_OBJECT_0,
+            "dropping playback must reap its player"
+        );
+    }
+
+    #[test]
     fn hidden_player_is_shown_soon_after_mpv_draws_or_by_the_fallback() {
         let start = Instant::now();
         assert_eq!(reveal_due(start, None), start + REVEAL_FALLBACK);

@@ -23,3 +23,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/check-qualification-runner.ps1
